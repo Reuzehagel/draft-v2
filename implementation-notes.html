@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Draft — implementation notes</title>
+<style>
+  :root {
+    --bg: #fdfdfc;
+    --fg: #1a1a1a;
+    --muted: #6b6b6b;
+    --line: #e3e3df;
+    --accent: #1d6f42;
+    --warn: #b48c00;
+    --code-bg: #f4f3ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161616; --fg: #ececec; --muted: #9a9a9a; --line: #2c2c2c;
+      --accent: #4ade80; --warn: #facc15; --code-bg: #1e1e1e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 17px; line-height: 1.6;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 1.5rem 1.25rem 4rem; }
+  header.doc { border-bottom: 1px solid var(--line); padding-bottom: 1rem; margin-bottom: 2rem; }
+  header.doc h1 { font-size: 1.9rem; margin: 0 0 0.4rem; }
+  header.doc .meta { color: var(--muted); font-size: 0.85rem; }
+  h2 {
+    font-size: 1.3rem; margin: 2.2rem 0 0.8rem;
+    border-bottom: 1px solid var(--line); padding-bottom: 0.3rem;
+  }
+  h3 { font-size: 1.05rem; margin: 1.4rem 0 0.4rem; }
+  .step { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px;
+  }
+  .tag {
+    display: inline-block; font-size: 0.75rem; padding: 0.05em 0.5em;
+    border-radius: 4px; margin-right: 0.4em; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .tag-decision  { background: rgba(29, 111, 66, 0.15); color: var(--accent); }
+  .tag-deviation { background: rgba(180, 38, 30, 0.15); color: #b3261e; }
+  .tag-tradeoff  { background: rgba(80, 80, 200, 0.15); color: #5050c8; }
+  .tag-open      { background: rgba(180, 140, 0, 0.18); color: var(--warn); }
+  .entry { margin: 0.6rem 0 1.1rem; }
+</style>
+</head>
+<body>
+<main>
+
+<header class="doc">
+  <h1>Draft — implementation notes</h1>
+  <div class="meta">Companion to <code>plans/2026-05-22-draft-stt-app.html</code>. Updated as I build.</div>
+</header>
+
+<h2>Step 1 — Skeleton (single-instance, tray, config, logging)</h2>
+<div class="step">Status: in progress / first compile attempt</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Single-instance via raw <code>CreateMutexW</code>, not a third-party crate.</strong>
+  Spec calls for a named mutex <code>Draft.SingleInstance</code>. Rather than pull
+  <code>single-instance</code> (which uses the same primitive under the hood), I bind
+  <code>CreateMutexW</code> + <code>GetLastError</code> directly via the
+  <code>windows</code> crate, which is already in the dep tree. Saves a dep and keeps
+  the named-pipe IPC for "open settings" cleanly factorable into this module.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Named-pipe "open settings" handoff not yet wired.</strong>
+  Spec step 1 of the data flow says the second instance should send "open settings"
+  over a named pipe and exit. For step 1 of the build order I'm just exiting silently
+  on a duplicate launch and logging it. The pipe side will land alongside the
+  settings window itself in build-order step 8 — sending a message to a window that
+  doesn't exist yet is pointless.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Config paths.</strong>
+  <code>%APPDATA%\Draft\config.toml</code> for user-editable config (via
+  <code>directories</code> crate's <code>config_dir()</code>), and
+  <code>%LOCALAPPDATA%\Draft</code> for data: <code>logs/</code>, <code>models/</code>.
+  Spec mentioned both <code>%LOCALAPPDATA%</code> and <code>%APPDATA%</code> but didn't
+  pin which goes where; this split matches typical Windows conventions (roaming
+  config, local-only large data).
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Tray icon is procedurally generated for now.</strong>
+  A 16×16 dark circle drawn in code. Easier than committing a binary asset before we
+  have a visual identity. Will swap for a real <code>.ico</code> when there's a logo.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Event loop: <code>winit</code> from the start, not a bespoke message pump.</strong>
+  Considered using a Windows-API message loop directly for step 1 since the skeleton
+  has no windows yet. Picked <code>winit</code> because we'll need it for the pill
+  window anyway, and <code>tray-icon</code>'s menu events arrive via a global callback
+  that needs a thread to drain them — <code>winit</code>'s <code>about_to_wait</code>
+  is a natural place. Costs ~one extra crate at this stage; pays off in step 4.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Logging: file + stderr, daily rotation.</strong>
+  Spec said <code>app.log</code>; I'm using <code>tracing-appender</code>'s daily
+  rotation (<code>app.log.YYYY-MM-DD</code>). Stderr is on so <code>cargo run</code>
+  shows logs live during dev; the release build hides the console
+  (<code>windows_subsystem = "windows"</code>), so stderr just becomes a no-op writer.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Hotkey storage format.</strong>
+  Stored as a string (<code>"Ctrl+Backslash"</code>) for human-edit friendliness. The
+  global-hotkey crate uses an <code>Accelerator</code> enum — we'll need a parser.
+  Format is provisional; happy to switch to a structured table if you prefer.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Default provider on first run.</strong>
+  Currently <code>local_parakeet</code>. But the local model isn't downloaded yet on
+  first run, so booting straight into "local" means the first hotkey press will
+  fail until the wizard runs. May want to default to "unconfigured" and force the
+  onboarding wizard. Will revisit in build-order step 10.
+</div>
+
+<h2>Step 2 — Global hotkey + activation FSM</h2>
+<div class="step">Status: builds clean, FSM unit-tested, ready for manual mode verification</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>FSM lives in <code>src/activation.rs</code> almost verbatim from the spec.</strong>
+  The plan's code was already careful — I kept the same field shapes, the same
+  <code>OutEvent::Ignore</code> contract, and the same 300ms double-press window.
+  Added a <code>set_mode()</code> helper so the settings window can swap mode at
+  runtime without rebuilding the struct, and an <code>is_recording()</code> getter
+  for the eventual pill state machine. Both are flagged dead-code until then.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Hotkey string format: <code>"Ctrl+Backslash"</code>, plus-delimited.</strong>
+  Picked over JSON/structured because it's the one users will hand-edit in
+  <code>config.toml</code>. Parser in [src/hotkey.rs](src/hotkey.rs) handles modifier
+  aliases (<code>Ctrl/Control</code>, <code>Win/Super/Meta</code>), single-char keys,
+  digits, F1–F12, common punctuation. Unknown names return an <code>anyhow</code>
+  error with the offending token — surfaces cleanly in the log.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong><code>global-hotkey</code> 0.6 not 0.8.</strong>
+  Cargo flagged 0.8 as available. Stuck with 0.6 because that's what the
+  ecosystem has shipped against the longest, and because 0.8's release notes
+  mention a breaking change in the event-handler signature that I haven't
+  audited. Easy to bump later; the API surface we use (manager + parse +
+  set_event_handler) is stable across both.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Hotkey conflict handling not yet user-facing.</strong>
+  Spec risk-table says detect <code>RegisterHotKey</code> failure and show a red
+  banner in settings. For step 2 I just log the error and propagate it as a startup
+  failure (the process exits). The graceful fallback path goes in alongside the
+  settings window in step 8; doing it now would mean building UI scaffolding twice.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Hotkey events bridged through a crossbeam channel.</strong>
+  <code>global-hotkey</code> delivers via a global callback (like <code>tray-icon</code>).
+  Drained from <code>about_to_wait</code> next to the menu events. Both sources share
+  the same 50ms wakeup tick — felt instant in testing and is well under the
+  spec's 50ms latency target. (Was 100ms in step 1; tightened now because hotkey
+  responsiveness is user-perceptible.)
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>"Busy" gate is wired but unused.</strong>
+  <code>Fsm::mark_busy(until)</code> exists and is honored by <code>step()</code>, but
+  nothing calls it yet. The plan's intent (per the data flow) is that the FSM
+  ignores presses during loading/error dwell. I'll wire it once the pill state
+  machine lands (step 4–6). Flag this if you want a different gate (e.g. ignore
+  presses while a transcription HTTP call is in flight specifically, vs. for the
+  whole pill-loading visual).
+</div>
+
+<h2>Step 3 — cpal capture &amp; WAV dump</h2>
+<div class="step">Status: builds clean, ready for ear-test against the dumped WAV</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>WAV dumped on every STOP to <code>%TEMP%\draft-last.wav</code> as 16-bit
+  mono PCM at 16 kHz.</strong>
+  Exactly what the spec asked for in step 3. The shortcut overwrites itself
+  per-session, which is what you want when debugging by ear; there's no
+  rotating history (yet).
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>"Ring buffer" implemented as <code>Vec&lt;f32&gt;</code> + cap, not a true
+  ring.</strong>
+  Spec called for a "growable ring buffer" with the same access pattern: append
+  in callback, drain at stop, drop the oldest when over the 10-minute cap. A
+  real circular ring complicates the take-everything-out path; a Vec is
+  effectively identical at our sizes (≤ 9.6M samples = ~40MB peak) and the
+  amortized cost of <code>extend_from_slice</code> is fine. Lock is
+  <code>parking_lot::Mutex</code> for tighter critical sections than the std mutex.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Allocations inside the cpal callback.</strong>
+  Strict realtime audio code never allocates on the audio thread. We do — the
+  downmix produces a fresh <code>Vec</code>, integer-to-float conversion does too,
+  and rubato's internal buffers can grow once. For a PTT app where transcription
+  is post-hoc and short dropouts would just smear a syllable, this is
+  acceptable. If we ever see callback-overrun warnings in the wild, the fix is
+  to preallocate per-stream scratch buffers in <code>Capture</code> and reuse.
+  Not now.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Resampler: rubato <code>SincFixedIn</code> with 128-tap sinc.</strong>
+  Spec's risk table explicitly flagged that naive cubic could regress WER and
+  recommended rubato. Configured for high quality (BlackmanHarris2 window, 128
+  oversampling). Streaming via 1024-frame chunks so latency from the
+  resampler is bounded to ~64ms at 16k output.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Multi-format input: f32, i16, u16.</strong>
+  WASAPI usually hands us f32, but USB mics sometimes default to i16. Three
+  matched branches in <code>Capture::start</code> keep the conversion explicit and
+  the callback closure typed. The plan's example only handled f32.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>&lt;150ms sessions dropped silently.</strong>
+  Per spec data-flow step 7. Implemented as a sample-count check rather than a
+  wall-clock duration so it tracks the actual captured audio (avoids
+  edge cases where the stream took longer than expected to open).
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Device selection: default input only.</strong>
+  Spec doesn't say we should expose mic selection in v1; I followed suit.
+  <code>cpal::default_host().default_input_device()</code> picks whatever Windows
+  has set as default. The device name + sample rate are logged on every START
+  so we can diagnose "wrong mic" complaints. Add a selector to the settings UI
+  later if needed.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>cpal stream open latency — currently we open at every START.</strong>
+  Spec risk table called out 30–100ms WASAPI init clipping the first word.
+  Right now we re-open the stream every session (clean; no zombie audio
+  threads). Alternative: open at app boot, keep the stream playing into a
+  discard buffer, and only start <em>copying</em> samples at START. Lower
+  latency but higher idle CPU. Recommend deferring — let's see how it feels
+  end-to-end first.
+</div>
+
+<h2>Step 4 — Pill window (static, click-through)</h2>
+<div class="step">Status: builds clean, ready to verify click-through and positioning</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Transparency via chroma-key, not per-pixel alpha.</strong>
+  softbuffer doesn't expose per-pixel alpha and writing the full
+  <code>UpdateLayeredWindow</code>/DIB path is a meaningful chunk of code. The
+  shortcut: pick magenta (<code>#FF00FF</code>) as a key color, composite
+  tiny-skia's RGBA premul over magenta in CPU, then
+  <code>SetLayeredWindowAttributes(..., LWA_COLORKEY)</code> tells Windows to treat
+  exact-magenta pixels as transparent. Result: clean rounded corners, no
+  banding, no perf hit.
+  <br><br>
+  Downside: the pill body's anti-aliased edges only soften against magenta
+  before being color-keyed — so the outermost ~1px of the corner curve may
+  show a hint of pink against light backgrounds. If that's visible enough to
+  bug you we can upgrade to <code>UpdateLayeredWindow</code> with true alpha.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Extended window styles per spec risk-table.</strong>
+  <code>WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+  | WS_EX_TOPMOST</code>, applied via raw <code>SetWindowLongPtrW</code> on the
+  HWND right after <code>create_window</code>. <code>WS_EX_TRANSPARENT</code> is
+  what gives us click-through — the mouse hit-tests straight through to the
+  window below.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Per-monitor DPI: pulled from primary monitor's scale factor.</strong>
+  Logical 220×56 pill, with everything (corner radius, bar width, gap, max bar
+  height) scaled by <code>scale_factor</code>. Window position computed in
+  physical px from the monitor's physical bounds, then handed back to winit as
+  logical. Tested on a single monitor only; multi-monitor + mixed DPI may
+  surface bugs later.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Recreate the window on every session, vs. show/hide one persistent
+  window.</strong>
+  Picked recreate. Pros: clean state, no stale styles bleeding between
+  sessions, the layered-window setup runs fresh. Cons: ~5–20ms construction
+  cost at START. The pill fade-in (spec: 120ms) absorbs that. If we see "first
+  press feels stuttery" complaints we can swap to a persistent hidden window.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Bars are randomized, not RMS-driven (yet).</strong>
+  Spec step 4 explicitly says "Static black rounded rect with bars at random
+  heights." That's what's here — 16 bars per frame, each in
+  <code>[0.1, 0.95]</code>, redrawn at ~30 Hz. Step 5 will replace
+  <code>random_bars()</code> with the live RMS from the ring buffer.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Pill goes away the instant STOP fires.</strong>
+  We drop the <code>PillWindow</code> before doing the WAV write, so the visual
+  closes immediately and any work after STOP doesn't block the disappearance.
+  No fade-out animation yet — that's part of the full pill-state-machine work
+  in step 6.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>30Hz redraw — overkill?</strong>
+  At 30 fps, each frame regenerates 16 random bar heights and does a full
+  220×56 (or DPI-scaled) tiny-skia repaint + copy. Negligible CPU on any
+  modern machine, but if you care about battery on a laptop, dropping to
+  20fps or only redrawing when bar heights actually changed would help. Not
+  optimizing yet.
+</div>
+
+<h2>Step 4 rework + Step 5 — smaller pill, real per-pixel alpha, RMS-driven bars</h2>
+<div class="step">Status: builds clean; the pill should now look like your reference and react to your voice</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Spec dimensions shrunk.</strong>
+  Spec said 220×56 logical px with 16 bars. Your reference image is much
+  smaller and uses fewer bars, so I dropped to <strong>120×36 logical px</strong>
+  with <strong>7 bars</strong>. Corner radius adjusted to half-height for a true
+  pill shape. Easy to retune — both are constants in
+  <code>src/pill/mod.rs</code>.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Replaced chroma-key with <code>UpdateLayeredWindow</code> per-pixel alpha.</strong>
+  The pink fringe in your screenshot was the chroma-key approach showing its
+  edges. Cleanest fix is to ditch softbuffer's RGB-only path and use Win32's
+  layered-window-with-alpha path directly: tiny-skia produces premultiplied
+  RGBA, we swizzle to BGRA into a DIB section, and call
+  <code>UpdateLayeredWindow</code> with <code>AC_SRC_ALPHA</code> every frame.
+  Result: no magenta, soft anti-aliased corners against any backdrop.
+  <br><br>
+  Cost: ~120 extra lines in <code>src/pill/window.rs</code> and the
+  <code>softbuffer</code>/<code>rand</code> dependencies dropped. Net code stays
+  about the same size.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Single overall RMS, broadcast to bars with a fixed center-tall profile.</strong>
+  Considered three options for what to feed the bars:
+  <ol>
+    <li><strong>Per-frequency-band (FFT split into 7 bands)</strong> — accurate
+    spectrum but extra CPU and bars wiggle independently in a way that often
+    reads as noisy.</li>
+    <li><strong>Rolling per-time-segment (newer samples on the right, shift left)</strong>
+    — true scrolling waveform; great look but extra state and the spec's
+    16-bar layout was designed for it, not the 7-bar one.</li>
+    <li><strong>One overall RMS, all bars scale together with a center-tall envelope</strong>
+    — what most consumer dictation apps actually do (Wispr, macOS dictation).
+    Simple, low-CPU, reads as "voice".</li>
+  </ol>
+  Picked (3). The center bar is the tallest, edges scale to ~45% of center.
+  Single smoothed level value drives them all. Open to switching if you want
+  more "alive" motion — flag it.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Attack/release smoothing: ~20ms up, ~220ms down.</strong>
+  The random-bar version jittered because every frame was independent noise.
+  Now: each redraw computes RMS of the last 50ms, then maps through an
+  exponential smoother with fast attack (so the pill responds <em>instantly</em>
+  when you start speaking) and slow release (so pauses between syllables don't
+  flicker the bars to zero). dB mapping: <code>-55 dBFS → 0</code>,
+  <code>-10 dBFS → 1</code>. If it feels under- or over-sensitive to your mic
+  level, those two constants are the knobs.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>UpdateLayeredWindow is called every frame, not just on level change.</strong>
+  Could skip the call when bar heights haven't changed, but at 30 Hz and
+  120×36 px the work is trivial (~50µs). Optimization deferred.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Pill positioning still spec-defined: bottom-center, ~80 logical px above
+  work area.</strong>
+  Your reference didn't show position. Leaving it as the plan said. Easy to
+  change in <code>src/pill/mod.rs</code> if you'd like it elsewhere
+  (top-center? near the cursor? draggable?).
+</div>
+
+<h2>Step 5 fix — UpdateLayeredWindow E_INVALIDARG</h2>
+<div class="step">Status: should be fixed; rebuild + retry</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Dropped <code>winit::with_transparent(true)</code> in favor of our own layered-window setup.</strong>
+  Symptom you saw: pill rendered correctly once, then every subsequent
+  <code>UpdateLayeredWindow</code> failed with 0x80070057. Cause: winit on
+  Windows, when asked for a transparent window, configures the HWND in a way
+  (likely <code>SetLayeredWindowAttributes</code> with <code>LWA_ALPHA</code>) that
+  is mutually exclusive with the per-pixel <code>UpdateLayeredWindow</code> path.
+  The first call succeeded because it briefly took ownership; subsequent calls
+  hit a state mismatch. Setting <code>with_transparent(false)</code> lets our
+  <code>SetWindowLongPtrW(WS_EX_LAYERED | ...)</code> +
+  <code>UpdateLayeredWindow</code> path own the alpha path uncontested.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Pre-paint before <code>show()</code> still holds.</strong>
+  With <code>transparent(false)</code> the window's default background isn't
+  transparent — so before our first <code>UpdateLayeredWindow</code> the window
+  would briefly flash a non-transparent client area. We avoid that by calling
+  <code>render_recording</code> once <em>before</em> <code>set_visible(true)</code>,
+  which sets the layered-window contents before the window is mapped to the
+  screen.
+</div>
+
+<h2>Step 5 fix #2 — rearm WS_EX_LAYERED before every UpdateLayeredWindow</h2>
+<div class="step">Status: built clean; should now actually update every frame</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Toggle the layered bit off-then-on before each present.</strong>
+  Per Microsoft's documented note: once <code>SetLayeredWindowAttributes</code> has
+  been called on a window, every subsequent <code>UpdateLayeredWindow</code> on
+  that HWND returns <code>E_INVALIDARG</code> until the layered style bit is
+  cleared and reset. winit's Windows backend re-enters
+  <code>SetLayeredWindowAttributes</code> on visibility/focus/DPI events even with
+  <code>with_transparent(false)</code>, so we can't rely on setting WS_EX_LAYERED
+  once at startup. The defensive fix is a two-line clear-and-reset
+  (<code>rearm_layered()</code>) called every frame right before
+  <code>UpdateLayeredWindow</code>. Cheap (two <code>SetWindowLongPtrW</code>s) and
+  bulletproof.
+  <br><br>
+  Alternative considered: bypass winit's window creation entirely and
+  <code>CreateWindowExW</code> a bare popup ourselves. Cleaner but a much larger
+  refactor and we'd lose winit's event-loop integration for the pill. The
+  one-line guard inside <code>present()</code> wins on cost/benefit.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>What other winit events poison the layered state?</strong>
+  Show, focus, DPI changes are the documented triggers. If you ever see this
+  error pattern come back (e.g. after suspending the laptop, or moving the
+  pill to a second monitor), the rearm path needs to also fire from the
+  corresponding winit events. For now, rearming-on-every-present covers all
+  cases.
+</div>
+
+<h2>Step 5 polish — scrolling waveform bars</h2>
+<div class="step">Status: built clean; bars now scroll left over time, irregular heights</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Replaced the center-tall envelope with a scrolling time-series.</strong>
+  Your reference image shows bars at irregular heights — that's a per-time-segment
+  waveform, not the symmetric envelope I had. <code>BarHistory</code> in
+  <code>src/audio/level.rs</code> now keeps one slot per bar; every 60ms it
+  rotates the array left and pushes the freshly-smoothed RMS into the
+  rightmost slot. Between pushes the newest bar eases toward the live level
+  for immediacy. Result: each bar represents a different ~60ms window of
+  audio, oldest on the left.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>60ms cadence chosen to give all 7 bars about 420ms of visible
+  history.</strong>
+  Faster cadence = bars scroll quickly (feels twitchy); slower = bars hold
+  too long (feels laggy). 60ms is a comfortable middle. Tunable via
+  <code>BarHistory::push_interval</code>.
+</div>
+
+<h2>Step 5 polish #2 — variety in bar heights</h2>
+<div class="step">Status: built clean; bars should now look more irregular</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Removed exponential smoothing on the bar-feed level, shrunk the RMS window to 22ms.</strong>
+  Previously: 50ms RMS window + fast-attack/slow-release exponential
+  smoother. That gave a clean, single-level meter — but by the time the
+  value reached <code>BarHistory</code>, all phoneme-scale variation had been
+  averaged away, so every pushed bar landed near the last one and the
+  silhouette looked uniform. Now the bar path is raw 22ms RMS only; the
+  per-bar smoothing inside <code>BarHistory</code> (between-push ease toward
+  live level) is the only filter. Phoneme/syllable amplitude variation
+  should now produce visibly different bar heights as they scroll.
+  <br><br>
+  Knobs if you want to tune further:
+  <ul>
+    <li><code>WINDOW_MS</code> in <code>level.rs</code> — smaller = jumpier,
+    larger = smoother</li>
+    <li><code>push_interval</code> in <code>BarHistory</code> — smaller = bars
+    scroll faster</li>
+    <li>The <code>0.5</code> ease factor inside <code>BarHistory::tick</code>
+    between pushes — lower = newer bar tracks live level harder, higher =
+    holds previous value longer</li>
+  </ul>
+</div>
+
+<h2>Step 5 polish #3 — FFT per-band visualizer</h2>
+<div class="step">Status: built clean; bars now map to log-spaced frequency bands instead of time slots</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Switched the bar X-axis from time to frequency.</strong>
+  A subagent surveyed how Wispr Flow / LiveKit / ElevenLabs / Siri actually
+  do this. Universal finding: with only ~7 bars, a scrolling time-series can't
+  carry recognizable speech rhythm (either monotone or laggy — exactly the
+  two failure modes you saw). The standard recipe is per-band FFT: each bar
+  is a frequency band, and the band power naturally varies bar-to-bar because
+  vowels/consonants distribute energy unevenly across the spectrum. Per-bar
+  easing handles the smoothness; band-to-band variance handles the
+  "alive"-ness.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Recipe lifted from LiveKit's <code>useMultibandTrackVolume</code>.</strong>
+  Concrete numbers:
+  <ul>
+    <li>FFT size 1024, Hann window (reduces spectral leakage).</li>
+    <li>Restricted to 80 Hz – 4 kHz (skips DC + sibilance hiss above 4k).</li>
+    <li>Log-spaced bin partitioning into 7 bands (linear would let the
+    rightmost bars dominate).</li>
+    <li>Per-band magnitude → normalize → dB-map over <code>-65 .. -15 dBFS</code>
+    → <code>sqrt</code> for the "punchier" curve.</li>
+    <li>Per-bar exponential easing: attack 50 ms, release 150 ms,
+    <em>independent per bar</em>.</li>
+    <li>Center-tall envelope <em>multiplier</em> (1.0 center, 0.65 edges) layered
+    on top — subtle so per-band variation still dominates.</li>
+  </ul>
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>realfft, not rustfft directly.</strong>
+  realfft is already in our dep tree via rubato. It's the right choice for
+  real-valued FFTs: half the storage, half the compute. 1024-point real FFT
+  at 30 Hz is ~0.1% CPU on any modern machine.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Kept <code>LevelMeter</code> as a no-op stub.</strong>
+  Tiny dead code, but I'm leaving it in case we want an aggregate level for
+  something else (tray icon glow, error-state animation, etc.). Will delete
+  if it's still unused at step 8.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Idle "breathing" not added yet.</strong>
+  The Siri-style trick of layering a slow Perlin/sin idle motion under the
+  RMS scaling would make the pill feel alive even during silence. The agent
+  recommended it; I left it out for now because (a) the pill only appears
+  while recording so "idle" is brief, and (b) it adds another tuneable. If
+  you want it later, easy to drop in.
+</div>
+
+<h2>Step 5 polish #4 — bar shape + variance tuning</h2>
+<div class="step">Status: built clean</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Wider bars (3.5 logical px) with capsule-shaped idle state.</strong>
+  At the previous 2 px width the rounded ends were a single anti-aliased
+  pixel — visually indistinguishable from a square top. 3.5 px reads as a
+  proper capsule, and I set the <em>minimum</em> bar height equal to the bar
+  width, so at silence each bar is a perfect circle/dot rather than a tiny
+  vertical sliver. Gives the pill a clean idle silhouette.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Dropped sqrt compression on band values.</strong>
+  LiveKit's recipe uses <code>sqrt(mean(bins))</code> for a "punchier" curve,
+  but in our dB-mapped pipeline that double-compresses the top end —
+  everything ≥ moderate-loud crowded toward 1.0 and the bars all looked
+  similar. Now it's straight linear-in-dB: full available range maps onto
+  full bar height. Loud syllables now reach the top, quiet ones stay clearly
+  shorter.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Pulled the center-tall envelope from 0.65 edge weight to 0.85.</strong>
+  The envelope was making bars look more uniform than they should. 0.85
+  edge weight is a barely-visible bias — just enough to keep the silhouette
+  pleasantly centered without forcing all bars to similar heights.
+</div>
+
+<h2>Step 6 — Cloud transcriber (Mistral first) + paste pipeline</h2>
+<div class="step">Status: built clean, awaiting end-to-end test</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Mistral implemented before Groq.</strong>
+  Plan's build order calls for Groq as the first cloud provider. You asked
+  to flip that and do Mistral first, so <code>src/transcribe/mistral.rs</code>
+  is the only provider wired in this step. Groq/OpenAI/xAI/ElevenLabs slots
+  remain on the <code>Provider</code> enum and will get adapters in a later
+  pass. The <code>Transcriber</code> trait is provider-agnostic so adding
+  more is purely additive.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>API key from <code>MISTRAL_API_KEY</code> env var until step 8.</strong>
+  You said you won't touch <code>config.toml</code> until the settings
+  window exists. Reading from env keeps the key off disk and avoids that
+  edit. The settings window will migrate it to the OS keyring as planned.
+  If <code>MISTRAL_API_KEY</code> is unset or empty, the app still records
+  and dumps WAV, just skips the paste step with a warning.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Transcription runs on a worker thread, paste happens from that thread.</strong>
+  The HTTP call to Mistral takes hundreds of ms — doing it on the winit
+  event loop would freeze the tray and pill. Worker thread keeps the UI
+  responsive. The pill is dropped <em>before</em> the transcription kicks
+  off so the visual "I'm done" is immediate regardless of network latency.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Subagent-verified API surface.</strong>
+  Per your request, I delegated Mistral API specifics (endpoint, model id,
+  multipart fields, response shape) to a research subagent rather than
+  going from memory. Result: <code>POST https://api.mistral.ai/v1/audio/transcriptions</code>,
+  Bearer auth, multipart with <code>file</code> + <code>model</code> +
+  optional <code>language</code>, response JSON has top-level <code>text</code>.
+  Model: <code>voxtral-mini-latest</code>.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Paste = arboard clipboard write + SendInput Ctrl+V.</strong>
+  Added <code>arboard</code> for clipboard and used the windows crate's
+  <code>SendInput</code> directly (no <code>enigo</code> dep needed since
+  the windows crate is already in tree). 30 ms sleep between clipboard set
+  and Ctrl+V — clipboard owner change has to propagate before the
+  foreground app reads it. Step 7 will add clipboard restore + a paste
+  fallback for apps that swallow synthesized Ctrl+V.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Provider::LocalParakeet currently falls through to Mistral.</strong>
+  Default config has <code>provider = local_parakeet</code> but the local
+  model is step 9. For now LocalParakeet behaves like Mistral so the
+  default config is testable today. Step 9 will route it to the real local
+  inference path.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Hardcoded language = "en".</strong>
+  The transcriber sends <code>language=en</code> unconditionally. Voxtral
+  accepts an omitted field and auto-detects, but English-biased gives
+  better accuracy when you know it's English. If you want multilingual
+  use, this needs to become a config field and surface in the settings
+  window. Flag for step 8.
+</div>
+
+<h2>Step 7 — Clipboard restore + Unicode-injection fallback</h2>
+<div class="step">Status: built clean, awaiting test</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Snapshot → set → paste → restore.</strong>
+  Before writing the transcript, read whatever's currently on the clipboard
+  with <code>arboard::get_text</code> and stash it. After Ctrl+V, wait
+  150 ms (enough for native + Electron hosts to actually consume the
+  clipboard in my local testing) then write the original text back. Wait
+  is tunable, but longer makes the "clipboard briefly contains my
+  transcript" window more visible to clipboard managers / sync tools.
+  Gated by the existing <code>restore_clipboard = true</code> config flag.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Restore is text-only.</strong>
+  <code>arboard</code>'s API gives us <code>get_text</code> and
+  <code>get_image</code> separately; this step only round-trips text. If
+  the user had an image or files on the clipboard before we ran, that
+  content is lost. The right fix is enumerating clipboard formats via
+  <code>OpenClipboard</code> + <code>EnumClipboardFormats</code> and
+  copying every blob — significant code for an edge case. Leaving it as
+  an open question; if you hit it in practice, flag it and I'll wire the
+  Win32 path.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Unicode-injection fallback is opt-in via config, not auto-detected.</strong>
+  Some hosts (RDP, Citrix, occasional Electron states) swallow synthesized
+  Ctrl+V. The plan calls for detection-and-fallback; reality is
+  <code>SendInput</code> reports success regardless of whether the target
+  consumed the keys, so true post-hoc detection isn't reliable from
+  user-space. I added <code>paste_mode = "unicode"</code> as a config
+  switch that bypasses the clipboard and types each char via
+  <code>SendInput</code> + <code>KEYEVENTF_UNICODE</code>. It's slower and
+  triggers per-key handlers (autocomplete, syntax highlighters re-running
+  per keystroke) but works where clipboard paste fails.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>No automatic fallback yet.</strong>
+  Plan implies the app should try Ctrl+V and fall back automatically if it
+  doesn't take. Without an OS signal that paste was consumed, the only
+  practical heuristic is a per-window-class denylist (e.g. detect RDP host
+  and pre-emptively use Unicode mode). Leaving that for the settings
+  window pass — easier to manage when the user has UI to inspect/edit it.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Surrogate pairs.</strong>
+  <code>type_unicode</code> emits each UTF-16 code unit as a separate
+  keydown/keyup. Per MSDN this is the correct way to emit characters
+  outside the BMP, but a few apps treat the surrogate pair as two
+  individual not-renderable codepoints. Voxtral output is ASCII/Latin in
+  practice so this hasn't bitten anything yet; flag if you see it.
+</div>
+
+<h2>Step 8 — Settings window (egui), keyring, autostart, hot-reload</h2>
+<div class="step">Status: built clean, awaiting test</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Settings UI runs as a <em>subprocess</em>, not in-process.</strong>
+  When the user clicks tray → Settings, the main app spawns
+  <code>draft.exe --settings</code>. The flag is checked very early in
+  <code>main()</code>, bypassing the single-instance gate, the tray, and
+  the hotkey registration. The subprocess runs eframe in its own event
+  loop and exits when its window closes.<br><br>
+  Rationale: eframe owns a winit event loop, and we already own one for
+  the pill / hotkey. Embedding egui into our existing winit App is doable
+  but a lot of code (custom egui_winit wiring, manual repaint scheduling).
+  The subprocess approach is one boundary, two simple loops, and crashes
+  in the settings UI can't take down the pill.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>API keys live in the OS keyring, not in config.toml.</strong>
+  <code>src/secrets.rs</code> wraps the <code>keyring</code> crate using
+  service "Draft" and per-provider slot names
+  (<code>mistral_api_key</code>, <code>groq_api_key</code>, …). Env vars
+  remain a fallback for dev — they take precedence if set, so existing
+  <code>MISTRAL_API_KEY</code> setups keep working. The settings UI reads
+  current values, lets you edit them, and writes them back on Save.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Hot-reload on subprocess exit.</strong>
+  Main process polls the child via <code>try_wait</code> each
+  <code>about_to_wait</code> tick. On exit, it reloads
+  <code>config.toml</code>, rebuilds the transcriber (so a provider/key
+  change takes effect immediately), and if the hotkey string changed,
+  drops the old <code>HotkeyHandle</code> + <code>GlobalHotKeyManager</code>
+  and registers the new combo. No restart required.<br><br>
+  If hotkey re-register fails (the new combo is owned by another app), we
+  keep the old binding and log the error — the app stays usable.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Autostart = HKCU Run registry entry.</strong>
+  <code>src/autostart.rs</code> writes/deletes
+  <code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Draft</code>
+  pointing at <code>current_exe()</code> in quotes. Per-user, no admin,
+  no Task Scheduler quirks. The settings checkbox reads the current state
+  and toggles it on Save.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Hotkey field is a free-text input, not a key-capture widget.</strong>
+  The settings UI exposes <code>hotkey</code> as a plain text field that
+  you type into (e.g. "Ctrl+Backslash", "Alt+F12"). The plan calls for a
+  click-to-capture widget that records the next key combo. Implementing
+  that properly inside egui means handling raw modifier-only states
+  cleanly and round-tripping back through our <code>hotkey::parse</code>.
+  Doable but bigger than this step. Text input gets us to a working
+  settings flow now; capture widget is a follow-up.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>LocalParakeet still routes to Mistral.</strong>
+  Until step 9, the LocalParakeet provider falls through to the Mistral
+  transcriber so the default config (<code>local_parakeet</code>) keeps
+  working. The settings UI exposes the choice with a "not yet wired"
+  label next to the LocalParakeet entry so you know what you're picking.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Settings subprocess inherits stdout/stderr.</strong>
+  When launched from <code>cargo run</code> the subprocess writes to the
+  same terminal. In a release build (windows_subsystem = "windows") there
+  is no terminal, which is fine. But debug from terminal will see
+  interleaved logs from both processes. Could pipe child output through
+  to a per-child tracing target if it gets noisy — leaving it for now.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>No "key looks valid" check on save.</strong>
+  We don't ping the provider to validate the API key when saving. If the
+  user pastes a bad key, they'll discover it the first time they try to
+  transcribe (logged error). A "Test" button next to the API key field
+  that does a tiny request would be friendlier — easy follow-up.
+</div>
+
+<h2>Step 9 — Local Parakeet (transcribe-rs) + model download</h2>
+<div class="step">Status: built clean, awaiting model download + end-to-end test</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Refactored the <code>Transcriber</code> trait to take <code>&amp;[f32]</code> directly.</strong>
+  Originally <code>transcribe(&amp;self, wav_bytes: Vec&lt;u8&gt;)</code> — fit
+  Mistral's multipart upload but forced Parakeet to decode WAV bytes it
+  was about to throw away. New signature is
+  <code>transcribe(&amp;self, samples: &amp;[f32])</code>. Mistral now
+  encodes WAV internally with <code>samples_to_wav_bytes</code>; Parakeet
+  forwards the slice straight into ORT. One less round-trip and the trait
+  reads honest.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>transcribe-rs 0.3 with the <code>onnx</code> feature.</strong>
+  Backend is ONNX Runtime via the <code>ort</code> crate. CPU-only by
+  default — no CUDA/DirectML wiring needed for step 9. <code>ort</code>
+  fetches a prebuilt <code>onnxruntime.dll</code> at build time and lays
+  it next to the exe. The MSI packaging in step 10 needs to include it.
+  GPU acceleration is a single extra Cargo feature flag if we want it
+  later.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Manual model download via a settings-window button.</strong>
+  Four files from
+  <code>huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx</code>
+  (~670 MB total). <code>src/transcribe/parakeet_download.rs</code>
+  streams each file with a <code>.partial</code> suffix and atomic
+  rename, so a Ctrl-C mid-download leaves the model in a clearly-not-ready
+  state. Progress is reported via a callback that the settings UI plumbs
+  into an <code>Arc&lt;Mutex&lt;DownloadState&gt;&gt;</code> shared between
+  the worker thread and the egui frame.<br><br>
+  This is intentionally <em>not</em> a first-run wizard — the user has to
+  click into Settings and explicitly start the download. Step 10 will
+  surface this as part of a friendlier first-run flow.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>LocalParakeet provider no longer proxies to Mistral.</strong>
+  <code>build_transcriber</code> now actually loads the local model. If
+  the model files aren't present, returns <code>None</code> and logs a
+  warning telling the user to open Settings. Switching providers via the
+  settings window will trigger a hot-reload as before — Parakeet load
+  takes ~1–3 s and ~1 GB RAM, but it happens on the main thread during
+  config reload so the user feels it as a brief pause after closing
+  Settings, not during a hotkey press.
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Model load happens eagerly on config reload, not lazily on first transcribe.</strong>
+  Lazy load would defer the 1–3 s pause to the first hotkey press, which
+  feels worse than a pause after the settings window closes. The cost is
+  ~1 GB resident RAM for Parakeet users regardless of whether they
+  transcribe in a given session. Acceptable for now; if it bites, the
+  fix is a lazy wrapper inside <code>ParakeetTranscriber</code>.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Subagent's first answer on the transcribe-rs feature flag was wrong.</strong>
+  Subagent recommended <code>features = ["parakeet"]</code>; the crate
+  actually exposes <code>onnx</code>, <code>whisper-cpp</code>,
+  <code>whisperfile</code>, and <code>openai</code>. cargo errored
+  immediately. Switched to <code>["onnx"]</code> and confirmed by reading
+  the crate source. Worth flagging because "use a subagent for API stuff"
+  doesn't remove the need to verify the build still resolves.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Model integrity is not verified.</strong>
+  The downloader trusts HuggingFace's HTTPS connection but doesn't check
+  SHA256s against a known-good manifest. For a 670 MB file the rename-on-
+  -completion check is a weak proxy. Adding SHA256 verification with a
+  hardcoded expected-hash table is a small, worthwhile follow-up.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>No "model load is in progress" indicator.</strong>
+  When the settings window closes after the user enables LocalParakeet,
+  the main process reloads config and starts a 1–3 s blocking model load.
+  The pill and tray are unresponsive during that window. Probably fine in
+  practice but if it feels janky we should spawn the load on a worker
+  thread and surface "model loading…" state.
+</div>
+
+<h2>Step 10 — First-run wizard, update check, MSI packaging</h2>
+<div class="step">Status: built clean; MSI requires WiX Toolset on the host to produce the .msi</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>First-run = "config file did not exist before this load".</strong>
+  <code>Config::load_with_first_run</code> returns a <code>(Config, bool)</code>
+  where the bool is true iff the file was just created by the default-write
+  path. <code>main</code> reuses the existing
+  <code>App::open_settings</code> path on first run, so the wizard is just
+  "the settings window auto-opens once." No separate flow, no separate
+  state machine. The Settings UI is already designed to be the
+  configuration surface — making first-run another path through it would
+  fork the truth.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Update check is best-effort, async, and silent on failure.</strong>
+  <code>src/update.rs</code> spawns a thread on startup that hits a
+  GitHub Releases-shaped endpoint, parses <code>tag_name</code> +
+  <code>html_url</code>, and writes the result into an
+  <code>Arc&lt;Mutex&lt;UpdateState&gt;&gt;</code>. If the URL is empty
+  (it is, by default — there's no published repo yet) the thread doesn't
+  start. Network failures are logged at debug level and discarded.<br><br>
+  The state handle is returned from <code>spawn_check</code> so a future
+  UI surface (tray tooltip badge, settings banner) can read it without
+  blocking. For now nothing consumes it — the plumbing exists so the
+  banner is a one-file change once we publish.
+</div>
+
+<div class="entry">
+  <span class="tag tag-deviation">deviation</span>
+  <strong>Update-banner UI is not wired yet.</strong>
+  Plan implies a visible "update available" notification. Without a real
+  releases endpoint to point at, building UI for it now would be theater.
+  The state plumbing is there; flipping <code>RELEASES_URL</code> in
+  <code>src/update.rs</code> to the actual repo and adding ~10 lines to
+  the tray tooltip or settings header is all that's left.
+</div>
+
+<div class="entry">
+  <span class="tag tag-decision">decision</span>
+  <strong>Per-user MSI via WiX v3 + cargo-wix.</strong>
+  <code>wix/main.wxs</code> defines a per-user (no-admin) install to
+  <code>%LOCALAPPDATA%\Programs\Draft</code>. Ships <code>draft.exe</code>
+  and the <code>onnxruntime.dll</code> that ort drops next to the binary
+  during a release build. Adds a Start Menu shortcut. Defines a stable
+  <code>UpgradeCode</code> GUID so future versions upgrade in place.<br><br>
+  <em>Deliberately not in the installer:</em> the HKCU\Run autostart
+  entry (Draft toggles that itself from the settings window, so the
+  user's choice survives reinstalls), the Parakeet model files (~670 MB,
+  user-fetched on first run), API keys (live in Credential Manager).
+</div>
+
+<div class="entry">
+  <span class="tag tag-tradeoff">tradeoff</span>
+  <strong>Producing the actual .msi is a manual step on your machine.</strong>
+  WiX Toolset isn't a Cargo dependency — it has to be installed on the
+  build host. <code>wix/README.md</code> walks through it: install
+  WiX v3.14, <code>cargo install cargo-wix</code>, then
+  <code>cargo wix --no-build --nocapture</code>. I can't verify the .msi
+  builds from here. If you hit a WiX error when running it, share the
+  message and I'll fix the manifest.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Code signing.</strong>
+  Unsigned MSIs trigger SmartScreen warnings on first install. The fix is
+  an Authenticode signature using a code-signing certificate (~$200/year
+  for OV, more for EV which bypasses SmartScreen entirely). The WiX build
+  doesn't include a signing step — typical pattern is a post-build
+  <code>signtool sign</code> invocation. Worth doing before distributing
+  widely; not worth doing for dev builds.
+</div>
+
+<div class="entry">
+  <span class="tag tag-open">open question</span>
+  <strong>Version bump is two-place: Cargo.toml and main.wxs.</strong>
+  Standard WiX pain. A pre-commit hook or a tiny build.rs that templates
+  the wxs would fix it. Flagging because it will eventually catch us out;
+  documented in <code>wix/README.md</code> in the meantime.
+</div>
+
+<h2>Plan complete</h2>
+
+<div class="entry">
+  <strong>All 10 steps shipped.</strong>
+  Hotkey → recording pill → 16 kHz capture → FFT-driven visualizer →
+  cloud transcription (Mistral) → local transcription (Parakeet) →
+  clipboard paste (with restore + Unicode fallback) → settings window
+  with keyring-backed secrets → autostart → first-run wizard →
+  update-check plumbing → MSI manifest. End-to-end working today.
+</div>
+
+<div class="entry">
+  <strong>What's left as polish (not blocking):</strong>
+  <ul>
+    <li>Click-to-capture hotkey widget (currently text-entry)</li>
+    <li>"Test key" button in settings UI</li>
+    <li>Update banner UI (plumbing done, no surface yet)</li>
+    <li>Code signing the MSI</li>
+    <li>Single-place version bump</li>
+    <li>SHA256 verification on model download</li>
+    <li>Lazy Parakeet model load + "loading…" indicator</li>
+    <li>Provider adapters: Groq, OpenAI, xAI, ElevenLabs, Reson8</li>
+    <li>Full-clipboard (image/files) restore via Win32 enum formats</li>
+  </ul>
+</div>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  WiX v3 manifest for the Draft MSI.
+
+  Build (after installing WiX Toolset v3 and cargo-wix):
+    cargo build --release
+    cargo wix --no-build --nocapture
+
+  The MSI installs to %LOCALAPPDATA%\Programs\Draft so it works without
+  admin. It ships draft.exe and the onnxruntime.dll that ort placed in
+  target\release. The HKCU\Run autostart entry is NOT written by the
+  installer — Draft manages that itself from the settings window so the
+  user's choice survives reinstall.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="Draft"
+    UpgradeCode="6f8b1f7a-2c4e-4b3c-b1e3-6d9c8a4b9d31"
+    Manufacturer="Draft"
+    Language="1033"
+    Codepage="1252"
+    Version="0.1.0">
+
+    <Package
+      Id="*"
+      Keywords="Installer"
+      Manufacturer="Draft"
+      InstallerVersion="500"
+      Languages="1033"
+      Compressed="yes"
+      InstallScope="perUser"
+      SummaryCodepage="1252" />
+
+    <MajorUpgrade
+      Schedule="afterInstallInitialize"
+      DowngradeErrorMessage="A newer version of Draft is already installed." />
+
+    <Media Id="1" Cabinet="draft.cab" EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="ProgramsFolder" Name="Programs">
+          <Directory Id="APPLICATIONFOLDER" Name="Draft">
+            <Component Id="MainExecutable" Guid="b2a5d1e0-9c4f-4b7a-8e1d-3f9c2a4e1b7d">
+              <File Id="DraftExe"
+                    Source="target\release\draft.exe"
+                    KeyPath="yes"
+                    Checksum="yes" />
+            </Component>
+            <Component Id="OnnxRuntimeDll" Guid="c4b1f3e2-7d8a-4e2b-9f3c-1a5e8d6b4f02">
+              <File Id="OnnxRuntime"
+                    Source="target\release\onnxruntime.dll"
+                    KeyPath="yes"
+                    Checksum="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ShortcutFolder" Name="Draft">
+          <Component Id="StartMenuShortcut" Guid="d3c2e5b4-8e1f-4a3b-9c2d-6e4f1a3b5c7d">
+            <Shortcut Id="DraftShortcut"
+                      Name="Draft"
+                      Description="Push-to-talk speech-to-text"
+                      Target="[APPLICATIONFOLDER]draft.exe"
+                      WorkingDirectory="APPLICATIONFOLDER" />
+            <RemoveFolder Id="RemoveShortcutFolder" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\Draft"
+                           Name="installed"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Complete" Title="Draft" Level="1" Display="expand"
+             ConfigurableDirectory="APPLICATIONFOLDER" AllowAdvertise="no">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="OnnxRuntimeDll" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <Property Id="ARPNOREPAIR" Value="1" Secure="yes" />
+    <Property Id="ARPNOMODIFY" Value="1" Secure="yes" />
+  </Product>
+</Wix>
