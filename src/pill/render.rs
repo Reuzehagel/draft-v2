@@ -19,10 +19,13 @@ fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
     let w = pm.width() as f32;
     let h = pm.height() as f32;
 
-    // Inset by half the border width so the stroke sits fully inside the
-    // pixmap (a centred stroke at the edge would be clipped in half).
+    // Inset by half the border width PLUS a ~1px transparent margin. The
+    // margin is what stops the outer edge looking pixelated: a centred stroke
+    // ending exactly at the pixmap boundary has its anti-aliased falloff
+    // clipped (nowhere to fade into), so the curve stair-steps. The margin
+    // gives that falloff room to blend to full transparency inside the pixmap.
     let border_w = (1.0 * scale).max(1.0);
-    let inset = border_w * 0.5;
+    let inset = border_w * 0.5 + 1.0 * scale;
     let rw = w - 2.0 * inset;
     let rh = h - 2.0 * inset;
     let r = (RADIUS * scale).min(rh / 2.0);
@@ -36,9 +39,9 @@ fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
     fill.anti_alias = true;
     pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
-    // Thin white hairline border.
+    // Thin soft-grey hairline border (a touch softer than pure white).
     let mut border = Paint::default();
-    border.set_color_rgba8(255, 255, 255, 72);
+    border.set_color_rgba8(170, 172, 178, 64);
     border.anti_alias = true;
     let stroke = Stroke {
         width: border_w,
@@ -56,7 +59,7 @@ fn draw_bars(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
 
     let bar_count = bar_heights.len() as f32;
     let bar_w = 2.5 * scale;
-    let bar_gap = 4.0 * scale;
+    let bar_gap = 2.5 * scale;
     let total_w = bar_count * bar_w + (bar_count - 1.0) * bar_gap;
     let start_x = (w - total_w) / 2.0;
     let cy = h / 2.0;

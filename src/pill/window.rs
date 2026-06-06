@@ -8,6 +8,11 @@
 use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
 use anyhow::{anyhow, Result};
 use tiny_skia::Pixmap;
+
+// Render the pill at this multiple of device resolution, then downscale with
+// bilinear filtering. The extra samples per device pixel smooth the rounded
+// outline far better than rasterising straight at device resolution.
+const SUPERSAMPLE: u32 = 3;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -17,6 +22,7 @@ pub struct PillWindow {
     pub window: Window,
     pub scale: f32,
     pixmap: Pixmap,
+    hires: Pixmap,
     #[cfg(windows)]
     layered: LayeredSurface,
 }
@@ -56,6 +62,8 @@ impl PillWindow {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
+        let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
+            .ok_or_else(|| anyhow!("hires pixmap"))?;
 
         #[cfg(windows)]
         let layered = LayeredSurface::new(&window, w, h)?;
@@ -64,6 +72,7 @@ impl PillWindow {
             window,
             scale,
             pixmap,
+            hires,
             #[cfg(windows)]
             layered,
         })
@@ -78,10 +87,33 @@ impl PillWindow {
         let (w, h) = (size.width.max(1), size.height.max(1));
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
+            self.hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
+                .ok_or_else(|| anyhow!("hires pixmap"))?;
             #[cfg(windows)]
             self.layered.resize(&self.window, w, h)?;
         }
-        crate::pill::render::draw_recording(&mut self.pixmap, self.scale, bar_heights);
+
+        // Draw at SUPERSAMPLE× scale into the hi-res buffer, then downscale
+        // into the device pixmap with bilinear filtering for a smooth edge.
+        crate::pill::render::draw_recording(
+            &mut self.hires,
+            self.scale * SUPERSAMPLE as f32,
+            bar_heights,
+        );
+        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        let paint = tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bilinear,
+            ..Default::default()
+        };
+        let inv = 1.0 / SUPERSAMPLE as f32;
+        self.pixmap.draw_pixmap(
+            0,
+            0,
+            self.hires.as_ref(),
+            &paint,
+            tiny_skia::Transform::from_scale(inv, inv),
+            None,
+        );
 
         #[cfg(windows)]
         {
