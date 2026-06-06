@@ -133,52 +133,60 @@ impl LayeredSurface {
     }
 
     fn present(&mut self, pm: &Pixmap) -> Result<()> {
+        let byte_count = (self.w * self.h * 4) as usize;
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, byte_count) };
+        crate::pill::render::pixmap_to_premul_bgra(pm, dst);
+
+        // Normally we just blit. Re-arming WS_EX_LAYERED briefly drops the
+        // window out of per-pixel-alpha mode, so Windows flashes it as a plain
+        // square for a frame — doing that every frame made the pill visibly
+        // flicker between its rounded shape and a bare rectangle.
+        //
+        // winit's message pump can still re-enter `SetLayeredWindowAttributes`
+        // on window state changes (visibility, focus, DPI), which is mutually
+        // exclusive with UpdateLayeredWindow's per-pixel-alpha mode and makes
+        // it fail with E_INVALIDARG. So re-arm ONLY on failure, then retry.
+        unsafe {
+            if self.update_layered().is_err() {
+                rearm_layered(self.hwnd);
+                self.update_layered()?;
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn update_layered(&self) -> Result<()> {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::Graphics::Gdi::{
             GetDC, ReleaseDC, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
         };
         use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
-        let byte_count = (self.w * self.h * 4) as usize;
-        let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, byte_count) };
-        crate::pill::render::pixmap_to_premul_bgra(pm, dst);
-
-        // winit's message pump re-enters `SetLayeredWindowAttributes` on
-        // various window state changes (visibility, focus, DPI), which is
-        // mutually exclusive with UpdateLayeredWindow's per-pixel-alpha mode
-        // and causes subsequent UpdateLayeredWindow calls to fail with
-        // E_INVALIDARG. Toggling WS_EX_LAYERED off-then-on right before each
-        // call clears that state. Per MS docs this is the documented fix.
-        unsafe { rearm_layered(self.hwnd) };
-
-        unsafe {
-            let screen_dc = GetDC(None);
-            let size = windows::Win32::Foundation::SIZE {
-                cx: self.w as i32,
-                cy: self.h as i32,
-            };
-            let src_pt = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let res = UpdateLayeredWindow(
-                self.hwnd,
-                screen_dc,
-                None,
-                Some(&size),
-                self.mem_dc,
-                Some(&src_pt),
-                windows::Win32::Foundation::COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            ReleaseDC(None, screen_dc);
-            res.map_err(|e| anyhow!("UpdateLayeredWindow: {e}"))?;
-        }
-        Ok(())
+        let screen_dc = GetDC(None);
+        let size = windows::Win32::Foundation::SIZE {
+            cx: self.w as i32,
+            cy: self.h as i32,
+        };
+        let src_pt = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let res = UpdateLayeredWindow(
+            self.hwnd,
+            screen_dc,
+            None,
+            Some(&size),
+            self.mem_dc,
+            Some(&src_pt),
+            windows::Win32::Foundation::COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        ReleaseDC(None, screen_dc);
+        res.map_err(|e| anyhow!("UpdateLayeredWindow: {e}"))
     }
 
     unsafe fn destroy_gdi(&mut self) {
