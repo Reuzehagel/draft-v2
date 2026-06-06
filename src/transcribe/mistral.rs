@@ -4,8 +4,7 @@
 // with fields: file=<wav bytes>, model=<id>, language=<iso>. Bearer auth.
 // Response JSON has a top-level "text" field with the transcript.
 
-use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use super::Transcriber;
@@ -24,10 +23,7 @@ pub struct MistralTranscriber {
 
 impl MistralTranscriber {
     pub fn new(api_key: String) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("build reqwest client")?;
+        let client = super::http_client(REQUEST_TIMEOUT)?;
         Ok(Self {
             api_key,
             model: DEFAULT_MODEL.into(),
@@ -35,11 +31,6 @@ impl MistralTranscriber {
             client,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct MistralResponse {
-    text: String,
 }
 
 impl Transcriber for MistralTranscriber {
@@ -69,17 +60,6 @@ impl Transcriber for MistralTranscriber {
             .send()
             .context("POST to Mistral")?;
 
-        let status = resp.status();
-        let body = resp.text().context("read response body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Mistral returned {}: {}",
-                status,
-                body.chars().take(500).collect::<String>()
-            ));
-        }
-        let parsed: MistralResponse = serde_json::from_str(&body)
-            .with_context(|| format!("parse Mistral response: {}", &body[..body.len().min(200)]))?;
-        Ok(parsed.text)
+        super::parse_text_response("Mistral", resp)
     }
 }

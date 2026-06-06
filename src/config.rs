@@ -7,7 +7,6 @@ pub struct Config {
     pub hotkey: String,
     pub activation: Activation,
     pub provider: Provider,
-    pub autostart: bool,
     pub append_trailing_space: bool,
     pub restore_clipboard: bool,
     pub double_press_lock: bool,
@@ -49,7 +48,6 @@ impl Default for Config {
             hotkey: "Ctrl+Backslash".into(),
             activation: Activation::Hold,
             provider: Provider::LocalParakeet,
-            autostart: false,
             append_trailing_space: true,
             restore_clipboard: true,
             double_press_lock: true,
@@ -73,17 +71,30 @@ impl Config {
             return Ok((cfg, true));
         }
         let text = std::fs::read_to_string(&path)?;
-        let cfg: Self = toml::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "config parse failed, using defaults");
-            Self::default()
-        });
+        let cfg: Self = match toml::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // Don't silently overwrite the user's settings on the next save:
+                // preserve the unparseable file as a .bak so it can be recovered.
+                let backup = path.with_extension("toml.bak");
+                if let Err(be) = std::fs::rename(&path, &backup) {
+                    tracing::warn!(error = %be, "could not back up corrupt config");
+                }
+                tracing::warn!(
+                    error = %e,
+                    backup = %backup.display(),
+                    "config parse failed, using defaults (corrupt file backed up)"
+                );
+                Self::default()
+            }
+        };
         Ok((cfg, false))
     }
 
     pub fn save(&self) -> Result<()> {
         let path = crate::paths::config_file()?;
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text)?;
-        Ok(())
+        // Atomic replace so a crash mid-write can't leave a truncated config.
+        crate::paths::atomic_write(&path, text)
     }
 }

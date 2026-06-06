@@ -96,5 +96,16 @@ fn newer_than(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u32> {
         s.split('.').filter_map(|p| p.parse().ok()).collect()
     };
-    parse(latest) > parse(current)
+    let (l, c) = (parse(latest), parse(current));
+    // Compare component-by-component, treating missing trailing components as
+    // zero, so "1.2" and "1.2.0" compare equal and "1.3" isn't seen as newer
+    // than "1.3.5". A plain Vec compare would mis-rank unequal-length versions.
+    let n = l.len().max(c.len());
+    for i in 0..n {
+        let (lv, cv) = (l.get(i).copied().unwrap_or(0), c.get(i).copied().unwrap_or(0));
+        if lv != cv {
+            return lv > cv;
+        }
+    }
+    false
 }

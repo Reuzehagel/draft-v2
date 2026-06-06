@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_V,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_V,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -56,9 +56,24 @@ fn type_unicode(text: &str) -> Result<()> {
     // Per character: one keydown + one keyup with KEYEVENTF_UNICODE.
     // Surrogate pairs need to be emitted as two separate inputs.
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.encode_utf16().count() * 2);
-    for unit in text.encode_utf16() {
-        inputs.push(unicode_event(unit, false));
-        inputs.push(unicode_event(unit, true));
+    let mut utf16 = [0u16; 2];
+    for ch in text.chars() {
+        match ch {
+            // A literal LF (wScan 0x0A) is a control char most edit controls
+            // ignore — emit a real Return keystroke instead. Skip CR so CRLF
+            // collapses to a single newline.
+            '\r' => {}
+            '\n' => {
+                inputs.push(key_event(VK_RETURN, false));
+                inputs.push(key_event(VK_RETURN, true));
+            }
+            _ => {
+                for unit in ch.encode_utf16(&mut utf16) {
+                    inputs.push(unicode_event(*unit, false));
+                    inputs.push(unicode_event(*unit, true));
+                }
+            }
+        }
     }
     if inputs.is_empty() {
         return Ok(());

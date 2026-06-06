@@ -494,7 +494,12 @@ impl SettingsApp {
     }
 
     fn parakeet_row(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut state = self.download_state.lock().unwrap();
+        // Recover rather than panic if the download worker poisoned the lock —
+        // a failed download shouldn't take down the whole settings window.
+        let mut state = self
+            .download_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         split_row(
             ui,
             |ui| {
@@ -533,12 +538,15 @@ impl SettingsApp {
                         state.finished = None;
                         state.progress = None;
                         let handle = self.download_state.clone();
+                        let repaint_ctx = ctx.clone();
                         std::thread::spawn(move || {
                             let cb = {
                                 let handle = handle.clone();
+                                let repaint_ctx = repaint_ctx.clone();
                                 move |p: DlProgress| {
                                     let mut s = handle.lock().unwrap();
                                     s.progress = Some(p);
+                                    repaint_ctx.request_repaint();
                                 }
                             };
                             let result = parakeet_download::download(cb);
@@ -546,6 +554,10 @@ impl SettingsApp {
                             s.running = false;
                             s.model_present = parakeet_download::is_present();
                             s.finished = Some(result.map_err(|e| e.to_string()));
+                            drop(s);
+                            // The progress repaint loop stops once running=false;
+                            // wake the UI once more so the final state shows.
+                            repaint_ctx.request_repaint();
                         });
                     }
                 }

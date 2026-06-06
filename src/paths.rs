@@ -30,3 +30,15 @@ pub fn models_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&p).ok();
     Ok(p)
 }
+
+/// Write `contents` to `path` atomically: write a sibling temp file, then
+/// rename it over the target so a crash mid-write can never leave a
+/// truncated/empty file in place.
+pub fn atomic_write(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}

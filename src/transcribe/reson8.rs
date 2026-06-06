@@ -10,8 +10,7 @@
 // but the prerecorded endpoint accepts the static ApiKey scheme directly, so
 // we use that and keep this a one-request client like the other adapters.
 
-use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use super::Transcriber;
@@ -28,21 +27,13 @@ pub struct Reson8Transcriber {
 
 impl Reson8Transcriber {
     pub fn new(api_key: String) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("build reqwest client")?;
+        let client = super::http_client(REQUEST_TIMEOUT)?;
         Ok(Self {
             api_key,
             language: Some("en".into()),
             client,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct Reson8Response {
-    text: String,
 }
 
 impl Transcriber for Reson8Transcriber {
@@ -68,17 +59,6 @@ impl Transcriber for Reson8Transcriber {
 
         let resp = req.body(wav_bytes).send().context("POST to Reson8")?;
 
-        let status = resp.status();
-        let body = resp.text().context("read response body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Reson8 returned {}: {}",
-                status,
-                body.chars().take(500).collect::<String>()
-            ));
-        }
-        let parsed: Reson8Response = serde_json::from_str(&body)
-            .with_context(|| format!("parse Reson8 response: {}", &body[..body.len().min(200)]))?;
-        Ok(parsed.text)
+        super::parse_text_response("Reson8", resp)
     }
 }

@@ -311,19 +311,8 @@ fn wav_dump_path() -> PathBuf {
 }
 
 fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: audio::TARGET_SR,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut w = hound::WavWriter::create(path, spec)?;
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let v = (clamped * i16::MAX as f32) as i16;
-        w.write_sample(v)?;
-    }
-    w.finalize()?;
+    let bytes = transcribe::samples_to_wav_bytes(samples, audio::TARGET_SR)?;
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 

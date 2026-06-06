@@ -51,18 +51,24 @@ impl StreamingResampler {
 
         self.input_buffer.extend_from_slice(mono_in);
         while self.input_buffer.len() >= CHUNK_IN {
-            let chunk: Vec<f32> = self.input_buffer.drain(..CHUNK_IN).collect();
-            let input_slice = [chunk.as_slice()];
-            let mut output_slice = [self.output_scratch.as_mut_slice()];
-            match resampler.process_into_buffer(&input_slice, &mut output_slice, None) {
-                Ok((_, out_frames)) => {
-                    self.output_buffer
-                        .extend_from_slice(&self.output_scratch[..out_frames]);
+            // Borrow the chunk in place — no per-iteration heap allocation in
+            // this RT-sensitive path. We drain afterward, once the borrow ends.
+            let out_frames = {
+                let input_slice = [&self.input_buffer[..CHUNK_IN]];
+                let mut output_slice = [self.output_scratch.as_mut_slice()];
+                match resampler.process_into_buffer(&input_slice, &mut output_slice, None) {
+                    Ok((_, out_frames)) => Some(out_frames),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "resampler chunk failed");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "resampler chunk failed");
-                }
+            };
+            if let Some(out_frames) = out_frames {
+                self.output_buffer
+                    .extend_from_slice(&self.output_scratch[..out_frames]);
             }
+            self.input_buffer.drain(..CHUNK_IN);
         }
         &self.output_buffer
     }

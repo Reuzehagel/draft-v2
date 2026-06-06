@@ -43,19 +43,8 @@ impl Fsm {
         }
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-        self.recording = false;
-        self.locked = false;
-        self.last_press = None;
-    }
-
     pub fn mark_busy(&mut self, until: Instant) {
         self.busy_until = Some(until);
-    }
-
-    pub fn is_recording(&self) -> bool {
-        self.recording
     }
 
     pub fn step(&mut self, ev: InEvent) -> OutEvent {

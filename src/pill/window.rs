@@ -197,7 +197,7 @@ impl LayeredSurface {
     }
 
     fn present(&mut self, pm: &Pixmap) -> Result<()> {
-        let byte_count = (self.w * self.h * 4) as usize;
+        let byte_count = self.w as usize * self.h as usize * 4;
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, byte_count) };
         crate::pill::render::pixmap_to_premul_bgra(pm, dst);
 
@@ -255,11 +255,15 @@ impl LayeredSurface {
 
     unsafe fn destroy_gdi(&mut self) {
         use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
-        if !self.dib.is_invalid() {
-            let _ = DeleteObject(self.dib);
-        }
+        // Delete the DC first: the DIB is still selected into it, and GDI
+        // refuses to delete a selected bitmap. DeleteDC deselects it, so the
+        // subsequent DeleteObject actually frees the DIB's backing memory
+        // instead of leaking it on every resize.
         if !self.mem_dc.is_invalid() {
             let _ = DeleteDC(self.mem_dc);
+        }
+        if !self.dib.is_invalid() {
+            let _ = DeleteObject(self.dib);
         }
     }
 }

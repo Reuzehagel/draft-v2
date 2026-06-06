@@ -60,9 +60,11 @@ impl Capture {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &stream_cfg,
                 move |data: &[i16], _: &_| {
+                    // Divide by 32768 (not i16::MAX = 32767) so the most-negative
+                    // sample i16::MIN maps to exactly -1.0 and stays in [-1, 1].
                     let f: Vec<f32> = data
                         .iter()
-                        .map(|&s| s as f32 / i16::MAX as f32)
+                        .map(|&s| s as f32 / 32768.0)
                         .collect();
                     let mono = downmix(&f, channels);
                     let out = resampler.process(&mono);

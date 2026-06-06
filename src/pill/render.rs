@@ -22,6 +22,9 @@ pub fn draw_recording(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
 /// green while the (frozen) waveform bars hold. `alpha` (0..1) multiplies the
 /// whole pill for the fade-out at the end.
 pub fn draw_success(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
+    // Clamp so an easing overshoot/undershoot can't produce a negative alpha
+    // (which `as u8` would turn into 0, blanking the whole pill for a frame).
+    let alpha = alpha.clamp(0.0, 1.0);
     clear_transparent(pm);
     draw_pill_shape(pm, scale, SUCCESS, 235, alpha);
     draw_bars(pm, scale, bar_heights, alpha);
@@ -127,7 +130,10 @@ fn rounded_rect(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, r: f32) {
 pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8]) {
     let src = pm.data();
     debug_assert_eq!(src.len(), dst.len());
-    for i in 0..(src.len() / 4) {
+    // Bound by the shorter buffer so a size desync can never become an
+    // out-of-bounds write in release builds (where the assert is compiled out).
+    let pixels = src.len().min(dst.len()) / 4;
+    for i in 0..pixels {
         dst[i * 4] = src[i * 4 + 2];     // B
         dst[i * 4 + 1] = src[i * 4 + 1]; // G
         dst[i * 4 + 2] = src[i * 4];     // R

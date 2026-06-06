@@ -33,12 +33,6 @@ const IDLE_WOBBLE: f32 = 0.10; // breathing amplitude
 const IDLE_SPEED: f32 = 3.0; // radians/sec
 const IDLE_BAR_OFFSET: f32 = 0.7; // phase shift per bar → wave travels across
 
-pub struct LevelMeter; // kept for API stability; no longer used by the pill
-impl LevelMeter {
-    pub fn new() -> Self { Self }
-    pub fn sample(&mut self, _buffer: &Buffer) -> f32 { 0.0 }
-}
-
 pub struct BandMeter {
     n_bands: usize,
     bars: Vec<f32>,

@@ -24,13 +24,21 @@ impl Buffer {
 
     pub fn extend(&self, samples: &[f32]) {
         let mut buf = self.inner.lock();
+        // A single chunk at least as large as the cap can't coexist with any
+        // existing samples: keep only its trailing `cap` samples. (Guards
+        // against copy_within below panicking when overflow > buf.len().)
+        if samples.len() >= self.cap {
+            buf.clear();
+            buf.extend_from_slice(&samples[samples.len() - self.cap..]);
+            return;
+        }
         let new_len = buf.len() + samples.len();
         if new_len > self.cap {
-            let overflow = new_len - self.cap;
+            let overflow = new_len - self.cap; // < buf.len() given the guard above
             // Faster than drain(..n) for big shifts: copy tail to front, truncate.
             buf.copy_within(overflow.., 0);
-            let new_len = buf.len() - overflow;
-            buf.truncate(new_len);
+            let kept = buf.len() - overflow;
+            buf.truncate(kept);
         }
         buf.extend_from_slice(samples);
     }

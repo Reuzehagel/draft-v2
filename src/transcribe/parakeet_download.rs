@@ -31,7 +31,6 @@ pub fn is_present() -> bool {
 pub struct Progress {
     pub file_index: usize,
     pub file_count: usize,
-    pub file_name: String,
     pub bytes_done: u64,
     pub bytes_total: Option<u64>,
 }
@@ -42,21 +41,19 @@ pub fn download(cb: impl Fn(Progress)) -> Result<()> {
     let dir = model_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60 * 30))
-        .build()
-        .context("build downloader client")?;
+    let client = super::http_client(std::time::Duration::from_secs(60 * 30))?;
 
     for (i, name) in REQUIRED_FILES.iter().enumerate() {
+        let progress = |bytes_done, bytes_total| Progress {
+            file_index: i,
+            file_count: REQUIRED_FILES.len(),
+            bytes_done,
+            bytes_total,
+        };
         let final_path = dir.join(name);
         if final_path.is_file() {
-            cb(Progress {
-                file_index: i,
-                file_count: REQUIRED_FILES.len(),
-                file_name: (*name).into(),
-                bytes_done: final_path.metadata().map(|m| m.len()).unwrap_or(0),
-                bytes_total: final_path.metadata().ok().map(|m| m.len()),
-            });
+            let len = final_path.metadata().ok().map(|m| m.len());
+            cb(progress(len.unwrap_or(0), len));
             continue;
         }
         let url = format!("{}/{}", BASE_URL, name);
@@ -81,28 +78,30 @@ pub fn download(cb: impl Fn(Progress)) -> Result<()> {
             file.write_all(&buf[..n]).context("write chunk")?;
             done += n as u64;
             if last_report.elapsed() > std::time::Duration::from_millis(100) {
-                cb(Progress {
-                    file_index: i,
-                    file_count: REQUIRED_FILES.len(),
-                    file_name: (*name).into(),
-                    bytes_done: done,
-                    bytes_total: total,
-                });
+                cb(progress(done, total));
                 last_report = std::time::Instant::now();
             }
         }
         file.flush().ok();
         drop(file);
+
+        // Reject a truncated download: if the server told us the length and we
+        // got fewer bytes, the connection dropped mid-stream. Leaving the
+        // .partial in place (not renaming to final) means is_present() stays
+        // false and the next run retries instead of loading a corrupt model.
+        if let Some(total) = total {
+            if done != total {
+                let _ = std::fs::remove_file(&partial);
+                return Err(anyhow!(
+                    "download {name} truncated: got {done} of {total} bytes"
+                ));
+            }
+        }
+
         std::fs::rename(&partial, &final_path).with_context(|| {
             format!("rename {} -> {}", partial.display(), final_path.display())
         })?;
-        cb(Progress {
-            file_index: i,
-            file_count: REQUIRED_FILES.len(),
-            file_name: (*name).into(),
-            bytes_done: done,
-            bytes_total: total.or(Some(done)),
-        });
+        cb(progress(done, total.or(Some(done))));
     }
     Ok(())
 }
