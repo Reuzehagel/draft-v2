@@ -1,7 +1,7 @@
 // tiny-skia renderers for the pill. Produces a premultiplied BGRA byte
 // buffer suitable for UpdateLayeredWindow with AC_SRC_ALPHA.
 
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 const RADIUS: f32 = 18.0;
 
@@ -18,16 +18,33 @@ pub fn draw_recording(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
 fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
     let w = pm.width() as f32;
     let h = pm.height() as f32;
-    let r = (RADIUS * scale).min(h / 2.0);
 
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(13, 13, 13, 245);
-    paint.anti_alias = true;
+    // Inset by half the border width so the stroke sits fully inside the
+    // pixmap (a centred stroke at the edge would be clipped in half).
+    let border_w = (1.0 * scale).max(1.0);
+    let inset = border_w * 0.5;
+    let rw = w - 2.0 * inset;
+    let rh = h - 2.0 * inset;
+    let r = (RADIUS * scale).min(rh / 2.0);
 
     let mut pb = PathBuilder::new();
-    rounded_rect(&mut pb, 0.0, 0.0, w, h, r);
+    rounded_rect(&mut pb, inset, inset, rw, rh, r);
     let path = pb.finish().unwrap();
-    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+    let mut fill = Paint::default();
+    fill.set_color_rgba8(13, 13, 13, 245);
+    fill.anti_alias = true;
+    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
+
+    // Thin white hairline border.
+    let mut border = Paint::default();
+    border.set_color_rgba8(255, 255, 255, 72);
+    border.anti_alias = true;
+    let stroke = Stroke {
+        width: border_w,
+        ..Default::default()
+    };
+    pm.stroke_path(&path, &border, &stroke, Transform::identity(), None);
 }
 
 fn draw_bars(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {

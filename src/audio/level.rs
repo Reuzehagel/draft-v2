@@ -22,8 +22,16 @@ const LO_HZ: f32 = 80.0;
 const HI_HZ: f32 = 4000.0;
 const NOISE_FLOOR_DB: f32 = -65.0;
 const FULL_SCALE_DB: f32 = -15.0;
-const ATTACK_MS: f32 = 50.0;
-const RELEASE_MS: f32 = 150.0;
+const ATTACK_MS: f32 = 40.0;
+const RELEASE_MS: f32 = 110.0;
+
+// "Listening" idle motion: a gentle traveling wave so the bars keep breathing
+// during pauses instead of sitting still. The real signal overrides it the
+// moment you actually speak (we take the max of the two).
+const IDLE_BASE: f32 = 0.06; // resting height
+const IDLE_WOBBLE: f32 = 0.10; // breathing amplitude
+const IDLE_SPEED: f32 = 3.0; // radians/sec
+const IDLE_BAR_OFFSET: f32 = 0.7; // phase shift per bar → wave travels across
 
 pub struct LevelMeter; // kept for API stability; no longer used by the pill
 impl LevelMeter {
@@ -34,6 +42,8 @@ impl LevelMeter {
 pub struct BandMeter {
     n_bands: usize,
     bars: Vec<f32>,
+    out: Vec<f32>,
+    phase: f32,
     bin_ranges: Vec<(usize, usize)>,
     window: Vec<f32>,
     fft: Arc<dyn realfft::RealToComplex<f32>>,
@@ -78,6 +88,8 @@ impl BandMeter {
         Self {
             n_bands,
             bars: vec![0.0; n_bands],
+            out: vec![0.0; n_bands],
+            phase: 0.0,
             bin_ranges,
             window,
             fft,
@@ -91,6 +103,10 @@ impl BandMeter {
         for v in &mut self.bars {
             *v = 0.0;
         }
+        for v in &mut self.out {
+            *v = 0.0;
+        }
+        self.phase = 0.0;
         self.last_tick = None;
     }
 
@@ -101,6 +117,7 @@ impl BandMeter {
             .map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
             .unwrap_or(33.0);
         self.last_tick = Some(now);
+        self.phase += dt_ms / 1000.0;
 
         let targets = self.compute_band_targets(buffer);
         let attack_alpha = 1.0 - (-dt_ms / ATTACK_MS).exp();
@@ -109,7 +126,15 @@ impl BandMeter {
             let alpha = if target > *cur { attack_alpha } else { release_alpha };
             *cur += alpha * (target - *cur);
         }
-        &self.bars
+
+        // Blend in the idle wave: each bar gets a phase-shifted sine so the
+        // motion travels across the pill. max() means real speech always wins.
+        for (i, &cur) in self.bars.iter().enumerate() {
+            let phase_i = self.phase * IDLE_SPEED + i as f32 * IDLE_BAR_OFFSET;
+            let wobble = IDLE_BASE + IDLE_WOBBLE * (phase_i.sin() * 0.5 + 0.5);
+            self.out[i] = cur.max(wobble).clamp(0.0, 1.0);
+        }
+        &self.out
     }
 
     fn compute_band_targets(&mut self, buffer: &Buffer) -> Vec<f32> {
