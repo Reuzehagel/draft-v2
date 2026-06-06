@@ -33,6 +33,10 @@ use winit::window::WindowId;
 
 const PILL_FRAME_RATE_HZ: u64 = 30;
 
+/// How long the pill lingers after a capture, showing the green border
+/// before it fades and disappears.
+const SUCCESS_LINGER: Duration = Duration::from_millis(500);
+
 /// Release the on-device model from RAM after this much dictation inactivity.
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -91,6 +95,8 @@ fn main() -> Result<()> {
         transcriber,
         cfg,
         settings_child: None,
+        success_anim: None,
+        last_bars: vec![0.0; pill::BAR_COUNT],
     };
     if first_run {
         tracing::info!("first run detected; opening settings");
@@ -123,6 +129,11 @@ struct App {
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
     settings_child: Option<std::process::Child>,
+    /// When set, the pill is playing its post-capture success animation
+    /// (green border) starting at this instant, after which it's dropped.
+    success_anim: Option<Instant>,
+    /// Most recent waveform bars, frozen and reused during the success linger.
+    last_bars: Vec<f32>,
 }
 
 fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
@@ -192,6 +203,9 @@ impl App {
             }
         }
 
+        // A quick re-trigger during the success linger supersedes it.
+        self.success_anim = None;
+
         match pill::window::PillWindow::create(el) {
             Ok(mut pw) => {
                 self.bands.reset();
@@ -208,20 +222,28 @@ impl App {
         }
     }
 
-    fn stop_session(&mut self) {
-        // Drop the pill window first so the visual "I'm done" is immediate
-        // even if transcription takes a moment.
+    /// Tear down the pill immediately (no success animation).
+    fn dismiss_pill(&mut self) {
+        self.success_anim = None;
         if let Some(pw) = self.pill.take() {
             drop(pw);
         }
+    }
 
+    fn stop_session(&mut self) {
+        // Stop capturing immediately (this freezes the bars), but keep the
+        // pill window around — if we end up dispatching a transcription we
+        // replace the bars with a brief green-checkmark "success" animation.
         let Some(cap) = self.capture.take() else {
+            self.dismiss_pill();
             tracing::warn!("session: STOP without active capture");
             return;
         };
         let samples = cap.buffer.take();
         let duration_ms = samples.len() as u64 * 1000 / audio::TARGET_SR as u64;
         if samples.len() < (audio::TARGET_SR as usize * 150) / 1000 {
+            // Nothing usable captured — just disappear, no success checkmark.
+            self.dismiss_pill();
             tracing::info!(duration_ms, "session: STOP (too short, dropped)");
             return;
         }
@@ -238,9 +260,14 @@ impl App {
         }
 
         let Some(transcriber) = self.transcriber.clone() else {
+            self.dismiss_pill();
             tracing::warn!("no transcriber configured; skipping paste");
             return;
         };
+
+        // We're committing to a transcription — play the success linger.
+        self.success_anim = Some(Instant::now());
+
         let append_space = self.cfg.append_trailing_space;
         let restore_clipboard = self.cfg.restore_clipboard;
         let paste_mode = match self.cfg.paste_mode {
@@ -343,6 +370,13 @@ impl ApplicationHandler for App {
             t.unload_if_idle(MODEL_IDLE_TIMEOUT);
         }
 
+        // Retire the pill once the success animation has run its course.
+        if let Some(start) = self.success_anim {
+            if start.elapsed() >= SUCCESS_LINGER {
+                self.dismiss_pill();
+            }
+        }
+
         // When the pill is up, drive frame redraws ourselves at ~30 Hz.
         // Otherwise idle wait so we don't spin.
         if self.pill.is_some() {
@@ -426,12 +460,26 @@ impl App {
 
     fn redraw_pill(&mut self) {
         let Some(pill) = self.pill.as_mut() else { return };
+
+        // Success state: soft-green border over the frozen bars, holding then
+        // fading out over the final stretch (elapsed fraction of the linger).
+        if let Some(start) = self.success_anim {
+            let t = (start.elapsed().as_secs_f32() / SUCCESS_LINGER.as_secs_f32()).clamp(0.0, 1.0);
+            // Hold fully opaque, then fade over the last 30%.
+            let alpha = if t < 0.7 { 1.0 } else { ((1.0 - t) / 0.3).clamp(0.0, 1.0) };
+            if let Err(e) = pill.render_success(&self.last_bars, alpha) {
+                tracing::error!(error = %e, "pill success render failed");
+            }
+            return;
+        }
+
         let bars = if let Some(cap) = self.capture.as_ref() {
             let raw = self.bands.tick(&cap.buffer).to_vec();
             audio::level::shape_bars(&raw)
         } else {
             vec![0.0; pill::BAR_COUNT]
         };
+        self.last_bars = bars.clone();
         if let Err(e) = pill.render_recording(&bars) {
             tracing::error!(error = %e, "pill render failed");
         }

@@ -9,10 +9,13 @@ use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
 use anyhow::{anyhow, Result};
 use tiny_skia::Pixmap;
 
-// Render the pill at this multiple of device resolution, then downscale with
-// bilinear filtering. The extra samples per device pixel smooth the rounded
-// outline far better than rasterising straight at device resolution.
-const SUPERSAMPLE: u32 = 3;
+// Render the pill at this multiple of device resolution, then downscale to
+// device size by halving twice (4×→2×→1×). Each halving is an exact 2×
+// reduction, where bilinear sampling becomes a clean 2×2 box average — this
+// avoids both bilinear's undersampling (when downscaling >2× in one shot) and
+// bicubic's ringing halos at the high-contrast border edge. Must be a power of
+// two so the halving chain lands exactly on device resolution.
+const SUPERSAMPLE: u32 = 4;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -23,6 +26,8 @@ pub struct PillWindow {
     pub scale: f32,
     pixmap: Pixmap,
     hires: Pixmap,
+    // Intermediate 2× buffer for the halving downscale chain.
+    mid: Pixmap,
     #[cfg(windows)]
     layered: LayeredSurface,
 }
@@ -64,6 +69,7 @@ impl PillWindow {
         let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
         let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
             .ok_or_else(|| anyhow!("hires pixmap"))?;
+        let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
 
         #[cfg(windows)]
         let layered = LayeredSurface::new(&window, w, h)?;
@@ -73,6 +79,7 @@ impl PillWindow {
             scale,
             pixmap,
             hires,
+            mid,
             #[cfg(windows)]
             layered,
         })
@@ -83,37 +90,62 @@ impl PillWindow {
     }
 
     pub fn render_recording(&mut self, bar_heights: &[f32]) -> Result<()> {
+        self.ensure_size()?;
+        crate::pill::render::draw_recording(
+            &mut self.hires,
+            self.scale * SUPERSAMPLE as f32,
+            bar_heights,
+        );
+        self.blit_and_present()
+    }
+
+    /// Render the post-capture success frame: a soft-green border over the
+    /// frozen waveform bars, with `alpha` fading the whole pill out at the end.
+    pub fn render_success(&mut self, bar_heights: &[f32], alpha: f32) -> Result<()> {
+        self.ensure_size()?;
+        crate::pill::render::draw_success(
+            &mut self.hires,
+            self.scale * SUPERSAMPLE as f32,
+            bar_heights,
+            alpha,
+        );
+        self.blit_and_present()
+    }
+
+    fn ensure_size(&mut self) -> Result<()> {
         let size = self.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
             self.hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
                 .ok_or_else(|| anyhow!("hires pixmap"))?;
+            self.mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
             #[cfg(windows)]
             self.layered.resize(&self.window, w, h)?;
         }
+        Ok(())
+    }
 
-        // Draw at SUPERSAMPLE× scale into the hi-res buffer, then downscale
-        // into the device pixmap with bilinear filtering for a smooth edge.
-        crate::pill::render::draw_recording(
-            &mut self.hires,
-            self.scale * SUPERSAMPLE as f32,
-            bar_heights,
-        );
-        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+    /// Downscale the hi-res buffer to device size by halving twice (4×→2×→1×),
+    /// then push it through UpdateLayeredWindow. Each halving is an exact 2×
+    /// reduction so bilinear acts as a clean box average — no undersampling, no
+    /// ringing.
+    fn blit_and_present(&mut self) -> Result<()> {
         let paint = tiny_skia::PixmapPaint {
             quality: tiny_skia::FilterQuality::Bilinear,
             ..Default::default()
         };
-        let inv = 1.0 / SUPERSAMPLE as f32;
-        self.pixmap.draw_pixmap(
-            0,
-            0,
-            self.hires.as_ref(),
-            &paint,
-            tiny_skia::Transform::from_scale(inv, inv),
-            None,
-        );
+        let half = tiny_skia::Transform::from_scale(0.5, 0.5);
+
+        // 4× → 2×
+        self.mid.fill(tiny_skia::Color::TRANSPARENT);
+        self.mid
+            .draw_pixmap(0, 0, self.hires.as_ref(), &paint, half, None);
+
+        // 2× → 1× (device)
+        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        self.pixmap
+            .draw_pixmap(0, 0, self.mid.as_ref(), &paint, half, None);
 
         #[cfg(windows)]
         {

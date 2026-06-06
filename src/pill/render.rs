@@ -5,6 +5,9 @@ use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Trans
 
 const RADIUS: f32 = 18.0;
 
+// A calm, muted success green — distinct from the settings lime, not loud.
+const SUCCESS: (u8, u8, u8) = (74, 188, 120);
+
 pub fn clear_transparent(pm: &mut Pixmap) {
     pm.fill(Color::TRANSPARENT);
 }
@@ -12,10 +15,24 @@ pub fn clear_transparent(pm: &mut Pixmap) {
 pub fn draw_recording(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
     clear_transparent(pm);
     draw_pill_bg(pm, scale);
-    draw_bars(pm, scale, bar_heights);
+    draw_bars(pm, scale, bar_heights, 1.0);
+}
+
+/// Success state shown briefly after a capture ends: the hairline turns a soft
+/// green while the (frozen) waveform bars hold. `alpha` (0..1) multiplies the
+/// whole pill for the fade-out at the end.
+pub fn draw_success(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
+    clear_transparent(pm);
+    draw_pill_shape(pm, scale, SUCCESS, 235, alpha);
+    draw_bars(pm, scale, bar_heights, alpha);
 }
 
 fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
+    // Recording: faint soft-grey hairline, fully opaque.
+    draw_pill_shape(pm, scale, (170, 172, 178), 64, 1.0);
+}
+
+fn draw_pill_shape(pm: &mut Pixmap, scale: f32, border_rgb: (u8, u8, u8), border_a: u8, alpha: f32) {
     let w = pm.width() as f32;
     let h = pm.height() as f32;
 
@@ -35,13 +52,12 @@ fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
     let path = pb.finish().unwrap();
 
     let mut fill = Paint::default();
-    fill.set_color_rgba8(13, 13, 13, 245);
+    fill.set_color_rgba8(13, 13, 13, (245.0 * alpha) as u8);
     fill.anti_alias = true;
     pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
-    // Thin soft-grey hairline border (a touch softer than pure white).
     let mut border = Paint::default();
-    border.set_color_rgba8(170, 172, 178, 64);
+    border.set_color_rgba8(border_rgb.0, border_rgb.1, border_rgb.2, (border_a as f32 * alpha) as u8);
     border.anti_alias = true;
     let stroke = Stroke {
         width: border_w,
@@ -50,7 +66,7 @@ fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {
     pm.stroke_path(&path, &border, &stroke, Transform::identity(), None);
 }
 
-fn draw_bars(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
+fn draw_bars(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
     if bar_heights.is_empty() {
         return;
     }
@@ -70,7 +86,7 @@ fn draw_bars(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
     let r = bar_w / 2.0;
 
     let mut paint = Paint::default();
-    paint.set_color_rgba8(255, 255, 255, 235);
+    paint.set_color_rgba8(255, 255, 255, (235.0 * alpha) as u8);
     paint.anti_alias = true;
 
     let mut pb = PathBuilder::new();
