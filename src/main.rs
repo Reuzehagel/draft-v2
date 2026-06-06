@@ -33,6 +33,9 @@ use winit::window::WindowId;
 
 const PILL_FRAME_RATE_HZ: u64 = 30;
 
+/// Release the on-device model from RAM after this much dictation inactivity.
+const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--settings") {
@@ -139,13 +142,10 @@ fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
                     return None;
                 }
             };
-            match transcribe::parakeet::ParakeetTranscriber::load(&dir) {
-                Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
-                Err(e) => {
-                    tracing::error!(error = %e, "Parakeet load failed");
-                    None
-                }
-            }
+            // Lazy: the ~700MB model is pulled into RAM on first dictation
+            // and released again after MODEL_IDLE_TIMEOUT of inactivity.
+            let t = transcribe::parakeet::ParakeetTranscriber::new(&dir);
+            Some(Arc::new(t) as Arc<dyn Transcriber>)
         }
         config::Provider::Mistral => {
             let key = secrets::load_key(config::Provider::Mistral)?;
@@ -153,6 +153,16 @@ fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
                 Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build Mistral transcriber");
+                    None
+                }
+            }
+        }
+        config::Provider::Reson8 => {
+            let key = secrets::load_key(config::Provider::Reson8)?;
+            match transcribe::reson8::Reson8Transcriber::new(key) {
+                Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to build Reson8 transcriber");
                     None
                 }
             }
@@ -325,6 +335,12 @@ impl ApplicationHandler for App {
                 activation::OutEvent::Stop => self.stop_session(),
                 activation::OutEvent::Ignore => {}
             }
+        }
+
+        // Free the on-device model if dictation has been idle long enough.
+        // Cheap (try_lock + elapsed check); a no-op for cloud providers.
+        if let Some(t) = self.transcriber.as_ref() {
+            t.unload_if_idle(MODEL_IDLE_TIMEOUT);
         }
 
         // When the pill is up, drive frame redraws ourselves at ~30 Hz.

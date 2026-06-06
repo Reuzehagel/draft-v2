@@ -5,6 +5,7 @@
 pub mod mistral;
 pub mod parakeet;
 pub mod parakeet_download;
+pub mod reson8;
 
 use anyhow::Result;
 use std::io::Cursor;
@@ -13,6 +14,11 @@ pub trait Transcriber: Send + Sync + 'static {
     /// 16 kHz mono f32 PCM in [-1.0, 1.0].
     fn transcribe(&self, samples: &[f32]) -> Result<String>;
     fn name(&self) -> &'static str;
+
+    /// Release any heavy resident state (e.g. an on-device model held in RAM)
+    /// if it has gone unused for at least `timeout`. Called periodically from
+    /// the main loop. Default: no-op — cloud providers hold nothing resident.
+    fn unload_if_idle(&self, _timeout: std::time::Duration) {}
 }
 
 pub fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
