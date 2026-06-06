@@ -48,14 +48,6 @@ impl Buffer {
         std::mem::take(&mut *buf)
     }
 
-    pub fn len(&self) -> usize {
-        self.inner.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Copy the last `n` samples (or fewer if less is available).
     pub fn snapshot_tail(&self, n: usize) -> Vec<f32> {
         let buf = self.inner.lock();

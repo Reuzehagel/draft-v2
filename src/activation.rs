@@ -43,6 +43,9 @@ impl Fsm {
         }
     }
 
+    // Suppress presses until `until`. Wired into `step` (and tested), but not
+    // yet engaged by the app event loop — kept for a future debounce.
+    #[allow(dead_code)]
     pub fn mark_busy(&mut self, until: Instant) {
         self.busy_until = Some(until);
     }

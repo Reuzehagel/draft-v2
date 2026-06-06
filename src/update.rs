@@ -15,6 +15,9 @@ const USER_AGENT: &str = concat!("Draft/", env!("CARGO_PKG_VERSION"));
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub latest_version: String,
+    /// Release page to open — consumed once the update UI is wired up
+    /// (the whole check is dormant until RELEASES_URL is set).
+    #[allow(dead_code)]
     pub url: String,
 }
 
