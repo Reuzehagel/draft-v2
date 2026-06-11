@@ -112,6 +112,33 @@ impl PillWindow {
         self.blit_and_present()
     }
 
+    /// Render the failure frame: a muted-red border over the frozen bars,
+    /// `alpha` fading it out at the end. Shown when the transcript couldn't be
+    /// delivered, cueing the user to recover it from History.
+    pub fn render_error(&mut self, bar_heights: &[f32], alpha: f32) -> Result<()> {
+        self.ensure_size()?;
+        crate::pill::render::draw_error(
+            &mut self.hires,
+            self.scale * SUPERSAMPLE as f32,
+            bar_heights,
+            alpha,
+        );
+        self.blit_and_present()
+    }
+
+    /// Render a "working" frame while transcription/paste runs: frozen bars
+    /// under a neutral border that breathes via `pulse` (0..1).
+    pub fn render_processing(&mut self, bar_heights: &[f32], pulse: f32) -> Result<()> {
+        self.ensure_size()?;
+        crate::pill::render::draw_processing(
+            &mut self.hires,
+            self.scale * SUPERSAMPLE as f32,
+            bar_heights,
+            pulse,
+        );
+        self.blit_and_present()
+    }
+
     fn ensure_size(&mut self) -> Result<()> {
         let size = self.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));

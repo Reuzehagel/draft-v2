@@ -11,6 +11,44 @@ pub struct Config {
     pub restore_clipboard: bool,
     pub double_press_lock: bool,
     pub paste_mode: PasteMode,
+    /// Name of the input device to record from. `None` (the default) means the
+    /// system default device, resolved fresh at each session start.
+    pub input_device: Option<String>,
+    /// Ordered find/replace rules applied to every transcript before paste.
+    /// Provider-agnostic and instant — the first stage of the post-processing
+    /// pipeline (see `src/postprocess`). Empty by default.
+    pub replacements: Vec<Replacement>,
+}
+
+/// A single find/replace rule. Rules run in order, each over the output of
+/// the previous one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Replacement {
+    /// Text to look for. Empty `from` rules are skipped.
+    pub from: String,
+    /// What to substitute in. May be empty (deletes the match).
+    pub to: String,
+    /// Only match when `from` is bounded by non-word characters, so "a row"
+    /// won't fire inside "narrow". Word chars are alphanumerics and `_`.
+    pub whole_word: bool,
+    /// Match case exactly. When false, matching is case-insensitive (ASCII
+    /// folding) but the replacement is inserted verbatim.
+    pub case_sensitive: bool,
+    /// Lets a rule be kept but turned off without deleting it.
+    pub enabled: bool,
+}
+
+impl Default for Replacement {
+    fn default() -> Self {
+        Self {
+            from: String::new(),
+            to: String::new(),
+            whole_word: false,
+            case_sensitive: false,
+            enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +90,8 @@ impl Default for Config {
             restore_clipboard: true,
             double_press_lock: true,
             paste_mode: PasteMode::Clipboard,
+            input_device: None,
+            replacements: Vec::new(),
         }
     }
 }

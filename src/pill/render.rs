@@ -8,6 +8,14 @@ const RADIUS: f32 = 18.0;
 // A calm, muted success green — distinct from the settings lime, not loud.
 const SUCCESS: (u8, u8, u8) = (74, 188, 120);
 
+// A muted red for the failure flash — readable as "something went wrong"
+// without being an alarm. Matches the settings destructive tone.
+const ERROR: (u8, u8, u8) = (214, 96, 96);
+
+// Neutral cool-grey for the "working" pulse shown while transcription/paste
+// is still in flight.
+const PROCESSING: (u8, u8, u8) = (190, 192, 200);
+
 pub fn clear_transparent(pm: &mut Pixmap) {
     pm.fill(Color::TRANSPARENT);
 }
@@ -28,6 +36,28 @@ pub fn draw_success(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32
     clear_transparent(pm);
     draw_pill_shape(pm, scale, SUCCESS, 235, alpha);
     draw_bars(pm, scale, bar_heights, alpha);
+}
+
+/// Failure state: same shape as success but a muted red border, telling the
+/// user the transcript never made it (transcription or paste error) so they
+/// can recover it from History. `alpha` drives the same end fade-out.
+pub fn draw_error(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    clear_transparent(pm);
+    draw_pill_shape(pm, scale, ERROR, 235, alpha);
+    draw_bars(pm, scale, bar_heights, alpha);
+}
+
+/// "Working" state shown while the worker transcribes and pastes. The frozen
+/// waveform bars hold, dimmed, behind a neutral border that breathes via
+/// `pulse` (0..1) so a multi-second cloud round-trip still reads as live.
+pub fn draw_processing(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], pulse: f32) {
+    let pulse = pulse.clamp(0.0, 1.0);
+    clear_transparent(pm);
+    // Border alpha breathes between a dim and a brighter grey.
+    let border_a = (110.0 + 110.0 * pulse) as u8;
+    draw_pill_shape(pm, scale, PROCESSING, border_a, 1.0);
+    draw_bars(pm, scale, bar_heights, 0.45);
 }
 
 fn draw_pill_bg(pm: &mut Pixmap, scale: f32) {

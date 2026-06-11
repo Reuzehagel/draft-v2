@@ -18,12 +18,39 @@ pub struct Capture {
     pub device_name: String,
 }
 
+/// Names of the available input devices, for the Settings picker. Best-effort:
+/// returns an empty list if the host can't enumerate.
+pub fn input_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not enumerate input devices");
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve the device to record from: the one whose name matches `preferred`,
+/// else the system default. A configured-but-absent device (unplugged mic)
+/// falls back to default rather than failing the session.
+fn resolve_device(host: &cpal::Host, preferred: Option<&str>) -> Result<cpal::Device> {
+    if let Some(name) = preferred {
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(d) = devices.find(|d| d.name().is_ok_and(|n| n == name)) {
+                return Ok(d);
+            }
+        }
+        tracing::warn!(device = %name, "preferred input device not found; using default");
+    }
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("no default input device"))
+}
+
 impl Capture {
-    pub fn start() -> Result<Self> {
+    pub fn start(preferred: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"))?;
+        let device = resolve_device(&host, preferred)?;
         let device_name = device.name().unwrap_or_else(|_| "unknown".into());
         let cfg = device.default_input_config()?;
         let input_sr = cfg.sample_rate().0;
