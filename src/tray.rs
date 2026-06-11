@@ -10,6 +10,7 @@ pub struct Tray {
 }
 
 pub struct MenuIds {
+    pub copy_last: tray_icon::menu::MenuId,
     pub settings: tray_icon::menu::MenuId,
     pub quit: tray_icon::menu::MenuId,
 }
@@ -40,10 +41,14 @@ fn make_icon() -> Icon {
 
 pub fn build(tooltip: &str) -> Result<Tray> {
     let menu = Menu::new();
+    let copy_last = MenuItem::new("Copy last transcription", true, None);
     let settings = MenuItem::new("Settings…", true, None);
     let quit = MenuItem::new("Quit", true, None);
+    let copy_last_id = copy_last.id().clone();
     let settings_id = settings.id().clone();
     let quit_id = quit.id().clone();
+    menu.append(&copy_last)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&settings)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit)?;
@@ -57,6 +62,7 @@ pub fn build(tooltip: &str) -> Result<Tray> {
     Ok(Tray {
         _icon: icon,
         menu_ids: MenuIds {
+            copy_last: copy_last_id,
             settings: settings_id,
             quit: quit_id,
         },

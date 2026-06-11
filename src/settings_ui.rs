@@ -46,6 +46,10 @@ pub fn run() -> anyhow::Result<()> {
         baseline,
         save_status: None,
         download_state: Arc::new(Mutex::new(DownloadState::initial())),
+        history: crate::history::load(),
+        history_filter: String::new(),
+        confirm_clear_history: false,
+        input_devices: crate::audio::capture::input_device_names(),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -84,18 +88,29 @@ const ALL_PROVIDERS: &[Provider] = &[
 enum Tab {
     Recording,
     Transcription,
+    Replacements,
     Output,
+    History,
     System,
 }
 
 impl Tab {
-    const ALL: &'static [Tab] = &[Tab::Recording, Tab::Transcription, Tab::Output, Tab::System];
+    const ALL: &'static [Tab] = &[
+        Tab::Recording,
+        Tab::Transcription,
+        Tab::Replacements,
+        Tab::Output,
+        Tab::History,
+        Tab::System,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Recording => "Recording",
             Tab::Transcription => "Transcription",
+            Tab::Replacements => "Replacements",
             Tab::Output => "Output",
+            Tab::History => "History",
             Tab::System => "System",
         }
     }
@@ -104,7 +119,9 @@ impl Tab {
         match self {
             Tab::Recording => "How Draft listens for your voice.",
             Tab::Transcription => "Where your speech becomes text.",
+            Tab::Replacements => "Fix misheard words and expand shorthand before pasting.",
             Tab::Output => "How the transcript reaches your cursor.",
+            Tab::History => "Recent transcripts — recover anything a paste missed.",
             Tab::System => "Startup and app behaviour.",
         }
     }
@@ -277,6 +294,16 @@ struct SettingsApp {
     baseline: Snapshot,
     save_status: Option<(bool, String)>,
     download_state: Arc<Mutex<DownloadState>>,
+    /// Snapshot of the transcript history as of when this window opened. The
+    /// main process appends to it live; "Refresh" re-reads from disk.
+    history: Vec<crate::history::Entry>,
+    /// Case-insensitive substring filter for the history list. Empty = show all.
+    history_filter: String,
+    /// True while the "Clear history?" confirmation modal is open. The wipe only
+    /// happens once the user confirms — clearing is irreversible.
+    confirm_clear_history: bool,
+    /// Input device names enumerated at window open, for the microphone picker.
+    input_devices: Vec<String>,
 }
 
 struct DownloadState {
@@ -341,13 +368,19 @@ impl eframe::App for SettingsApp {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        if save_shortcut && self.key_dialog.is_none() && self.is_dirty() {
+        if save_shortcut
+            && self.key_dialog.is_none()
+            && !self.confirm_clear_history
+            && self.is_dirty()
+        {
             self.save();
         }
         if close_shortcut {
             // Esc dismisses an open dialog first, then the window.
             if self.key_dialog.is_some() {
                 self.key_dialog = None;
+            } else if self.confirm_clear_history {
+                self.confirm_clear_history = false;
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -392,13 +425,16 @@ impl eframe::App for SettingsApp {
                     .show(ui, |ui| match self.tab {
                         Tab::Recording => self.tab_recording(ui),
                         Tab::Transcription => self.tab_transcription(ui, ctx),
+                        Tab::Replacements => self.tab_replacements(ui),
                         Tab::Output => self.tab_output(ui),
+                        Tab::History => self.tab_history(ui),
                         Tab::System => self.tab_system(ui),
                     });
             });
 
-        // Modal sits above everything when open.
+        // Modals sit above everything when open.
         self.key_dialog_view(ctx);
+        self.confirm_clear_view(ctx);
     }
 }
 
@@ -430,6 +466,18 @@ impl SettingsApp {
         group(ui, |ui| {
             row(ui, "Hotkey", "Push-to-talk key combination.", |ui| {
                 text_input(ui, &mut self.cfg.hotkey, "Ctrl+Backslash", CONTROL_W);
+            });
+            divider(ui);
+            row(ui, "Microphone", "Which input device Draft records from.", |ui| {
+                let selected = self
+                    .cfg
+                    .input_device
+                    .clone()
+                    .unwrap_or_else(|| "System default".into());
+                // "System default" (None) plus one option per enumerated device.
+                let mut options: Vec<(Option<String>, &str)> = vec![(None, "System default")];
+                options.extend(self.input_devices.iter().map(|n| (Some(n.clone()), n.as_str())));
+                combo(ui, "input_device", &mut self.cfg.input_device, &selected, &options);
             });
             divider(ui);
             row(ui, "Activation", "Hold the key, or tap to toggle.", |ui| {
@@ -569,6 +617,57 @@ impl SettingsApp {
         );
     }
 
+    fn tab_replacements(&mut self, ui: &mut egui::Ui) {
+        group(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Rules run top to bottom on every transcript before it's pasted. \
+                     Each rule's output feeds the next. Use them to fix words your \
+                     provider mishears, or to expand shorthand.",
+                )
+                .size(12.0)
+                .color(MUTED_FG),
+            );
+            ui.add_space(16.0);
+
+            if self.cfg.replacements.is_empty() {
+                ui.label(
+                    RichText::new("No rules yet.")
+                        .size(12.5)
+                        .color(MUTED_FG)
+                        .italics(),
+                );
+                ui.add_space(12.0);
+            }
+
+            // Edit in place; defer the structural removal until after the
+            // borrow ends so we don't mutate the Vec mid-iteration.
+            let mut remove: Option<usize> = None;
+            let count = self.cfg.replacements.len();
+            for i in 0..count {
+                if i > 0 {
+                    divider(ui);
+                }
+                if replacement_editor(ui, i, &mut self.cfg.replacements[i]) {
+                    remove = Some(i);
+                }
+            }
+            if let Some(i) = remove {
+                self.cfg.replacements.remove(i);
+            }
+
+            if count > 0 {
+                ui.add_space(16.0);
+            }
+            if ui
+                .add(ghost_button("Add replacement", 160.0, CONTROL_H))
+                .clicked()
+            {
+                self.cfg.replacements.push(crate::config::Replacement::default());
+            }
+        });
+    }
+
     fn tab_output(&mut self, ui: &mut egui::Ui) {
         group(ui, |ui| {
             row(
@@ -607,6 +706,129 @@ impl SettingsApp {
                 "Put your previous clipboard back after pasting.",
             );
         });
+    }
+
+    fn tab_history(&mut self, ui: &mut egui::Ui) {
+        // Actions are deferred past the immutable borrow of `self.history` the
+        // list rendering holds, then applied once the closure returns.
+        let mut copy: Option<String> = None;
+        let mut refresh = false;
+        let mut clear = false;
+
+        group(ui, |ui| {
+            ui.horizontal(|ui| {
+                let count = self.history.len();
+                let summary = match count {
+                    0 => "Nothing recorded yet.".to_string(),
+                    1 => "1 transcript.".to_string(),
+                    n => format!("{n} transcripts (newest first)."),
+                };
+                ui.label(RichText::new(summary).size(12.0).color(MUTED_FG));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(ghost_button("Refresh", 84.0, CONTROL_H)).clicked() {
+                        refresh = true;
+                    }
+                    if count > 0 {
+                        ui.add_space(8.0);
+                        if ui.add(ghost_button("Clear", 72.0, CONTROL_H)).clicked() {
+                            clear = true;
+                        }
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            if self.history.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "Transcripts appear here the moment they're produced — even if the \
+                         paste lands in the wrong place. Use Copy to put one back on your \
+                         clipboard.",
+                    )
+                    .size(12.0)
+                    .color(MUTED_FG)
+                    .italics(),
+                );
+                return;
+            }
+
+            // Search box: filters the list as you type. Full width so it lines
+            // up with the entries below.
+            ui.add_sized(
+                [ui.available_width(), CONTROL_H],
+                egui::TextEdit::singleline(&mut self.history_filter)
+                    .hint_text("Search transcripts…")
+                    .vertical_align(egui::Align::Center),
+            );
+            ui.add_space(10.0);
+
+            // Case-insensitive substring match over text and provider. Computed
+            // once; an empty needle matches everything.
+            let needle = self.history_filter.trim().to_lowercase();
+            let matches = |e: &crate::history::Entry| {
+                needle.is_empty()
+                    || e.text.to_lowercase().contains(&needle)
+                    || e.provider.to_lowercase().contains(&needle)
+            };
+
+            // Newest first. The store keeps oldest-first, so walk it in reverse.
+            let now = crate::history::now_unix();
+            let mut shown = 0usize;
+            for entry in self.history.iter().rev().filter(|e| matches(e)) {
+                if shown > 0 {
+                    divider(ui);
+                }
+                shown += 1;
+                ui.horizontal(|ui| {
+                    let copy_w = 64.0;
+                    let text_w = (ui.available_width() - copy_w - 12.0).max(160.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(text_w);
+                        ui.add(
+                            egui::Label::new(RichText::new(&entry.text).size(13.0).color(FG))
+                                .wrap(),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}",
+                                relative_time(now, entry.ts),
+                                entry.provider
+                            ))
+                            .size(11.0)
+                            .color(MUTED_FG),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(ghost_button("Copy", copy_w, 28.0)).clicked() {
+                            copy = Some(entry.text.clone());
+                        }
+                    });
+                });
+            }
+
+            // The list is non-empty but the filter hid everything.
+            if shown == 0 {
+                ui.label(
+                    RichText::new("No transcripts match your search.")
+                        .size(12.0)
+                        .color(MUTED_FG)
+                        .italics(),
+                );
+            }
+        });
+
+        if let Some(text) = copy {
+            ui.output_mut(|o| o.copied_text = text);
+            self.save_status = Some((true, "Copied to clipboard.".into()));
+        }
+        if clear {
+            // Don't wipe on the click — open the confirmation modal first.
+            self.confirm_clear_history = true;
+        }
+        if refresh {
+            self.history = crate::history::load();
+        }
     }
 
     fn tab_system(&mut self, ui: &mut egui::Ui) {
@@ -779,6 +1001,99 @@ impl SettingsApp {
             Act::None => {}
         }
     }
+
+    /// "Clear history?" confirmation: dimmed scrim + centred card with a
+    /// destructive confirm. The wipe only runs on explicit confirm; the scrim,
+    /// Cancel, and Esc all back out without touching the file.
+    fn confirm_clear_view(&mut self, ctx: &egui::Context) {
+        if !self.confirm_clear_history {
+            return;
+        }
+        enum Act {
+            None,
+            Confirm,
+            Cancel,
+        }
+        let mut act = Act::None;
+        let screen = ctx.screen_rect();
+
+        egui::Area::new(egui::Id::new("confirm_clear_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.left_top())
+            .show(ctx, |ui| {
+                let r = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(160));
+                if r.clicked() {
+                    act = Act::Cancel;
+                }
+            });
+
+        egui::Window::new("confirm_clear")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(
+                Frame::default()
+                    .fill(SIDEBAR_BG)
+                    .stroke(border())
+                    .rounding(Rounding::same(RADIUS))
+                    .inner_margin(Margin::same(20.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0.0, 12.0].into(),
+                        blur: 48.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(160),
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(
+                    RichText::new("Clear history?")
+                        .size(15.0)
+                        .strong()
+                        .color(FG),
+                );
+                ui.add_space(4.0);
+                let msg = match self.history.len() {
+                    1 => "This permanently deletes the 1 saved transcript. \
+                          You won't be able to recover it."
+                        .to_string(),
+                    n => format!(
+                        "This permanently deletes all {n} saved transcripts. \
+                         You won't be able to recover them."
+                    ),
+                };
+                ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(destructive_button("Clear")).clicked() {
+                        act = Act::Confirm;
+                    }
+                    ui.add_space(8.0);
+                    if ui.add(ghost_button("Cancel", 84.0, 34.0)).clicked() {
+                        act = Act::Cancel;
+                    }
+                });
+            });
+
+        match act {
+            Act::Confirm => {
+                self.confirm_clear_history = false;
+                if let Err(e) = crate::history::clear() {
+                    self.save_status = Some((false, format!("Couldn't clear history: {e}")));
+                } else {
+                    self.history.clear();
+                    self.save_status = Some((true, "History cleared.".into()));
+                }
+            }
+            Act::Cancel => self.confirm_clear_history = false,
+            Act::None => {}
+        }
+    }
 }
 
 // ---- pane chrome -------------------------------------------------------
@@ -842,7 +1157,7 @@ fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
 
 /// shadcn-style select. The button shares the input metrics; the popup lists
 /// options with a hover highlight and a trailing check on the current value.
-fn combo<T: PartialEq + Copy>(
+fn combo<T: PartialEq + Clone>(
     ui: &mut egui::Ui,
     id: &str,
     current: &mut T,
@@ -856,7 +1171,7 @@ fn combo<T: PartialEq + Copy>(
             ui.spacing_mut().item_spacing.y = 2.0;
             for (val, label) in options {
                 if combo_item(ui, label, *current == *val) {
-                    *current = *val;
+                    *current = val.clone();
                     ui.close_menu();
                 }
             }
@@ -987,6 +1302,61 @@ fn split_row(
     });
 }
 
+/// One editable find/replace rule: an enable switch, the from/to fields, the
+/// two match flags, and a remove button. Returns true when removal is asked.
+fn replacement_editor(ui: &mut egui::Ui, idx: usize, rule: &mut crate::config::Replacement) -> bool {
+    let mut remove = false;
+    let field_w = 140.0;
+    ui.horizontal(|ui| {
+        // Drive gaps with explicit spacing so the row width is predictable
+        // and doesn't wrap in the narrow window.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let id = ui.make_persistent_id(("repl_enabled", idx));
+        if mini_switch(ui, rule.enabled, id) {
+            rule.enabled = !rule.enabled;
+        }
+        ui.add_space(10.0);
+        ui.add_sized(
+            [field_w, CONTROL_H],
+            egui::TextEdit::singleline(&mut rule.from)
+                .hint_text("hears…")
+                .vertical_align(egui::Align::Center),
+        );
+        ui.add_space(8.0);
+        ui.label(RichText::new("→").size(15.0).color(MUTED_FG));
+        ui.add_space(8.0);
+        ui.add_sized(
+            [field_w, CONTROL_H],
+            egui::TextEdit::singleline(&mut rule.to)
+                .hint_text("writes…")
+                .vertical_align(egui::Align::Center),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add(ghost_button("Remove", 72.0, CONTROL_H)).clicked() {
+                remove = true;
+            }
+        });
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        // Indent the flags so they sit under the fields, clear of the switch.
+        ui.add_space(46.0);
+        ui.checkbox(&mut rule.whole_word, "Whole word");
+        ui.add_space(14.0);
+        ui.checkbox(&mut rule.case_sensitive, "Match case");
+    });
+    remove
+}
+
+/// Compact label-less toggle switch for inline use in list rows. Returns true
+/// on click; the caller flips the bound value.
+fn mini_switch(ui: &mut egui::Ui, on: bool, id: egui::Id) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    paint_toggle(ui, rect, on, id, resp.hovered());
+    resp.clicked()
+}
+
 /// Full-row clickable toggle. The whole label/caption strip is the hit area;
 /// hover gives a faint highlight so the affordance reads.
 fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, caption: &str) {
@@ -1104,6 +1474,35 @@ fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '_ {
     }
 }
 
+/// Destructive action button (confirming a history wipe). Red fill that
+/// brightens on hover and darkens + scales down on press — same metrics as the
+/// primary button so the two line up in a dialog footer.
+fn destructive_button(text: &str) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        let size = Vec2::new(94.0, 34.0);
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        let id = ui.make_persistent_id(("destructive_btn", text));
+        let pressed = resp.is_pointer_button_down_on();
+        let press_t = ui.ctx().animate_bool_with_time(id, pressed, 0.07);
+        let draw_rect = rect.shrink(press_t * 1.2);
+
+        let fill = if pressed {
+            lerp_color(DESTRUCTIVE, Color32::BLACK, 0.18)
+        } else if resp.hovered() {
+            lighten(DESTRUCTIVE, 0.08)
+        } else {
+            DESTRUCTIVE
+        };
+        ui.painter().rect_filled(draw_rect, Rounding::same(RADIUS), fill);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.5), FG);
+        let pos = draw_rect.center() - galley.size() / 2.0;
+        ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
 /// Outline button: bordered, transparent fill, fills with the neutral accent
 /// on hover. Used for Close, Show/Hide, and the model download.
 fn ghost_button(text: &str, width: f32, height: f32) -> impl egui::Widget + '_ {
@@ -1163,6 +1562,21 @@ fn format_progress_label(p: &DlProgress) -> String {
             )
         }
         _ => format!("{}/{}  {:>6.1} MB", p.file_index + 1, p.file_count, done_mb),
+    }
+}
+
+/// Coarse "x ago" rendering of a Unix timestamp relative to `now` — enough to
+/// orient a recovery, without pulling in a date library.
+fn relative_time(now: i64, ts: i64) -> String {
+    let secs = (now - ts).max(0);
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 

@@ -28,6 +28,14 @@ pub fn deliver_text(text: &str, mode: PasteMode, restore_clipboard: bool) -> Res
     }
 }
 
+/// Put `text` on the clipboard without pasting. Recovery actions (e.g. the
+/// tray "Copy last transcription") go through here so every clipboard write
+/// stays inside this module.
+pub fn set_clipboard(text: &str) -> Result<()> {
+    let mut cb = arboard::Clipboard::new().context("open clipboard")?;
+    cb.set_text(text.to_owned()).context("write to clipboard")
+}
+
 fn paste_via_clipboard(text: &str, restore: bool) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     let saved = if restore { cb.get_text().ok() } else { None };

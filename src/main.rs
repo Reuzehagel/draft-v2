@@ -8,11 +8,13 @@ mod activation;
 mod audio;
 mod autostart;
 mod config;
+mod history;
 mod hotkey;
 mod logging;
 mod paste;
 mod paths;
 mod pill;
+mod postprocess;
 mod secrets;
 mod settings_ui;
 mod single_instance;
@@ -33,9 +35,13 @@ use winit::window::WindowId;
 
 const PILL_FRAME_RATE_HZ: u64 = 30;
 
-/// How long the pill lingers after a capture, showing the green border
-/// before it fades and disappears.
+/// How long the pill lingers on a successful delivery, showing the green
+/// border before it fades and disappears.
 const SUCCESS_LINGER: Duration = Duration::from_millis(500);
+
+/// Failures linger longer than successes — a red flash the user might miss in
+/// 500 ms deserves an extra beat to register as "that one didn't land".
+const ERROR_LINGER: Duration = Duration::from_millis(1200);
 
 /// Release the on-device model from RAM after this much dictation inactivity.
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -83,6 +89,8 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
+
     let mut app = App {
         tray,
         menu_rx,
@@ -95,7 +103,10 @@ fn main() -> Result<()> {
         transcriber,
         cfg,
         settings_child: None,
-        success_anim: None,
+        tail: None,
+        outcome_tx,
+        outcome_rx,
+        session_seq: 0,
         last_bars: vec![0.0; pill::BAR_COUNT],
     };
     if first_run {
@@ -108,6 +119,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// How long the terminal flash holds before the pill fades out — failures
+/// linger longer than successes so they aren't missed.
+fn tail_linger(ok: bool) -> Duration {
+    if ok {
+        SUCCESS_LINGER
+    } else {
+        ERROR_LINGER
+    }
+}
+
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     match cfg.activation {
         config::Activation::Toggle => activation::Mode::Toggle,
@@ -115,6 +136,28 @@ fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
             double_press_lock: cfg.double_press_lock,
         },
     }
+}
+
+/// What a dictation worker thread reports back to the UI loop once it finishes,
+/// so the pill can show an honest result instead of a premature "success".
+enum Outcome {
+    /// Text was produced and the paste call succeeded.
+    Delivered,
+    /// Transcription returned nothing usable — disappear quietly.
+    Empty,
+    /// Transcription or paste errored — the transcript is recoverable from
+    /// History but never reached the cursor. Flash the pill red.
+    Failed,
+}
+
+/// The pill's post-capture lifecycle. While `Processing`, the worker is still
+/// transcribing/pasting; `Done` is the terminal green/red flash before the
+/// pill is dropped. `session` ties a `Processing` pill to the worker that owns
+/// it, so a slow earlier worker can't hijack the pill of a later capture.
+#[derive(Clone, Copy)]
+enum Tail {
+    Processing { session: u64, since: Instant },
+    Done { ok: bool, since: Instant },
 }
 
 struct App {
@@ -129,10 +172,15 @@ struct App {
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
     settings_child: Option<std::process::Child>,
-    /// When set, the pill is playing its post-capture success animation
-    /// (green border) starting at this instant, after which it's dropped.
-    success_anim: Option<Instant>,
-    /// Most recent waveform bars, frozen and reused during the success linger.
+    /// Post-capture pill state: `Processing` while a worker runs, then `Done`
+    /// for the terminal green/red flash. `None` when idle or recording.
+    tail: Option<Tail>,
+    /// Workers report their outcome here; polled each loop on the UI thread.
+    outcome_tx: crossbeam_channel::Sender<(u64, Outcome)>,
+    outcome_rx: crossbeam_channel::Receiver<(u64, Outcome)>,
+    /// Monotonic id stamped on each dispatched worker; matched on its outcome.
+    session_seq: u64,
+    /// Most recent waveform bars, frozen and reused during the tail animation.
     last_bars: Vec<f32>,
 }
 
@@ -187,7 +235,7 @@ fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
 
 impl App {
     fn start_session(&mut self, el: &ActiveEventLoop) {
-        match audio::capture::Capture::start() {
+        match audio::capture::Capture::start(self.cfg.input_device.as_deref()) {
             Ok(cap) => {
                 tracing::info!(
                     device = %cap.device_name,
@@ -203,8 +251,9 @@ impl App {
             }
         }
 
-        // A quick re-trigger during the success linger supersedes it.
-        self.success_anim = None;
+        // A quick re-trigger during the tail animation supersedes it; a still
+        // in-flight worker's outcome is then ignored by its session id.
+        self.tail = None;
 
         match pill::window::PillWindow::create(el) {
             Ok(mut pw) => {
@@ -222,9 +271,48 @@ impl App {
         }
     }
 
-    /// Tear down the pill immediately (no success animation).
+    /// Put the most recent transcript back on the clipboard, so a paste that
+    /// landed nowhere can be recovered with a manual Ctrl+V. No-op (logged) if
+    /// the history is empty or the clipboard can't be opened.
+    fn copy_last_transcription(&mut self) {
+        match history::last() {
+            Some(entry) => match paste::set_clipboard(&entry.text) {
+                Ok(()) => tracing::info!("last transcript copied to clipboard"),
+                Err(e) => tracing::error!(error = %e, "failed to copy last transcript"),
+            },
+            None => tracing::info!("copy last transcript: history is empty"),
+        }
+    }
+
+    /// Apply a worker's reported outcome to the pill. Outcomes from a
+    /// superseded session (the user re-triggered before this one finished) are
+    /// ignored — only the `Processing` pill that owns `session` reacts.
+    fn handle_outcome(&mut self, session: u64, outcome: Outcome) {
+        let owns = matches!(self.tail, Some(Tail::Processing { session: s, .. }) if s == session);
+        if !owns {
+            return;
+        }
+        match outcome {
+            Outcome::Delivered => {
+                self.tail = Some(Tail::Done {
+                    ok: true,
+                    since: Instant::now(),
+                });
+            }
+            Outcome::Failed => {
+                self.tail = Some(Tail::Done {
+                    ok: false,
+                    since: Instant::now(),
+                });
+            }
+            // Nothing usable was said — just disappear, no flash.
+            Outcome::Empty => self.dismiss_pill(),
+        }
+    }
+
+    /// Tear down the pill immediately (no tail animation).
     fn dismiss_pill(&mut self) {
-        self.success_anim = None;
+        self.tail = None;
         if let Some(pw) = self.pill.take() {
             drop(pw);
         }
@@ -265,21 +353,37 @@ impl App {
             return;
         };
 
-        // We're committing to a transcription — play the success linger.
-        self.success_anim = Some(Instant::now());
+        // We're committing to a transcription — hold the pill in its
+        // "processing" state until the worker reports back what really
+        // happened, then show green (delivered) or red (failed).
+        self.session_seq += 1;
+        let session = self.session_seq;
+        self.tail = Some(Tail::Processing {
+            session,
+            since: Instant::now(),
+        });
+        let outcome_tx = self.outcome_tx.clone();
 
         let append_space = self.cfg.append_trailing_space;
         let restore_clipboard = self.cfg.restore_clipboard;
+        let pipeline = postprocess::Pipeline::from_config(&self.cfg);
         let paste_mode = match self.cfg.paste_mode {
             config::PasteMode::Clipboard => paste::PasteMode::Clipboard,
             config::PasteMode::Unicode => paste::PasteMode::Unicode,
         };
         std::thread::spawn(move || {
+            // Send the worker's verdict to the UI loop. The receiver outlives
+            // every worker (it's owned by App), so a failed send only means the
+            // app is shutting down — nothing to recover.
+            let report = |o: Outcome| {
+                let _ = outcome_tx.send((session, o));
+            };
             let started = Instant::now();
             let text = match transcriber.transcribe(&samples) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "transcription failed");
+                    report(Outcome::Failed);
                     return;
                 }
             };
@@ -287,9 +391,20 @@ impl App {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 tracing::info!(elapsed_ms, "transcription empty; nothing to paste");
+                report(Outcome::Empty);
                 return;
             }
-            let mut out = trimmed.to_owned();
+            // Post-processing pipeline (find/replace today; commands and the
+            // optional LLM transform later) runs between transcription and
+            // paste. A no-op pipeline leaves the text untouched.
+            let processed = pipeline.apply(trimmed);
+            // Record the transcript BEFORE attempting paste: if the paste is
+            // swallowed or lands in the wrong window, this is the only surviving
+            // copy. Store the processed text without the cosmetic trailing space.
+            if let Err(e) = history::append(&processed, transcriber.name()) {
+                tracing::warn!(error = %e, "failed to record transcript in history");
+            }
+            let mut out = processed;
             if append_space {
                 out.push(' ');
             }
@@ -299,8 +414,12 @@ impl App {
                 chars = out.len(),
                 "transcription complete"
             );
-            if let Err(e) = paste::deliver_text(&out, paste_mode, restore_clipboard) {
-                tracing::error!(error = %e, "paste failed");
+            match paste::deliver_text(&out, paste_mode, restore_clipboard) {
+                Ok(()) => report(Outcome::Delivered),
+                Err(e) => {
+                    tracing::error!(error = %e, "paste failed");
+                    report(Outcome::Failed);
+                }
             }
         });
     }
@@ -338,6 +457,8 @@ impl ApplicationHandler for App {
                 el.exit();
             } else if ev.id == self.tray.menu_ids.settings {
                 self.open_settings();
+            } else if ev.id == self.tray.menu_ids.copy_last {
+                self.copy_last_transcription();
             }
         }
 
@@ -353,15 +474,21 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Workers report their outcome here; transition the pill to its
+        // terminal green/red flash (or dismiss it on an empty result).
+        while let Ok((session, outcome)) = self.outcome_rx.try_recv() {
+            self.handle_outcome(session, outcome);
+        }
+
         // Free the on-device model if dictation has been idle long enough.
         // Cheap (try_lock + elapsed check); a no-op for cloud providers.
         if let Some(t) = self.transcriber.as_ref() {
             t.unload_if_idle(MODEL_IDLE_TIMEOUT);
         }
 
-        // Retire the pill once the success animation has run its course.
-        if let Some(start) = self.success_anim {
-            if start.elapsed() >= SUCCESS_LINGER {
+        // Retire the pill once its terminal flash has run its course.
+        if let Some(Tail::Done { ok, since }) = self.tail {
+            if since.elapsed() >= tail_linger(ok) {
                 self.dismiss_pill();
             }
         }
@@ -450,16 +577,35 @@ impl App {
     fn redraw_pill(&mut self) {
         let Some(pill) = self.pill.as_mut() else { return };
 
-        // Success state: soft-green border over the frozen bars, holding then
-        // fading out over the final stretch (elapsed fraction of the linger).
-        if let Some(start) = self.success_anim {
-            let t = (start.elapsed().as_secs_f32() / SUCCESS_LINGER.as_secs_f32()).clamp(0.0, 1.0);
-            // Hold fully opaque, then fade over the last 30%.
-            let alpha = if t < 0.7 { 1.0 } else { ((1.0 - t) / 0.3).clamp(0.0, 1.0) };
-            if let Err(e) = pill.render_success(&self.last_bars, alpha) {
-                tracing::error!(error = %e, "pill success render failed");
+        // Post-capture states take over the pill until it's dismissed.
+        match self.tail {
+            // Terminal flash: green (delivered) or red (failed) border over the
+            // frozen bars, holding then fading over the final 30% of the linger.
+            Some(Tail::Done { ok, since }) => {
+                let t = (since.elapsed().as_secs_f32() / tail_linger(ok).as_secs_f32())
+                    .clamp(0.0, 1.0);
+                let alpha = if t < 0.7 { 1.0 } else { ((1.0 - t) / 0.3).clamp(0.0, 1.0) };
+                let res = if ok {
+                    pill.render_success(&self.last_bars, alpha)
+                } else {
+                    pill.render_error(&self.last_bars, alpha)
+                };
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "pill outcome render failed");
+                }
+                return;
             }
-            return;
+            // Worker still running: frozen bars under a neutral border that
+            // breathes (~0.8 Hz) so a slow round-trip reads as live, not hung.
+            Some(Tail::Processing { since, .. }) => {
+                let e = since.elapsed().as_secs_f32();
+                let pulse = 0.5 - 0.5 * (e * std::f32::consts::TAU * 0.8).cos();
+                if let Err(e) = pill.render_processing(&self.last_bars, pulse) {
+                    tracing::error!(error = %e, "pill processing render failed");
+                }
+                return;
+            }
+            None => {}
         }
 
         let bars = if let Some(cap) = self.capture.as_ref() {
