@@ -18,6 +18,23 @@ pub struct Config {
     /// Provider-agnostic and instant — the first stage of the post-processing
     /// pipeline (see `src/postprocess`). Empty by default.
     pub replacements: Vec<Replacement>,
+    /// Parse spoken formatting commands ("new line", "new paragraph",
+    /// "scratch that", "all caps") out of the transcript before paste.
+    pub voice_commands: bool,
+    /// Custom vocabulary: proper nouns and jargon the recognizer should bias
+    /// toward. Sent natively to providers that take a hint (OpenAI and Groq's
+    /// `prompt` field); providers without biasing support ignore it — use a
+    /// replacement rule there instead.
+    pub vocabulary: Vec<String>,
+    /// When the cloud provider errors out (network down, timeout, 5xx),
+    /// transcribe locally with Parakeet instead of losing the dictation.
+    /// Only takes effect when the local model is downloaded.
+    pub fallback_to_local: bool,
+    /// Push-to-command: a second hotkey where speech is an instruction and
+    /// the LLM's answer is pasted instead of the words. Needs a Groq API key.
+    pub push_to_command: bool,
+    /// The hotkey that triggers push-to-command. Same syntax as `hotkey`.
+    pub command_hotkey: String,
 }
 
 /// A single find/replace rule. Rules run in order, each over the output of
@@ -92,6 +109,11 @@ impl Default for Config {
             paste_mode: PasteMode::Clipboard,
             input_device: None,
             replacements: Vec::new(),
+            voice_commands: true,
+            vocabulary: Vec::new(),
+            fallback_to_local: true,
+            push_to_command: false,
+            command_hotkey: "Ctrl+Shift+Backslash".into(),
         }
     }
 }
