@@ -73,7 +73,7 @@ impl Fsm {
                 let is_double = double_press_lock
                     && self
                         .last_press
-                        .map_or(false, |p| t.duration_since(p) <= self.dbl_window);
+                        .is_some_and(|p| t.duration_since(p) <= self.dbl_window);
                 self.last_press = Some(t);
                 if self.locked {
                     self.locked = false;

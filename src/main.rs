@@ -10,6 +10,7 @@ mod autostart;
 mod config;
 mod history;
 mod hotkey;
+mod llm;
 mod logging;
 mod paste;
 mod paths;
@@ -73,11 +74,13 @@ fn main() -> Result<()> {
     let tray = tray::build(&format!("Draft — {}", cfg.hotkey))?;
     let menu_rx = tray::menu_event_receiver();
 
-    let (hotkey_handle, hotkey_rx) = hotkey::register(&cfg.hotkey)?;
-    tracing::info!(hotkey = %cfg.hotkey, "hotkey registered");
+    let command_spec = cfg.push_to_command.then(|| cfg.command_hotkey.clone());
+    let (hotkey_handle, hotkey_rx) = hotkey::register(&cfg.hotkey, command_spec.as_deref())?;
+    tracing::info!(hotkey = %cfg.hotkey, command = ?command_spec, "hotkeys registered");
 
     let fsm_mode = fsm_mode_from_config(&cfg);
     let fsm = activation::Fsm::new(fsm_mode);
+    let command_fsm = activation::Fsm::new(fsm_mode);
 
     let transcriber: Option<Arc<dyn Transcriber>> = build_transcriber(&cfg);
     if transcriber.is_none() {
@@ -94,10 +97,12 @@ fn main() -> Result<()> {
     let mut app = App {
         tray,
         menu_rx,
-        hotkey_handle,
+        hotkey_handle: Some(hotkey_handle),
         hotkey_rx,
         fsm,
+        command_fsm,
         capture: None,
+        session_kind: SessionKind::Dictate,
         pill: None,
         bands: audio::level::BandMeter::new(pill::BAR_COUNT),
         transcriber,
@@ -138,6 +143,14 @@ fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     }
 }
 
+/// Which pipeline a capture feeds: dictation pastes the (post-processed)
+/// transcript; command sends it to the LLM and pastes the answer (issue #4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    Dictate,
+    Command,
+}
+
 /// What a dictation worker thread reports back to the UI loop once it finishes,
 /// so the pill can show an honest result instead of a premature "success".
 enum Outcome {
@@ -163,10 +176,19 @@ enum Tail {
 struct App {
     tray: tray::Tray,
     menu_rx: crossbeam_channel::Receiver<tray_icon::menu::MenuEvent>,
-    hotkey_handle: hotkey::HotkeyHandle,
+    /// `None` only transiently during re-registration (and after a failed
+    /// restore, where hotkeys are dead until restart).
+    hotkey_handle: Option<hotkey::HotkeyHandle>,
     hotkey_rx: crossbeam_channel::Receiver<hotkey::HotkeyEvent>,
     fsm: activation::Fsm,
+    /// Separate FSM for the push-to-command chord, so holding one hotkey
+    /// can't corrupt the other's press/release state.
+    command_fsm: activation::Fsm,
     capture: Option<audio::capture::Capture>,
+    /// What the active (or most recent) capture is for: plain dictation, or
+    /// a spoken instruction whose LLM answer gets pasted. Set at session
+    /// start, read at stop to route the worker.
+    session_kind: SessionKind,
     pill: Option<pill::window::PillWindow>,
     bands: audio::level::BandMeter,
     transcriber: Option<Arc<dyn Transcriber>>,
@@ -185,46 +207,92 @@ struct App {
 }
 
 fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
-    match cfg.provider {
-        config::Provider::LocalParakeet => {
-            if !transcribe::parakeet_download::is_present() {
-                tracing::warn!(
-                    "Parakeet model files missing — open Settings and click \
-                     'Download model' to fetch them"
-                );
-                return None;
-            }
-            let dir = match transcribe::parakeet_download::model_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, "resolve model dir failed");
-                    return None;
-                }
-            };
-            // Lazy: the ~700MB model is pulled into RAM on first dictation
-            // and released again after MODEL_IDLE_TIMEOUT of inactivity.
-            let t = transcribe::parakeet::ParakeetTranscriber::new(&dir);
-            Some(Arc::new(t) as Arc<dyn Transcriber>)
+    // With a local fallback standing by, give the cloud call a tighter
+    // timeout — failing over beats hanging on a dead network for a minute.
+    let fallback_ready = cfg.fallback_to_local
+        && cfg.provider != config::Provider::LocalParakeet
+        && transcribe::parakeet_download::is_present();
+    let timeout = if fallback_ready {
+        transcribe::FALLBACK_PRIMARY_TIMEOUT
+    } else {
+        transcribe::DEFAULT_TIMEOUT
+    };
+    let primary = build_primary(cfg, timeout)?;
+    if !fallback_ready {
+        return Some(primary);
+    }
+    match local_parakeet() {
+        Some(local) => Some(Arc::new(transcribe::FallbackTranscriber::new(
+            primary, local,
+        ))),
+        // Model present but dir unresolvable — degraded but functional:
+        // run the cloud provider unwrapped rather than not at all.
+        None => Some(primary),
+    }
+}
+
+fn local_parakeet() -> Option<Arc<dyn Transcriber>> {
+    if !transcribe::parakeet_download::is_present() {
+        tracing::warn!(
+            "Parakeet model files missing — open Settings and click \
+             'Download model' to fetch them"
+        );
+        return None;
+    }
+    let dir = match transcribe::parakeet_download::model_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "resolve model dir failed");
+            return None;
         }
+    };
+    // Lazy: the ~700MB model is pulled into RAM on first dictation
+    // and released again after MODEL_IDLE_TIMEOUT of inactivity.
+    let t = transcribe::parakeet::ParakeetTranscriber::new(&dir);
+    Some(Arc::new(t) as Arc<dyn Transcriber>)
+}
+
+fn build_primary(
+    cfg: &config::Config,
+    timeout: std::time::Duration,
+) -> Option<Arc<dyn Transcriber>> {
+    fn arc<T: Transcriber>(t: anyhow::Result<T>, what: &str) -> Option<Arc<dyn Transcriber>> {
+        match t {
+            Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build {what} transcriber");
+                None
+            }
+        }
+    }
+    use transcribe::openai_compat::OpenAiCompatTranscriber;
+    let vocab = || transcribe::vocab_prompt(&cfg.vocabulary);
+    match cfg.provider {
+        config::Provider::LocalParakeet => local_parakeet(),
         config::Provider::Mistral => {
             let key = secrets::load_key(config::Provider::Mistral)?;
-            match transcribe::mistral::MistralTranscriber::new(key) {
-                Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build Mistral transcriber");
-                    None
-                }
-            }
+            arc(
+                transcribe::mistral::MistralTranscriber::new(key, timeout),
+                "Mistral",
+            )
         }
         config::Provider::Reson8 => {
             let key = secrets::load_key(config::Provider::Reson8)?;
-            match transcribe::reson8::Reson8Transcriber::new(key) {
-                Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build Reson8 transcriber");
-                    None
-                }
-            }
+            arc(
+                transcribe::reson8::Reson8Transcriber::new(key, timeout),
+                "Reson8",
+            )
+        }
+        config::Provider::Groq => {
+            let key = secrets::load_key(config::Provider::Groq)?;
+            arc(OpenAiCompatTranscriber::groq(key, timeout, vocab()), "Groq")
+        }
+        config::Provider::Openai => {
+            let key = secrets::load_key(config::Provider::Openai)?;
+            arc(
+                OpenAiCompatTranscriber::openai(key, timeout, vocab()),
+                "OpenAI",
+            )
         }
         other => {
             tracing::warn!(?other, "provider not yet implemented; no transcriber");
@@ -371,6 +439,13 @@ impl App {
             config::PasteMode::Clipboard => paste::PasteMode::Clipboard,
             config::PasteMode::Unicode => paste::PasteMode::Unicode,
         };
+        let kind = self.session_kind;
+        // Fetch the key on the UI thread — the keyring is process-global
+        // state, no reason to touch it from every worker.
+        let groq_key = match kind {
+            SessionKind::Command => secrets::load_key(config::Provider::Groq),
+            SessionKind::Dictate => None,
+        };
         std::thread::spawn(move || {
             // Send the worker's verdict to the UI loop. The receiver outlives
             // every worker (it's owned by App), so a failed send only means the
@@ -379,7 +454,10 @@ impl App {
                 let _ = outcome_tx.send((session, o));
             };
             let started = Instant::now();
-            let text = match transcriber.transcribe(&samples) {
+            // Attribution rides with the result so history credits whichever
+            // provider actually served this call (the fallback wrapper can
+            // route to local Parakeet mid-call).
+            let (text, stt_provider) = match transcriber.transcribe_attributed(&samples) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "transcription failed");
@@ -394,32 +472,67 @@ impl App {
                 report(Outcome::Empty);
                 return;
             }
-            // Post-processing pipeline (find/replace today; commands and the
-            // optional LLM transform later) runs between transcription and
-            // paste. A no-op pipeline leaves the text untouched.
-            let processed = pipeline.apply(trimmed);
-            // Record the transcript BEFORE attempting paste: if the paste is
-            // swallowed or lands in the wrong window, this is the only surviving
-            // copy. Store the processed text without the cosmetic trailing space.
-            if let Err(e) = history::append(&processed, transcriber.name()) {
+
+            // What lands at the cursor, and who is credited in history.
+            // Dictation runs the deterministic pipeline over the transcript;
+            // push-to-command treats it as an instruction instead — no
+            // pipeline (replacements and voice commands are for spoken
+            // prose), the LLM's answer is what gets pasted.
+            let (mut out, provider): (String, &'static str) = match kind {
+                SessionKind::Command => {
+                    let Some(key) = groq_key else {
+                        tracing::error!(
+                            "push-to-command needs a Groq API key — add one under \
+                             Settings > Transcription with Groq selected"
+                        );
+                        report(Outcome::Failed);
+                        return;
+                    };
+                    match llm::run_command(&key, trimmed) {
+                        Ok(answer) => (answer, "command"),
+                        Err(e) => {
+                            tracing::error!(error = %e, "command transform failed");
+                            report(Outcome::Failed);
+                            return;
+                        }
+                    }
+                }
+                SessionKind::Dictate => (pipeline.apply(trimmed), stt_provider),
+            };
+
+            // Either stage can legitimately empty the text (a lone "scratch
+            // that", a delete-everything replacement, a refusing model) —
+            // don't paste a bare trailing space or record an empty entry.
+            if out.trim().is_empty() {
+                tracing::info!(elapsed_ms, "nothing left to paste");
+                report(Outcome::Empty);
+                return;
+            }
+            // Record the text BEFORE attempting paste: if the paste is
+            // swallowed or lands in the wrong window, this is the only
+            // surviving copy. Stored without the cosmetic trailing space.
+            if let Err(e) = history::append(&out, provider) {
                 tracing::warn!(error = %e, "failed to record transcript in history");
             }
-            let mut out = processed;
             if append_space {
                 out.push(' ');
             }
             tracing::info!(
-                elapsed_ms,
-                provider = transcriber.name(),
+                elapsed_ms = started.elapsed().as_millis(),
+                provider,
                 chars = out.len(),
                 "transcription complete"
             );
-            match paste::deliver_text(&out, paste_mode, restore_clipboard) {
-                Ok(()) => report(Outcome::Delivered),
-                Err(e) => {
-                    tracing::error!(error = %e, "paste failed");
-                    report(Outcome::Failed);
-                }
+            // `deliver_text` reports Delivered the moment the paste keystroke
+            // is sent, then keeps the thread alive briefly for clipboard
+            // restore housekeeping — the pill shouldn't wait on that.
+            if let Err(e) =
+                paste::deliver_text(&out, paste_mode, restore_clipboard, || {
+                    report(Outcome::Delivered)
+                })
+            {
+                tracing::error!(error = %e, "paste failed");
+                report(Outcome::Failed);
             }
         });
     }
@@ -463,12 +576,29 @@ impl ApplicationHandler for App {
         }
 
         while let Ok(ev) = self.hotkey_rx.try_recv() {
-            let in_ev = match ev {
-                hotkey::HotkeyEvent::Pressed(t) => activation::InEvent::Pressed(t),
-                hotkey::HotkeyEvent::Released(t) => activation::InEvent::Released(t),
+            let (chord, in_ev) = match ev {
+                hotkey::HotkeyEvent::Pressed(c, t) => (c, activation::InEvent::Pressed(t)),
+                hotkey::HotkeyEvent::Released(c, t) => (c, activation::InEvent::Released(t)),
             };
-            match self.fsm.step(in_ev) {
-                activation::OutEvent::Start => self.start_session(el),
+            let kind = match chord {
+                hotkey::Chord::Dictate => SessionKind::Dictate,
+                hotkey::Chord::Command => SessionKind::Command,
+            };
+            // A capture belongs to the chord that started it. Swallow the
+            // other chord's events for the duration so the two FSMs can't
+            // fight over one microphone.
+            if self.capture.is_some() && self.session_kind != kind {
+                continue;
+            }
+            let fsm = match chord {
+                hotkey::Chord::Dictate => &mut self.fsm,
+                hotkey::Chord::Command => &mut self.command_fsm,
+            };
+            match fsm.step(in_ev) {
+                activation::OutEvent::Start => {
+                    self.session_kind = kind;
+                    self.start_session(el);
+                }
                 activation::OutEvent::Stop => self.stop_session(),
                 activation::OutEvent::Ignore => {}
             }
@@ -556,20 +686,48 @@ impl App {
             }
         };
 
-        if new_cfg.hotkey != self.cfg.hotkey {
-            match hotkey::register(&new_cfg.hotkey) {
+        let bindings_changed = new_cfg.hotkey != self.cfg.hotkey
+            || new_cfg.push_to_command != self.cfg.push_to_command
+            || new_cfg.command_hotkey != self.cfg.command_hotkey;
+        if bindings_changed {
+            // Release the old bindings first — when only the command chord
+            // changed, re-registering the unchanged main hotkey would
+            // otherwise collide with our own still-live registration.
+            self.hotkey_handle = None;
+            let command_spec = new_cfg.push_to_command.then(|| new_cfg.command_hotkey.clone());
+            match hotkey::register(&new_cfg.hotkey, command_spec.as_deref()) {
                 Ok((handle, rx)) => {
-                    self.hotkey_handle = handle;
+                    self.hotkey_handle = Some(handle);
                     self.hotkey_rx = rx;
-                    tracing::info!(hotkey = %new_cfg.hotkey, "hotkey re-registered");
+                    tracing::info!(
+                        hotkey = %new_cfg.hotkey,
+                        command = ?command_spec,
+                        "hotkeys re-registered"
+                    );
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "hotkey re-register failed; keeping old binding");
+                    tracing::error!(error = %e, "hotkey re-register failed; restoring previous binding");
+                    let old_spec = self
+                        .cfg
+                        .push_to_command
+                        .then(|| self.cfg.command_hotkey.clone());
+                    match hotkey::register(&self.cfg.hotkey, old_spec.as_deref()) {
+                        Ok((handle, rx)) => {
+                            self.hotkey_handle = Some(handle);
+                            self.hotkey_rx = rx;
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "restore failed; hotkeys inactive until restart"
+                        ),
+                    }
                 }
             }
         }
 
-        self.fsm = activation::Fsm::new(fsm_mode_from_config(&new_cfg));
+        let fsm_mode = fsm_mode_from_config(&new_cfg);
+        self.fsm = activation::Fsm::new(fsm_mode);
+        self.command_fsm = activation::Fsm::new(fsm_mode);
         self.transcriber = build_transcriber(&new_cfg);
         self.cfg = new_cfg;
     }

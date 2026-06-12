@@ -3,6 +3,7 @@
 // directly via the trait's `transcribe` entry point.
 
 pub mod mistral;
+pub mod openai_compat;
 pub mod parakeet;
 pub mod parakeet_download;
 pub mod reson8;
@@ -10,17 +11,118 @@ pub mod reson8;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Request timeout for cloud transcribers when they're the only option:
+/// generous, since waiting beats losing the dictation.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Tighter timeout used when a local fallback is standing by — no point
+/// hanging on a dead network for a minute when Parakeet can serve the
+/// transcript in a couple of seconds.
+pub const FALLBACK_PRIMARY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub trait Transcriber: Send + Sync + 'static {
     /// 16 kHz mono f32 PCM in [-1.0, 1.0].
     fn transcribe(&self, samples: &[f32]) -> Result<String>;
     fn name(&self) -> &'static str;
 
+    /// Transcribe and report which provider actually produced the text.
+    /// Trivially `name()` for plain providers; wrappers that route between
+    /// providers override it so attribution travels with the result instead
+    /// of through shared state (which races between concurrent dictations).
+    fn transcribe_attributed(&self, samples: &[f32]) -> Result<(String, &'static str)> {
+        self.transcribe(samples).map(|text| (text, self.name()))
+    }
+
     /// Release any heavy resident state (e.g. an on-device model held in RAM)
     /// if it has gone unused for at least `timeout`. Called periodically from
     /// the main loop. Default: no-op — cloud providers hold nothing resident.
     fn unload_if_idle(&self, _timeout: std::time::Duration) {}
+}
+
+/// Reliability wrapper (issue #7): try the configured cloud provider, and on
+/// any error — network down, timeout, 5xx — transcribe locally with Parakeet
+/// instead, so a connectivity blip degrades quality instead of losing words.
+pub struct FallbackTranscriber {
+    primary: Arc<dyn Transcriber>,
+    fallback: Arc<dyn Transcriber>,
+}
+
+impl FallbackTranscriber {
+    pub fn new(primary: Arc<dyn Transcriber>, fallback: Arc<dyn Transcriber>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl Transcriber for FallbackTranscriber {
+    fn name(&self) -> &'static str {
+        self.primary.name()
+    }
+
+    fn transcribe(&self, samples: &[f32]) -> Result<String> {
+        self.transcribe_attributed(samples).map(|(text, _)| text)
+    }
+
+    /// Attribution rides with the result, so history records the provider
+    /// that actually produced each transcript — a degraded fallback result
+    /// shouldn't be mistaken for the primary provider's quality, and two
+    /// concurrent dictations can't mislabel each other.
+    fn transcribe_attributed(&self, samples: &[f32]) -> Result<(String, &'static str)> {
+        match self.primary.transcribe(samples) {
+            Ok(text) => Ok((text, self.primary.name())),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    primary = self.primary.name(),
+                    fallback = self.fallback.name(),
+                    "primary transcription failed; falling back to local"
+                );
+                self.fallback
+                    .transcribe(samples)
+                    .map(|text| (text, self.fallback.name()))
+            }
+        }
+    }
+
+    fn unload_if_idle(&self, timeout: Duration) {
+        self.primary.unload_if_idle(timeout);
+        self.fallback.unload_if_idle(timeout);
+    }
+}
+
+/// Build the free-text vocabulary hint for prompt-based providers (OpenAI,
+/// Groq) from the user's term list. Whisper's prompt window is ~224 tokens;
+/// stay well under it by skipping terms past a character budget — and say so,
+/// rather than silently truncating mid-term.
+pub fn vocab_prompt(terms: &[String]) -> Option<String> {
+    const MAX_CHARS: usize = 600;
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    for term in terms {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let sep = if out.is_empty() { 0 } else { 2 };
+        if out.len() + sep + term.len() > MAX_CHARS {
+            dropped += 1;
+            continue;
+        }
+        if sep > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(term);
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "custom vocabulary exceeds the provider prompt budget; \
+             later terms were not sent"
+        );
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Shared blocking HTTP client for the cloud transcribers — keeps the
@@ -31,6 +133,12 @@ pub fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
         .timeout(timeout)
         .build()
         .context("build reqwest client")
+}
+
+/// Clip a response body for inclusion in an error or log message, so a huge
+/// HTML error page can't flood the diagnostics.
+pub fn clip_body(body: &str, max_chars: usize) -> String {
+    body.chars().take(max_chars).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,14 +155,11 @@ pub fn parse_text_response(provider: &str, resp: reqwest::blocking::Response) ->
     if !status.is_success() {
         return Err(anyhow!(
             "{provider} returned {status}: {}",
-            body.chars().take(500).collect::<String>()
+            clip_body(&body, 500)
         ));
     }
     let parsed: TextResponse = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "parse {provider} response: {}",
-            body.chars().take(200).collect::<String>()
-        )
+        format!("parse {provider} response: {}", clip_body(&body, 200))
     })?;
     Ok(parsed.text)
 }
@@ -78,4 +183,31 @@ pub fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>
         w.finalize()?;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vocab_prompt_joins_and_skips_blanks() {
+        let terms: Vec<String> = vec!["Reson8".into(), "   ".into(), "egui".into()];
+        assert_eq!(vocab_prompt(&terms).as_deref(), Some("Reson8, egui"));
+    }
+
+    #[test]
+    fn vocab_prompt_empty_is_none() {
+        assert_eq!(vocab_prompt(&[]), None);
+        assert_eq!(vocab_prompt(&["  ".into()]), None);
+    }
+
+    #[test]
+    fn vocab_prompt_stays_under_budget() {
+        let terms: Vec<String> = (0..200).map(|i| format!("term{i:03}xxxxxxxxxx")).collect();
+        let p = vocab_prompt(&terms).unwrap();
+        assert!(p.len() <= 600);
+        // The first terms made it in untruncated.
+        assert!(p.starts_with("term000xxxxxxxxxx, term001xxxxxxxxxx"));
+        assert!(!p.ends_with(','));
+    }
 }

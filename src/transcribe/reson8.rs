@@ -17,22 +17,16 @@ use super::Transcriber;
 use crate::audio::TARGET_SR;
 
 const ENDPOINT: &str = "https://api.reson8.dev/v1/speech-to-text/prerecorded";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Reson8Transcriber {
     api_key: String,
-    language: Option<String>,
     client: reqwest::blocking::Client,
 }
 
 impl Reson8Transcriber {
-    pub fn new(api_key: String) -> Result<Self> {
-        let client = super::http_client(REQUEST_TIMEOUT)?;
-        Ok(Self {
-            api_key,
-            language: Some("en".into()),
-            client,
-        })
+    pub fn new(api_key: String, timeout: Duration) -> Result<Self> {
+        let client = super::http_client(timeout)?;
+        Ok(Self { api_key, client })
     }
 }
 
@@ -45,19 +39,20 @@ impl Transcriber for Reson8Transcriber {
         let wav_bytes = super::samples_to_wav_bytes(samples, TARGET_SR)
             .context("encode WAV for Reson8 upload")?;
 
-        let mut req = self
+        // No `language` param on purpose: the API auto-detects per clip when
+        // it's omitted, which is what a bilingual user needs. Pinning it to
+        // "en" (an early copy-paste default) degraded every non-English clip.
+        let resp = self
             .client
             .post(ENDPOINT)
             .header(
                 reqwest::header::AUTHORIZATION,
                 format!("ApiKey {}", self.api_key),
             )
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
-        if let Some(lang) = &self.language {
-            req = req.query(&[("language", lang.as_str())]);
-        }
-
-        let resp = req.body(wav_bytes).send().context("POST to Reson8")?;
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(wav_bytes)
+            .send()
+            .context("POST to Reson8")?;
 
         super::parse_text_response("Reson8", resp)
     }
