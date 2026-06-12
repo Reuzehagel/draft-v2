@@ -5,4 +5,4 @@ Cargo.lock
 *.log
 node_modules/
 dist/
-.claude/settings.local.json
+.claude/
