@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     let fsm = activation::Fsm::new(fsm_mode);
     let command_fsm = activation::Fsm::new(fsm_mode);
 
-    let transcriber: Option<Arc<dyn Transcriber>> = build_transcriber(&cfg);
+    let transcriber: Option<Arc<dyn Transcriber>> = transcribe::build(&cfg);
     if transcriber.is_none() {
         tracing::warn!(
             "no transcriber available — set MISTRAL_API_KEY to enable paste-on-stop"
@@ -204,101 +204,6 @@ struct App {
     session_seq: u64,
     /// Most recent waveform bars, frozen and reused during the tail animation.
     last_bars: Vec<f32>,
-}
-
-fn build_transcriber(cfg: &config::Config) -> Option<Arc<dyn Transcriber>> {
-    // With a local fallback standing by, give the cloud call a tighter
-    // timeout — failing over beats hanging on a dead network for a minute.
-    let fallback_ready = cfg.fallback_to_local
-        && cfg.provider != config::Provider::LocalParakeet
-        && transcribe::parakeet_download::is_present();
-    let timeout = if fallback_ready {
-        transcribe::FALLBACK_PRIMARY_TIMEOUT
-    } else {
-        transcribe::DEFAULT_TIMEOUT
-    };
-    let primary = build_primary(cfg, timeout)?;
-    if !fallback_ready {
-        return Some(primary);
-    }
-    match local_parakeet() {
-        Some(local) => Some(Arc::new(transcribe::FallbackTranscriber::new(
-            primary, local,
-        ))),
-        // Model present but dir unresolvable — degraded but functional:
-        // run the cloud provider unwrapped rather than not at all.
-        None => Some(primary),
-    }
-}
-
-fn local_parakeet() -> Option<Arc<dyn Transcriber>> {
-    if !transcribe::parakeet_download::is_present() {
-        tracing::warn!(
-            "Parakeet model files missing — open Settings and click \
-             'Download model' to fetch them"
-        );
-        return None;
-    }
-    let dir = match transcribe::parakeet_download::model_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(error = %e, "resolve model dir failed");
-            return None;
-        }
-    };
-    // Lazy: the ~700MB model is pulled into RAM on first dictation
-    // and released again after MODEL_IDLE_TIMEOUT of inactivity.
-    let t = transcribe::parakeet::ParakeetTranscriber::new(&dir);
-    Some(Arc::new(t) as Arc<dyn Transcriber>)
-}
-
-fn build_primary(
-    cfg: &config::Config,
-    timeout: std::time::Duration,
-) -> Option<Arc<dyn Transcriber>> {
-    fn arc<T: Transcriber>(t: anyhow::Result<T>, what: &str) -> Option<Arc<dyn Transcriber>> {
-        match t {
-            Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to build {what} transcriber");
-                None
-            }
-        }
-    }
-    use transcribe::openai_compat::OpenAiCompatTranscriber;
-    let vocab = || transcribe::vocab_prompt(&cfg.vocabulary);
-    match cfg.provider {
-        config::Provider::LocalParakeet => local_parakeet(),
-        config::Provider::Mistral => {
-            let key = secrets::load_key(config::Provider::Mistral)?;
-            arc(
-                transcribe::mistral::MistralTranscriber::new(key, timeout),
-                "Mistral",
-            )
-        }
-        config::Provider::Reson8 => {
-            let key = secrets::load_key(config::Provider::Reson8)?;
-            arc(
-                transcribe::reson8::Reson8Transcriber::new(key, timeout),
-                "Reson8",
-            )
-        }
-        config::Provider::Groq => {
-            let key = secrets::load_key(config::Provider::Groq)?;
-            arc(OpenAiCompatTranscriber::groq(key, timeout, vocab()), "Groq")
-        }
-        config::Provider::Openai => {
-            let key = secrets::load_key(config::Provider::Openai)?;
-            arc(
-                OpenAiCompatTranscriber::openai(key, timeout, vocab()),
-                "OpenAI",
-            )
-        }
-        other => {
-            tracing::warn!(?other, "provider not yet implemented; no transcriber");
-            None
-        }
-    }
 }
 
 impl App {
@@ -728,7 +633,7 @@ impl App {
         let fsm_mode = fsm_mode_from_config(&new_cfg);
         self.fsm = activation::Fsm::new(fsm_mode);
         self.command_fsm = activation::Fsm::new(fsm_mode);
-        self.transcriber = build_transcriber(&new_cfg);
+        self.transcriber = transcribe::build(&new_cfg);
         self.cfg = new_cfg;
     }
 

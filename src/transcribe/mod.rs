@@ -92,6 +92,97 @@ impl Transcriber for FallbackTranscriber {
     }
 }
 
+/// Single seam for transcriber construction: owns provider selection,
+/// API-key loading, vocabulary-hint baking, and fallback-wrapping. The main
+/// process asks here for a ready-to-use `Transcriber` and never deals with
+/// providers, keys, or the vocabulary hint directly.
+pub fn build(cfg: &crate::config::Config) -> Option<Arc<dyn Transcriber>> {
+    // With a local fallback standing by, give the cloud call a tighter
+    // timeout — failing over beats hanging on a dead network for a minute.
+    let fallback_ready = cfg.fallback_to_local
+        && cfg.provider != crate::config::Provider::LocalParakeet
+        && parakeet_download::is_present();
+    let timeout = if fallback_ready {
+        FALLBACK_PRIMARY_TIMEOUT
+    } else {
+        DEFAULT_TIMEOUT
+    };
+    let primary = build_primary(cfg, timeout)?;
+    if !fallback_ready {
+        return Some(primary);
+    }
+    match local_parakeet() {
+        Some(local) => Some(Arc::new(FallbackTranscriber::new(primary, local))),
+        // Model present but dir unresolvable — degraded but functional:
+        // run the cloud provider unwrapped rather than not at all.
+        None => Some(primary),
+    }
+}
+
+fn local_parakeet() -> Option<Arc<dyn Transcriber>> {
+    if !parakeet_download::is_present() {
+        tracing::warn!(
+            "Parakeet model files missing — open Settings and click \
+             'Download model' to fetch them"
+        );
+        return None;
+    }
+    let dir = match parakeet_download::model_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "resolve model dir failed");
+            return None;
+        }
+    };
+    // Lazy: the ~700MB model is pulled into RAM on first dictation
+    // and released again after MODEL_IDLE_TIMEOUT of inactivity.
+    let t = parakeet::ParakeetTranscriber::new(&dir);
+    Some(Arc::new(t) as Arc<dyn Transcriber>)
+}
+
+fn build_primary(cfg: &crate::config::Config, timeout: Duration) -> Option<Arc<dyn Transcriber>> {
+    fn arc<T: Transcriber>(t: Result<T>, what: &str) -> Option<Arc<dyn Transcriber>> {
+        match t {
+            Ok(t) => Some(Arc::new(t) as Arc<dyn Transcriber>),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build {what} transcriber");
+                None
+            }
+        }
+    }
+    use crate::config::Provider;
+    use openai_compat::OpenAiCompatTranscriber;
+    // Baked in at construction so no downstream caller can forget to pass it
+    // and silently disable biasing on prompt-capable providers.
+    let vocab = || vocab_prompt(&cfg.vocabulary);
+    match cfg.provider {
+        Provider::LocalParakeet => local_parakeet(),
+        Provider::Mistral => {
+            let key = crate::secrets::load_key(Provider::Mistral)?;
+            arc(mistral::MistralTranscriber::new(key, timeout), "Mistral")
+        }
+        Provider::Reson8 => {
+            let key = crate::secrets::load_key(Provider::Reson8)?;
+            arc(reson8::Reson8Transcriber::new(key, timeout), "Reson8")
+        }
+        Provider::Groq => {
+            let key = crate::secrets::load_key(Provider::Groq)?;
+            arc(OpenAiCompatTranscriber::groq(key, timeout, vocab()), "Groq")
+        }
+        Provider::Openai => {
+            let key = crate::secrets::load_key(Provider::Openai)?;
+            arc(
+                OpenAiCompatTranscriber::openai(key, timeout, vocab()),
+                "OpenAI",
+            )
+        }
+        other => {
+            tracing::warn!(?other, "provider not yet implemented; no transcriber");
+            None
+        }
+    }
+}
+
 /// Build the free-text vocabulary hint for prompt-based providers (OpenAI,
 /// Groq) from the user's term list. Whisper's prompt window is ~224 tokens;
 /// stay well under it by skipping terms past a character budget — and say so,
@@ -188,6 +279,63 @@ pub fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Scripted stub Transcriber: pops results off a queue in call order and
+    /// reports a fixed name, so `FallbackTranscriber`'s routing and
+    /// attribution can be driven deterministically without a network or a
+    /// real model.
+    struct StubTranscriber {
+        name: &'static str,
+        results: Mutex<std::collections::VecDeque<Result<String>>>,
+    }
+
+    impl StubTranscriber {
+        fn new(name: &'static str, results: Vec<Result<String>>) -> Self {
+            Self {
+                name,
+                results: Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Transcriber for StubTranscriber {
+        fn transcribe(&self, _samples: &[f32]) -> Result<String> {
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("stub exhausted")))
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[test]
+    fn fallback_uses_primary_on_success() {
+        let primary = Arc::new(StubTranscriber::new("primary", vec![Ok("hello".into())]));
+        // Fallback would return different text; it must not be consulted.
+        let fallback = Arc::new(StubTranscriber::new("fallback", vec![Ok("degraded".into())]));
+        let t = FallbackTranscriber::new(primary, fallback);
+        let (text, provider) = t.transcribe_attributed(&[]).unwrap();
+        assert_eq!(text, "hello");
+        assert_eq!(provider, "primary");
+    }
+
+    #[test]
+    fn fallback_uses_fallback_on_primary_error() {
+        let primary = Arc::new(StubTranscriber::new(
+            "primary",
+            vec![Err(anyhow!("network down"))],
+        ));
+        let fallback = Arc::new(StubTranscriber::new("fallback", vec![Ok("local text".into())]));
+        let t = FallbackTranscriber::new(primary, fallback);
+        let (text, provider) = t.transcribe_attributed(&[]).unwrap();
+        assert_eq!(text, "local text");
+        assert_eq!(provider, "fallback");
+    }
 
     #[test]
     fn vocab_prompt_joins_and_skips_blanks() {
