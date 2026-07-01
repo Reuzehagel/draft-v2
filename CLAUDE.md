@@ -33,3 +33,17 @@ Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat
 - History (`history.rs`) records every transcript *before* the paste attempt — it is the recovery path for lost pastes. Don't reorder that.
 - The settings UI is screenshot-reviewed for polish. `settings_ui/widgets.rs` documents layout invariants at the top of the file — read them before touching any settings layout, and keep the two-pane sidebar structure.
 - Hotkey re-registration on config reload releases old bindings first (re-registering an unchanged chord collides with itself). See `reload_config` in `main.rs`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live as GitHub issues (`Reuzehagel/draft-v2`), managed via the `gh` CLI. External PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles using default label names (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
