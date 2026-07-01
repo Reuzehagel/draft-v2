@@ -1,6 +1,9 @@
 // Draft — Windows push-to-talk speech-to-text.
-// Step-4 build: hotkey → FSM → cpal capture + pill window (static rounded
-// rect, random bar heights, click-through).
+//
+// The dictation lifecycle lives in `session` as a pure command-returning core.
+// This file is the adapter: it translates winit/hotkey/tray events into
+// `Session` inputs, executes the `Command`s the core returns (open the mic,
+// drive the pill, spawn a worker), and feeds worker outcomes back by id.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -17,6 +20,7 @@ mod paths;
 mod pill;
 mod postprocess;
 mod secrets;
+mod session;
 mod settings_ui;
 mod single_instance;
 mod transcribe;
@@ -24,10 +28,12 @@ mod tray;
 mod update;
 
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::session::{Command, PillMode, Session, SessionKind};
 use crate::transcribe::Transcriber;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -35,14 +41,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 const PILL_FRAME_RATE_HZ: u64 = 30;
-
-/// How long the pill lingers on a successful delivery, showing the green
-/// border before it fades and disappears.
-const SUCCESS_LINGER: Duration = Duration::from_millis(500);
-
-/// Failures linger longer than successes — a red flash the user might miss in
-/// 500 ms deserves an extra beat to register as "that one didn't land".
-const ERROR_LINGER: Duration = Duration::from_millis(1200);
 
 /// Release the on-device model from RAM after this much dictation inactivity.
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -79,15 +77,15 @@ fn main() -> Result<()> {
     tracing::info!(hotkey = %cfg.hotkey, command = ?command_spec, "hotkeys registered");
 
     let fsm_mode = fsm_mode_from_config(&cfg);
-    let fsm = activation::Fsm::new(fsm_mode);
     let command_fsm = activation::Fsm::new(fsm_mode);
 
     let transcriber: Option<Arc<dyn Transcriber>> = transcribe::build(&cfg);
     if transcriber.is_none() {
-        tracing::warn!(
-            "no transcriber available — set MISTRAL_API_KEY to enable paste-on-stop"
-        );
+        tracing::warn!("no transcriber available — set MISTRAL_API_KEY to enable paste-on-stop");
     }
+
+    let mut session = Session::new(fsm_mode);
+    session.set_transcriber_available(transcriber.is_some());
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -99,20 +97,14 @@ fn main() -> Result<()> {
         menu_rx,
         hotkey_handle: Some(hotkey_handle),
         hotkey_rx,
-        fsm,
         command_fsm,
-        capture: None,
-        session_kind: SessionKind::Dictate,
-        pill: None,
-        bands: audio::level::BandMeter::new(pill::BAR_COUNT),
+        session,
+        pill: PillAdapter::new(),
         transcriber,
         cfg,
         settings_child: None,
-        tail: None,
         outcome_tx,
         outcome_rx,
-        session_seq: 0,
-        last_bars: vec![0.0; pill::BAR_COUNT],
     };
     if first_run {
         tracing::info!("first run detected; opening settings");
@@ -124,16 +116,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// How long the terminal flash holds before the pill fades out — failures
-/// linger longer than successes so they aren't missed.
-fn tail_linger(ok: bool) -> Duration {
-    if ok {
-        SUCCESS_LINGER
-    } else {
-        ERROR_LINGER
-    }
-}
-
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     match cfg.activation {
         config::Activation::Toggle => activation::Mode::Toggle,
@@ -143,36 +125,6 @@ fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     }
 }
 
-/// Which pipeline a capture feeds: dictation pastes the (post-processed)
-/// transcript; command sends it to the LLM and pastes the answer (issue #4).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SessionKind {
-    Dictate,
-    Command,
-}
-
-/// What a dictation worker thread reports back to the UI loop once it finishes,
-/// so the pill can show an honest result instead of a premature "success".
-enum Outcome {
-    /// Text was produced and the paste call succeeded.
-    Delivered,
-    /// Transcription returned nothing usable — disappear quietly.
-    Empty,
-    /// Transcription or paste errored — the transcript is recoverable from
-    /// History but never reached the cursor. Flash the pill red.
-    Failed,
-}
-
-/// The pill's post-capture lifecycle. While `Processing`, the worker is still
-/// transcribing/pasting; `Done` is the terminal green/red flash before the
-/// pill is dropped. `session` ties a `Processing` pill to the worker that owns
-/// it, so a slow earlier worker can't hijack the pill of a later capture.
-#[derive(Clone, Copy)]
-enum Tail {
-    Processing { session: u64, since: Instant },
-    Done { ok: bool, since: Instant },
-}
-
 struct App {
     tray: tray::Tray,
     menu_rx: crossbeam_channel::Receiver<tray_icon::menu::MenuEvent>,
@@ -180,163 +132,79 @@ struct App {
     /// restore, where hotkeys are dead until restart).
     hotkey_handle: Option<hotkey::HotkeyHandle>,
     hotkey_rx: crossbeam_channel::Receiver<hotkey::HotkeyEvent>,
-    fsm: activation::Fsm,
-    /// Separate FSM for the push-to-command chord, so holding one hotkey
-    /// can't corrupt the other's press/release state.
+    /// The push-to-command chord's activation FSM. The dictate FSM lives inside
+    /// `session`; the command chord keeps its own here (folded in next slice),
+    /// so holding one hotkey can't corrupt the other's press/release state.
     command_fsm: activation::Fsm,
-    capture: Option<audio::capture::Capture>,
-    /// What the active (or most recent) capture is for: plain dictation, or
-    /// a spoken instruction whose LLM answer gets pasted. Set at session
-    /// start, read at stop to route the worker.
-    session_kind: SessionKind,
-    pill: Option<pill::window::PillWindow>,
-    bands: audio::level::BandMeter,
+    /// The pure dictation lifecycle. Owns the dictate FSM, capture handle, tail,
+    /// session id, and session kind; hands back `Command`s to perform.
+    session: Session<audio::capture::Capture>,
+    pill: PillAdapter,
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
     settings_child: Option<std::process::Child>,
-    /// Post-capture pill state: `Processing` while a worker runs, then `Done`
-    /// for the terminal green/red flash. `None` when idle or recording.
-    tail: Option<Tail>,
     /// Workers report their outcome here; polled each loop on the UI thread.
-    outcome_tx: crossbeam_channel::Sender<(u64, Outcome)>,
-    outcome_rx: crossbeam_channel::Receiver<(u64, Outcome)>,
-    /// Monotonic id stamped on each dispatched worker; matched on its outcome.
-    session_seq: u64,
-    /// Most recent waveform bars, frozen and reused during the tail animation.
-    last_bars: Vec<f32>,
+    outcome_tx: crossbeam_channel::Sender<(u64, session::Outcome)>,
+    outcome_rx: crossbeam_channel::Receiver<(u64, session::Outcome)>,
 }
 
 impl App {
-    fn start_session(&mut self, el: &ActiveEventLoop) {
-        match audio::capture::Capture::start(self.cfg.input_device.as_deref()) {
-            Ok(cap) => {
-                tracing::info!(
-                    device = %cap.device_name,
-                    input_sr = cap.input_sr,
-                    channels = cap.input_channels,
-                    "session: START"
-                );
-                self.capture = Some(cap);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to start capture");
-                return;
-            }
-        }
-
-        // A quick re-trigger during the tail animation supersedes it; a still
-        // in-flight worker's outcome is then ignored by its session id.
-        self.tail = None;
-
-        match pill::window::PillWindow::create(el) {
-            Ok(mut pw) => {
-                self.bands.reset();
-                // Paint one frame BEFORE showing so the initial reveal is
-                // already the pill (not a transparent rectangle).
-                let initial = vec![0.0; pill::BAR_COUNT];
-                let _ = pw.render_recording(&initial);
-                pw.show();
-                self.pill = Some(pw);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create pill window");
+    /// Execute the `Command`s the core returned. `StartCapture` is the one
+    /// effect that reports a result straight back into the core, whose follow-up
+    /// commands (show the pill, or nothing on failure) are executed in turn.
+    fn run_commands(&mut self, cmds: Vec<Command>, el: &ActiveEventLoop) {
+        let mut queue: VecDeque<Command> = cmds.into_iter().collect();
+        while let Some(cmd) = queue.pop_front() {
+            match cmd {
+                Command::StartCapture => {
+                    let more = match audio::capture::Capture::start(self.cfg.input_device.as_deref())
+                    {
+                        Ok(cap) => {
+                            tracing::info!(
+                                device = %cap.device_name,
+                                input_sr = cap.input_sr,
+                                channels = cap.input_channels,
+                                "session: START"
+                            );
+                            // The pill animates live bars from a read-only clone
+                            // of the ring buffer; the core keeps the handle it
+                            // drains at stop.
+                            self.pill.set_ring(cap.buffer.clone());
+                            self.session.capture_started(Some(cap))
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to start capture");
+                            self.session.capture_started(None)
+                        }
+                    };
+                    queue.extend(more);
+                }
+                Command::SetPill(mode) => self.pill.set_mode(mode, el),
+                Command::DismissPill => self.pill.dismiss(),
+                Command::SpawnTranscription {
+                    samples,
+                    session_id,
+                    session_kind,
+                } => self.spawn_worker(samples, session_id, session_kind),
             }
         }
     }
 
-    /// Put the most recent transcript back on the clipboard, so a paste that
-    /// landed nowhere can be recovered with a manual Ctrl+V. No-op (logged) if
-    /// the history is empty or the clipboard can't be opened.
-    fn copy_last_transcription(&mut self) {
-        match history::last() {
-            Some(entry) => match paste::set_clipboard(&entry.text) {
-                Ok(()) => tracing::info!("last transcript copied to clipboard"),
-                Err(e) => tracing::error!(error = %e, "failed to copy last transcript"),
-            },
-            None => tracing::info!("copy last transcript: history is empty"),
-        }
-    }
-
-    /// Apply a worker's reported outcome to the pill. Outcomes from a
-    /// superseded session (the user re-triggered before this one finished) are
-    /// ignored — only the `Processing` pill that owns `session` reacts.
-    fn handle_outcome(&mut self, session: u64, outcome: Outcome) {
-        let owns = matches!(self.tail, Some(Tail::Processing { session: s, .. }) if s == session);
-        if !owns {
-            return;
-        }
-        match outcome {
-            Outcome::Delivered => {
-                self.tail = Some(Tail::Done {
-                    ok: true,
-                    since: Instant::now(),
-                });
-            }
-            Outcome::Failed => {
-                self.tail = Some(Tail::Done {
-                    ok: false,
-                    since: Instant::now(),
-                });
-            }
-            // Nothing usable was said — just disappear, no flash.
-            Outcome::Empty => self.dismiss_pill(),
-        }
-    }
-
-    /// Tear down the pill immediately (no tail animation).
-    fn dismiss_pill(&mut self) {
-        self.tail = None;
-        if let Some(pw) = self.pill.take() {
-            drop(pw);
-        }
-    }
-
-    fn stop_session(&mut self) {
-        // Stop capturing immediately (this freezes the bars), but keep the
-        // pill window around — if we end up dispatching a transcription we
-        // replace the bars with a brief green-checkmark "success" animation.
-        let Some(cap) = self.capture.take() else {
-            self.dismiss_pill();
-            tracing::warn!("session: STOP without active capture");
-            return;
-        };
-        let samples = cap.buffer.take();
-        let duration_ms = samples.len() as u64 * 1000 / audio::TARGET_SR as u64;
-        if samples.len() < (audio::TARGET_SR as usize * 150) / 1000 {
-            // Nothing usable captured — just disappear, no success checkmark.
-            self.dismiss_pill();
-            tracing::info!(duration_ms, "session: STOP (too short, dropped)");
-            return;
-        }
-        let path = wav_dump_path();
-        if let Err(e) = write_wav(&path, &samples) {
-            tracing::error!(error = %e, "failed to write wav dump");
-        } else {
-            tracing::info!(
-                duration_ms,
-                path = %path.display(),
-                samples = samples.len(),
-                "session: STOP (wav written)"
-            );
-        }
-
+    /// Off-thread pipeline for a committed capture: transcribe → postprocess →
+    /// history → paste, reporting one [`session::Outcome`] back by id.
+    ///
+    /// History is recorded *before* the paste attempt — if the paste is
+    /// swallowed or lands in the wrong window, that record is the only surviving
+    /// copy. Do not reorder.
+    fn spawn_worker(&self, samples: Vec<f32>, session_id: u64, kind: SessionKind) {
         let Some(transcriber) = self.transcriber.clone() else {
-            self.dismiss_pill();
+            // The core gates on transcriber availability, so this is defensive:
+            // resolve the pill instead of parking it in Processing.
             tracing::warn!("no transcriber configured; skipping paste");
+            let _ = self.outcome_tx.send((session_id, session::Outcome::Empty));
             return;
         };
-
-        // We're committing to a transcription — hold the pill in its
-        // "processing" state until the worker reports back what really
-        // happened, then show green (delivered) or red (failed).
-        self.session_seq += 1;
-        let session = self.session_seq;
-        self.tail = Some(Tail::Processing {
-            session,
-            since: Instant::now(),
-        });
         let outcome_tx = self.outcome_tx.clone();
-
         let append_space = self.cfg.append_trailing_space;
         let restore_clipboard = self.cfg.restore_clipboard;
         let pipeline = postprocess::Pipeline::from_config(&self.cfg);
@@ -344,19 +212,29 @@ impl App {
             config::PasteMode::Clipboard => paste::PasteMode::Clipboard,
             config::PasteMode::Unicode => paste::PasteMode::Unicode,
         };
-        let kind = self.session_kind;
-        // Fetch the key on the UI thread — the keyring is process-global
-        // state, no reason to touch it from every worker.
+        // Fetch the key on the UI thread — the keyring is process-global state,
+        // no reason to touch it from every worker.
         let groq_key = match kind {
             SessionKind::Command => secrets::load_key(config::Provider::Groq),
             SessionKind::Dictate => None,
         };
         std::thread::spawn(move || {
+            // Debug artifact: the last capture, on disk as a wav.
+            let path = wav_dump_path();
+            match write_wav(&path, &samples) {
+                Ok(()) => tracing::info!(
+                    samples = samples.len(),
+                    path = %path.display(),
+                    "session: STOP (wav written)"
+                ),
+                Err(e) => tracing::error!(error = %e, "failed to write wav dump"),
+            }
+
             // Send the worker's verdict to the UI loop. The receiver outlives
             // every worker (it's owned by App), so a failed send only means the
             // app is shutting down — nothing to recover.
-            let report = |o: Outcome| {
-                let _ = outcome_tx.send((session, o));
+            let report = |o: session::Outcome| {
+                let _ = outcome_tx.send((session_id, o));
             };
             let started = Instant::now();
             // Attribution rides with the result so history credits whichever
@@ -366,7 +244,7 @@ impl App {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "transcription failed");
-                    report(Outcome::Failed);
+                    report(session::Outcome::Failed);
                     return;
                 }
             };
@@ -374,7 +252,7 @@ impl App {
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 tracing::info!(elapsed_ms, "transcription empty; nothing to paste");
-                report(Outcome::Empty);
+                report(session::Outcome::Empty);
                 return;
             }
 
@@ -390,14 +268,14 @@ impl App {
                             "push-to-command needs a Groq API key — add one under \
                              Settings > Transcription with Groq selected"
                         );
-                        report(Outcome::Failed);
+                        report(session::Outcome::Failed);
                         return;
                     };
                     match llm::run_command(&key, trimmed) {
                         Ok(answer) => (answer, "command"),
                         Err(e) => {
                             tracing::error!(error = %e, "command transform failed");
-                            report(Outcome::Failed);
+                            report(session::Outcome::Failed);
                             return;
                         }
                     }
@@ -410,7 +288,7 @@ impl App {
             // don't paste a bare trailing space or record an empty entry.
             if out.trim().is_empty() {
                 tracing::info!(elapsed_ms, "nothing left to paste");
-                report(Outcome::Empty);
+                report(session::Outcome::Empty);
                 return;
             }
             // Record the text BEFORE attempting paste: if the paste is
@@ -431,15 +309,26 @@ impl App {
             // `deliver_text` reports Delivered the moment the paste keystroke
             // is sent, then keeps the thread alive briefly for clipboard
             // restore housekeeping — the pill shouldn't wait on that.
-            if let Err(e) =
-                paste::deliver_text(&out, paste_mode, restore_clipboard, || {
-                    report(Outcome::Delivered)
-                })
-            {
+            if let Err(e) = paste::deliver_text(&out, paste_mode, restore_clipboard, || {
+                report(session::Outcome::Delivered)
+            }) {
                 tracing::error!(error = %e, "paste failed");
-                report(Outcome::Failed);
+                report(session::Outcome::Failed);
             }
         });
+    }
+
+    /// Put the most recent transcript back on the clipboard, so a paste that
+    /// landed nowhere can be recovered with a manual Ctrl+V. No-op (logged) if
+    /// the history is empty or the clipboard can't be opened.
+    fn copy_last_transcription(&mut self) {
+        match history::last() {
+            Some(entry) => match paste::set_clipboard(&entry.text) {
+                Ok(()) => tracing::info!("last transcript copied to clipboard"),
+                Err(e) => tracing::error!(error = %e, "failed to copy last transcript"),
+            },
+            None => tracing::info!("copy last transcript: history is empty"),
+        }
     }
 }
 
@@ -456,14 +345,9 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
 impl ApplicationHandler for App {
     fn resumed(&mut self, _el: &ActiveEventLoop) {}
 
-    fn window_event(
-        &mut self,
-        _el: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if matches!(event, WindowEvent::RedrawRequested) {
-            self.redraw_pill();
+            self.pill.redraw();
         }
     }
 
@@ -492,27 +376,33 @@ impl ApplicationHandler for App {
             // A capture belongs to the chord that started it. Swallow the
             // other chord's events for the duration so the two FSMs can't
             // fight over one microphone.
-            if self.capture.is_some() && self.session_kind != kind {
+            if matches!(self.session.capturing_kind(), Some(active) if active != kind) {
                 continue;
             }
-            let fsm = match chord {
-                hotkey::Chord::Dictate => &mut self.fsm,
-                hotkey::Chord::Command => &mut self.command_fsm,
-            };
-            match fsm.step(in_ev) {
-                activation::OutEvent::Start => {
-                    self.session_kind = kind;
-                    self.start_session(el);
+            let cmds = match chord {
+                hotkey::Chord::Dictate => self.session.on_dictate_input(in_ev),
+                hotkey::Chord::Command => {
+                    // The command FSM still lives here (next slice folds it into
+                    // the core); drive it and route Start/Stop into the shared
+                    // lifecycle.
+                    let now = match &in_ev {
+                        activation::InEvent::Pressed(t) | activation::InEvent::Released(t) => *t,
+                    };
+                    match self.command_fsm.step(in_ev) {
+                        activation::OutEvent::Start => self.session.begin(SessionKind::Command),
+                        activation::OutEvent::Stop => self.session.end(now),
+                        activation::OutEvent::Ignore => Vec::new(),
+                    }
                 }
-                activation::OutEvent::Stop => self.stop_session(),
-                activation::OutEvent::Ignore => {}
-            }
+            };
+            self.run_commands(cmds, el);
         }
 
-        // Workers report their outcome here; transition the pill to its
-        // terminal green/red flash (or dismiss it on an empty result).
-        while let Ok((session, outcome)) = self.outcome_rx.try_recv() {
-            self.handle_outcome(session, outcome);
+        // Workers report their outcome here; the core transitions the pill to
+        // its terminal flash (or dismisses it) and ignores stale ids.
+        while let Ok((id, outcome)) = self.outcome_rx.try_recv() {
+            let cmds = self.session.on_outcome(id, outcome, Instant::now());
+            self.run_commands(cmds, el);
         }
 
         // Free the on-device model if dictation has been idle long enough.
@@ -522,16 +412,13 @@ impl ApplicationHandler for App {
         }
 
         // Retire the pill once its terminal flash has run its course.
-        if let Some(Tail::Done { ok, since }) = self.tail {
-            if since.elapsed() >= tail_linger(ok) {
-                self.dismiss_pill();
-            }
-        }
+        let cmds = self.session.tick(Instant::now());
+        self.run_commands(cmds, el);
 
         // When the pill is up, drive frame redraws ourselves at ~30 Hz.
         // Otherwise idle wait so we don't spin.
-        if self.pill.is_some() {
-            self.redraw_pill();
+        if self.pill.is_active() {
+            self.pill.redraw();
             el.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(1000 / PILL_FRAME_RATE_HZ),
             ));
@@ -567,7 +454,9 @@ impl App {
     }
 
     fn poll_settings_child(&mut self) {
-        let Some(child) = self.settings_child.as_mut() else { return };
+        let Some(child) = self.settings_child.as_mut() else {
+            return;
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 tracing::info!(?status, "settings subprocess exited; reloading config");
@@ -631,23 +520,98 @@ impl App {
         }
 
         let fsm_mode = fsm_mode_from_config(&new_cfg);
-        self.fsm = activation::Fsm::new(fsm_mode);
+        self.session.reset_activation(fsm_mode);
         self.command_fsm = activation::Fsm::new(fsm_mode);
         self.transcriber = transcribe::build(&new_cfg);
+        self.session
+            .set_transcriber_available(self.transcriber.is_some());
         self.cfg = new_cfg;
     }
+}
 
-    fn redraw_pill(&mut self) {
-        let Some(pill) = self.pill.as_mut() else { return };
+/// The pill window and its animation, driven by a logical [`PillMode`] the core
+/// assigns. The core decides *what* mode and *when* to transition; the adapter
+/// derives every frame's bars, breathing pulse, and fade — including freezing
+/// the bars the moment the mode leaves `Recording`.
+struct PillAdapter {
+    window: Option<pill::window::PillWindow>,
+    bands: audio::level::BandMeter,
+    /// Most recent waveform bars, frozen and reused once capture stops.
+    last_bars: Vec<f32>,
+    /// The current logical mode; `None` when no pill is shown.
+    mode: Option<PillMode>,
+    /// Read-only clone of the active capture's ring buffer, for live bars.
+    ring: Option<audio::ring::Buffer>,
+}
 
-        // Post-capture states take over the pill until it's dismissed.
-        match self.tail {
+impl PillAdapter {
+    fn new() -> Self {
+        Self {
+            window: None,
+            bands: audio::level::BandMeter::new(pill::BAR_COUNT),
+            last_bars: vec![0.0; pill::BAR_COUNT],
+            mode: None,
+            ring: None,
+        }
+    }
+
+    fn set_ring(&mut self, ring: audio::ring::Buffer) {
+        self.ring = Some(ring);
+    }
+
+    fn is_active(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Apply a mode set by the core. `Recording` starts a fresh session — a new
+    /// window, dropping any lingering flash pill; the rest just swap the mode,
+    /// so the next redraw freezes the bars (Processing/Done render `last_bars`
+    /// without touching the ring).
+    fn set_mode(&mut self, mode: PillMode, el: &ActiveEventLoop) {
+        if let PillMode::Recording = mode {
+            match pill::window::PillWindow::create(el) {
+                Ok(mut pw) => {
+                    self.bands.reset();
+                    // Paint one frame BEFORE showing so the initial reveal is
+                    // already the pill (not a transparent rectangle).
+                    let initial = vec![0.0; pill::BAR_COUNT];
+                    let _ = pw.render_recording(&initial);
+                    pw.show();
+                    self.window = Some(pw);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create pill window");
+                    self.window = None;
+                }
+            }
+        }
+        self.mode = Some(mode);
+    }
+
+    /// Tear the pill down immediately (no flash).
+    fn dismiss(&mut self) {
+        self.mode = None;
+        self.ring = None;
+        if let Some(pw) = self.window.take() {
+            drop(pw);
+        }
+    }
+
+    fn redraw(&mut self) {
+        let Some(pill) = self.window.as_mut() else {
+            return;
+        };
+        match self.mode {
             // Terminal flash: green (delivered) or red (failed) border over the
             // frozen bars, holding then fading over the final 30% of the linger.
-            Some(Tail::Done { ok, since }) => {
-                let t = (since.elapsed().as_secs_f32() / tail_linger(ok).as_secs_f32())
-                    .clamp(0.0, 1.0);
-                let alpha = if t < 0.7 { 1.0 } else { ((1.0 - t) / 0.3).clamp(0.0, 1.0) };
+            Some(PillMode::Done { ok, since }) => {
+                let total = session::linger(ok).as_secs_f32();
+                let t = (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+                let alpha = if t < 0.7 {
+                    1.0
+                } else {
+                    ((1.0 - t) / 0.3).clamp(0.0, 1.0)
+                };
                 let res = if ok {
                     pill.render_success(&self.last_bars, alpha)
                 } else {
@@ -656,30 +620,30 @@ impl App {
                 if let Err(e) = res {
                     tracing::error!(error = %e, "pill outcome render failed");
                 }
-                return;
             }
             // Worker still running: frozen bars under a neutral border that
             // breathes (~0.8 Hz) so a slow round-trip reads as live, not hung.
-            Some(Tail::Processing { since, .. }) => {
+            Some(PillMode::Processing { since }) => {
                 let e = since.elapsed().as_secs_f32();
                 let pulse = 0.5 - 0.5 * (e * std::f32::consts::TAU * 0.8).cos();
                 if let Err(e) = pill.render_processing(&self.last_bars, pulse) {
                     tracing::error!(error = %e, "pill processing render failed");
                 }
-                return;
             }
-            None => {}
-        }
-
-        let bars = if let Some(cap) = self.capture.as_ref() {
-            let raw = self.bands.tick(&cap.buffer).to_vec();
-            audio::level::shape_bars(&raw)
-        } else {
-            vec![0.0; pill::BAR_COUNT]
-        };
-        self.last_bars = bars.clone();
-        if let Err(e) = pill.render_recording(&bars) {
-            tracing::error!(error = %e, "pill render failed");
+            // Live capture (or a just-created window): animate bars from the
+            // ring buffer and keep `last_bars` current for the freeze.
+            Some(PillMode::Recording) | None => {
+                let bars = if let Some(ring) = self.ring.as_ref() {
+                    let raw = self.bands.tick(ring).to_vec();
+                    audio::level::shape_bars(&raw)
+                } else {
+                    vec![0.0; pill::BAR_COUNT]
+                };
+                self.last_bars = bars.clone();
+                if let Err(e) = pill.render_recording(&bars) {
+                    tracing::error!(error = %e, "pill render failed");
+                }
+            }
         }
     }
 }
