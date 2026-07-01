@@ -7,10 +7,12 @@
 // while the previous transcription is still running, capture failing to start
 // after the FSM already flipped to recording — assertable in a unit test.
 //
-// The core owns the dictate activation FSM, the capture handle, the post-capture
-// `Phase` (the old `Tail`), the monotonic session id, and the session kind. The
-// winit event loop, the pill, the worker thread, the transcriber, and the
-// clipboard all live on the far side of the `Command` boundary as adapters.
+// The core owns both activation FSMs (dictate and push-to-command), the capture
+// handle, the post-capture `Phase` (the old `Tail`), the monotonic session id,
+// and the session kind. The winit event loop, the pill, the worker thread, the
+// transcriber, and the clipboard all live on the far side of the `Command`
+// boundary as adapters. The two FSMs are separate instances, so holding one
+// chord can never corrupt the other's press/release state.
 //
 // Clock is a parameter, never ambient — no `Instant::now()` in here, matching
 // the activation FSM one level down, whose events already carry an `Instant`.
@@ -122,10 +124,12 @@ enum Phase<C> {
 }
 
 pub struct Session<C> {
-    /// The dictate activation FSM (the command chord keeps its own, in the
-    /// adapter, until the next slice folds it in here).
-    fsm: activation::Fsm,
-    /// Kept so a failed capture start can rebuild the FSM into a clean,
+    /// The dictation chord's activation FSM.
+    dictate_fsm: activation::Fsm,
+    /// The push-to-command chord's activation FSM. A separate instance from
+    /// `dictate_fsm` so the two chords keep independent press/release state.
+    command_fsm: activation::Fsm,
+    /// Kept so a failed capture start can rebuild the relevant FSM into a clean,
     /// non-recording state.
     mode: activation::Mode,
     phase: Phase<C>,
@@ -141,7 +145,8 @@ pub struct Session<C> {
 impl<C: CaptureHandle> Session<C> {
     pub fn new(mode: activation::Mode) -> Self {
         Self {
-            fsm: activation::Fsm::new(mode),
+            dictate_fsm: activation::Fsm::new(mode),
+            command_fsm: activation::Fsm::new(mode),
             mode,
             phase: Phase::Idle,
             session_seq: 0,
@@ -153,10 +158,11 @@ impl<C: CaptureHandle> Session<C> {
         self.transcriber_available = available;
     }
 
-    /// Rebuild the activation FSM for a new mode (config reload).
+    /// Rebuild both activation FSMs for a new mode (config reload).
     pub fn reset_activation(&mut self, mode: activation::Mode) {
         self.mode = mode;
-        self.fsm = activation::Fsm::new(mode);
+        self.dictate_fsm = activation::Fsm::new(mode);
+        self.command_fsm = activation::Fsm::new(mode);
     }
 
     /// The kind of the capture currently starting or running, if any. The
@@ -170,14 +176,29 @@ impl<C: CaptureHandle> Session<C> {
         }
     }
 
-    /// Drive the dictate FSM with a raw press/release event. Start/Stop verdicts
-    /// route into the shared lifecycle; the instant rides in with the event.
+    /// Drive the dictation chord's FSM with a raw press/release event.
     pub fn on_dictate_input(&mut self, ev: InEvent) -> Vec<Command> {
+        self.drive_fsm(SessionKind::Dictate, ev)
+    }
+
+    /// Drive the push-to-command chord's FSM with a raw press/release event.
+    pub fn on_command_input(&mut self, ev: InEvent) -> Vec<Command> {
+        self.drive_fsm(SessionKind::Command, ev)
+    }
+
+    /// Step the FSM belonging to `kind` and route its Start/Stop verdict into the
+    /// shared lifecycle; the instant rides in with the event. Each chord has its
+    /// own FSM, so one chord's presses never touch the other's state.
+    fn drive_fsm(&mut self, kind: SessionKind, ev: InEvent) -> Vec<Command> {
         let now = match &ev {
             InEvent::Pressed(t) | InEvent::Released(t) => *t,
         };
-        match self.fsm.step(ev) {
-            OutEvent::Start => self.begin(SessionKind::Dictate),
+        let fsm = match kind {
+            SessionKind::Dictate => &mut self.dictate_fsm,
+            SessionKind::Command => &mut self.command_fsm,
+        };
+        match fsm.step(ev) {
+            OutEvent::Start => self.begin(kind),
             OutEvent::Stop => self.end(now),
             OutEvent::Ignore => Vec::new(),
         }
@@ -186,10 +207,7 @@ impl<C: CaptureHandle> Session<C> {
     /// Begin a capture session. Replacing the phase drops any live capture
     /// handle (no overlap) and supersedes any in-flight tail — the superseded
     /// worker's outcome is later ignored by its session id.
-    ///
-    /// Public so the command chord (adapter-owned FSM, this slice) can share the
-    /// lifecycle; the dictate chord reaches it through `on_dictate_input`.
-    pub fn begin(&mut self, kind: SessionKind) -> Vec<Command> {
+    fn begin(&mut self, kind: SessionKind) -> Vec<Command> {
         self.phase = Phase::Starting { kind };
         vec![Command::StartCapture]
     }
@@ -208,12 +226,11 @@ impl<C: CaptureHandle> Session<C> {
                     tracing::error!("capture failed to start; session cancelled");
                     // No pill was ever shown (we only show it on success), so
                     // there's nothing to dismiss — just get back to a clean,
-                    // non-recording state. Only the dictate FSM lives here; the
-                    // command chord's FSM is still adapter-owned this slice, so a
-                    // failed command start can't be reset from the core yet (that
-                    // is folded in when the command chord moves in — next slice).
-                    if kind == SessionKind::Dictate {
-                        self.fsm = activation::Fsm::new(self.mode);
+                    // non-recording state. Rebuild the FSM for whichever chord
+                    // was starting, so it doesn't stay stuck believing it records.
+                    match kind {
+                        SessionKind::Dictate => self.dictate_fsm = activation::Fsm::new(self.mode),
+                        SessionKind::Command => self.command_fsm = activation::Fsm::new(self.mode),
                     }
                     Vec::new()
                 }
@@ -230,7 +247,7 @@ impl<C: CaptureHandle> Session<C> {
     /// Stop the current capture. Drains the samples and, if there's enough audio
     /// and a transcriber, commits to Processing and hands the samples to a
     /// worker; otherwise the pill just disappears.
-    pub fn end(&mut self, now: Instant) -> Vec<Command> {
+    fn end(&mut self, now: Instant) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Recording { kind, capture } => {
                 let samples = capture.take_samples();
@@ -529,6 +546,93 @@ mod tests {
                 Command::SpawnTranscription { .. }
             ]
         ));
+    }
+
+    /// Drive a chord (via its own input method) from idle all the way into
+    /// Processing, asserting the spawn and returning its routed session kind.
+    fn spawn_kind_for(
+        s: &mut Session<FakeCapture>,
+        input: fn(&mut Session<FakeCapture>, InEvent) -> Vec<Command>,
+    ) -> SessionKind {
+        assert_eq!(input(s, InEvent::Pressed(t(0))), vec![Command::StartCapture]);
+        assert_eq!(
+            s.capture_started(Some(long_capture())),
+            vec![Command::SetPill(PillMode::Recording)]
+        );
+        match &input(s, InEvent::Released(t(500)))[..] {
+            [Command::SetPill(PillMode::Processing { .. }), Command::SpawnTranscription {
+                session_kind,
+                ..
+            }] => *session_kind,
+            other => panic!("expected Processing + Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_chord_routes_spawn_to_the_command_path() {
+        let mut s = ready_session();
+        // Driving the command chord's FSM end-to-end must tag the spawned worker
+        // as Command, so the adapter routes it to the LLM instruction path.
+        assert_eq!(
+            spawn_kind_for(&mut s, Session::on_command_input),
+            SessionKind::Command
+        );
+    }
+
+    #[test]
+    fn dictate_chord_routes_spawn_to_the_dictate_path() {
+        let mut s = ready_session();
+        // The dictation chord tags its worker as Dictate → plain postprocess path.
+        assert_eq!(
+            spawn_kind_for(&mut s, Session::on_dictate_input),
+            SessionKind::Dictate
+        );
+    }
+
+    #[test]
+    fn one_chord_cannot_corrupt_the_others_press_release_state() {
+        let mut s = ready_session();
+        // The command chord is held → its FSM starts a capture.
+        assert_eq!(
+            s.on_command_input(InEvent::Pressed(t(0))),
+            vec![Command::StartCapture]
+        );
+        // A stray release on the *dictate* chord (never pressed) is ignored: its
+        // FSM has independent state, untouched by the command press. If the two
+        // shared one FSM this would misfire as a Stop.
+        assert!(s.on_dictate_input(InEvent::Released(t(100))).is_empty());
+        // The command chord then still stops cleanly on its own release, routed
+        // to the command path — proving its state survived intact.
+        s.capture_started(Some(long_capture()));
+        let cmds = s.on_command_input(InEvent::Released(t(200)));
+        assert!(matches!(
+            cmds[..],
+            [
+                Command::SetPill(PillMode::Processing { .. }),
+                Command::SpawnTranscription {
+                    session_kind: SessionKind::Command,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn command_capture_start_failure_resets_the_command_fsm() {
+        let mut s = ready_session();
+        assert_eq!(
+            s.on_command_input(InEvent::Pressed(t(0))),
+            vec![Command::StartCapture]
+        );
+        // Open failed: no pill, no recording, and the command FSM is rebuilt so a
+        // later command press starts fresh instead of reading as a stop.
+        assert!(s.capture_started(None).is_empty());
+        assert!(!s.is_recording());
+        assert!(s.capturing_kind().is_none());
+        assert_eq!(
+            s.on_command_input(InEvent::Pressed(t(100))),
+            vec![Command::StartCapture]
+        );
     }
 
     #[test]

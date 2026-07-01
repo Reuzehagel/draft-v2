@@ -77,7 +77,6 @@ fn main() -> Result<()> {
     tracing::info!(hotkey = %cfg.hotkey, command = ?command_spec, "hotkeys registered");
 
     let fsm_mode = fsm_mode_from_config(&cfg);
-    let command_fsm = activation::Fsm::new(fsm_mode);
 
     let transcriber: Option<Arc<dyn Transcriber>> = transcribe::build(&cfg);
     if transcriber.is_none() {
@@ -97,7 +96,6 @@ fn main() -> Result<()> {
         menu_rx,
         hotkey_handle: Some(hotkey_handle),
         hotkey_rx,
-        command_fsm,
         session,
         pill: PillAdapter::new(),
         transcriber,
@@ -132,12 +130,9 @@ struct App {
     /// restore, where hotkeys are dead until restart).
     hotkey_handle: Option<hotkey::HotkeyHandle>,
     hotkey_rx: crossbeam_channel::Receiver<hotkey::HotkeyEvent>,
-    /// The push-to-command chord's activation FSM. The dictate FSM lives inside
-    /// `session`; the command chord keeps its own here (folded in next slice),
-    /// so holding one hotkey can't corrupt the other's press/release state.
-    command_fsm: activation::Fsm,
-    /// The pure dictation lifecycle. Owns the dictate FSM, capture handle, tail,
-    /// session id, and session kind; hands back `Command`s to perform.
+    /// The pure dictation lifecycle. Owns both activation FSMs (dictate and
+    /// push-to-command), the capture handle, tail, session id, and session kind;
+    /// hands back `Command`s to perform.
     session: Session<audio::capture::Capture>,
     pill: PillAdapter,
     transcriber: Option<Arc<dyn Transcriber>>,
@@ -379,21 +374,11 @@ impl ApplicationHandler for App {
             if matches!(self.session.capturing_kind(), Some(active) if active != kind) {
                 continue;
             }
+            // Both chords now run entirely through the pure `Session` core,
+            // which owns an independent FSM for each.
             let cmds = match chord {
                 hotkey::Chord::Dictate => self.session.on_dictate_input(in_ev),
-                hotkey::Chord::Command => {
-                    // The command FSM still lives here (next slice folds it into
-                    // the core); drive it and route Start/Stop into the shared
-                    // lifecycle.
-                    let now = match &in_ev {
-                        activation::InEvent::Pressed(t) | activation::InEvent::Released(t) => *t,
-                    };
-                    match self.command_fsm.step(in_ev) {
-                        activation::OutEvent::Start => self.session.begin(SessionKind::Command),
-                        activation::OutEvent::Stop => self.session.end(now),
-                        activation::OutEvent::Ignore => Vec::new(),
-                    }
-                }
+                hotkey::Chord::Command => self.session.on_command_input(in_ev),
             };
             self.run_commands(cmds, el);
         }
@@ -521,7 +506,6 @@ impl App {
 
         let fsm_mode = fsm_mode_from_config(&new_cfg);
         self.session.reset_activation(fsm_mode);
-        self.command_fsm = activation::Fsm::new(fsm_mode);
         self.transcriber = transcribe::build(&new_cfg);
         self.session
             .set_transcriber_available(self.transcriber.is_some());
