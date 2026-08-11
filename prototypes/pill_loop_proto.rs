@@ -474,9 +474,36 @@ impl TextRenderer {
         }
     }
 
-    fn width(&self, text: &str, px: f32) -> f32 {
-        let Some(f) = &self.font else { return 0.0 };
-        text.chars().map(|c| f.metrics(c, px).advance_width).sum()
+    /// Where the string's *ink* actually starts and ends, relative to the pen
+    /// origin. Advance widths include side bearings, so centring on them
+    /// leaves the visible text off-centre — by different amounts per string,
+    /// which is what makes it look sloppy rather than merely shifted.
+    fn ink_span(&self, text: &str, px: f32) -> (f32, f32) {
+        let Some(f) = &self.font else { return (0.0, 0.0) };
+        let (mut pen, mut lo, mut hi) = (0.0f32, f32::MAX, f32::MIN);
+        for ch in text.chars() {
+            let m = f.metrics(ch, px);
+            if m.width > 0 {
+                lo = lo.min(pen + m.xmin as f32);
+                hi = hi.max(pen + m.xmin as f32 + m.width as f32);
+            }
+            pen += m.advance_width;
+        }
+        if lo > hi {
+            (0.0, pen)
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// Height of a capital, for optical vertical centring. Centring the cap
+    /// band rather than the ink keeps "Dictate" and "Copy last transcript" on
+    /// the same line despite one having descenders.
+    fn cap_height(&self, px: f32) -> f32 {
+        self.font
+            .as_ref()
+            .map(|f| f.metrics('H', px).height as f32)
+            .unwrap_or(px * 0.7)
     }
 
     /// Draw `text` with its left edge at `x` and its baseline at `baseline`,
@@ -1103,11 +1130,32 @@ impl App {
             style: self.body(),
         }
     }
+    /// Always UNIFIED, whatever Q0 says. Islands are the *resident pill's
+    /// hover bar* — a shelf of things you might pick. A session in progress is
+    /// one object with a stop and a cancel on it, and breaking it into three
+    /// floating pieces would say the recording is three things.
     fn recclick_layout(&self) -> Layout {
         Layout {
             centre_w: BARS_W,
             flank_w: BTN_D,
-            style: self.body(),
+            style: &BODIES[0],
+        }
+    }
+
+    /// 1 = drawn as islands, 0 = drawn as one body. Only Expanded is ever
+    /// islands; Idle is a single nub either way, so it inherits whatever it is
+    /// travelling to or from and the crossfade never fires on a hover.
+    fn island_mix(&self, now: Instant) -> f32 {
+        if !self.body().islands {
+            return 0.0;
+        }
+        let islandy = |m: Mode| matches!(m, Mode::Expanded | Mode::Idle) as i32 as f32;
+        let to = islandy(self.mode);
+        match &self.anim {
+            Some(a) if self.anim_t(now) < 1.0 => {
+                lerp(islandy(a.from_mode), to, out_cubic(self.anim_t(now)))
+            }
+            _ => to,
         }
     }
 
@@ -1953,6 +2001,8 @@ impl App {
             history_empty: self.history_empty,
             dictate_ring_a: self.dictate().ring_a,
             fold: self.fold_at(now),
+            island_mix: self.island_mix(now),
+            island_layout: self.expanded_layout(),
             glyph_frac: GLYPH_SIZES[self.glyph].frac,
             strip: self.strip,
         };
@@ -2078,10 +2128,12 @@ impl App {
                 ui.add_space(4.0);
                 question(
                     ui,
-                    "Q0 · One body, or three islands?",
-                    "Not in the ticket — it came out of looking at the thing. #29 assumed one \
-                     body and never asked. Islands invert its slab argument: with a visible \
-                     gap, losing hover between buttons is honest rather than a flicker.",
+                    "Q0 · Is the hover bar one body, or three islands?",
+                    "Not in the ticket — it came out of looking at the thing. Islands apply to \
+                     the resident pill's hover bar ONLY; a click-started recording stays one \
+                     body, so clicking Dictate now has a shape change to make as well. They \
+                     also invert #29's slab argument: with a visible gap, losing hover between \
+                     buttons is honest rather than a flicker.",
                     &mut self.body,
                     BODIES.iter().map(|b| (b.name, b.note)),
                 );
@@ -2272,6 +2324,8 @@ struct Frame {
     history_empty: bool,
     dictate_ring_a: f32,
     fold: f32,
+    island_mix: f32,
+    island_layout: Layout,
     glyph_frac: f32,
     strip: bool,
 }
@@ -2304,14 +2358,27 @@ fn draw(
     let cx = w / 2.0;
     let cy = y + rh / 2.0;
 
-    let islands = f.layout.map(|l| l.style.islands).unwrap_or(false);
-    if islands {
+    // Islands and the single body coexist during a handover: the hover bar is
+    // islands, the recording pill is not, so clicking Dictate has to get from
+    // one to the other. They crossfade while the glyphs travel.
+    let mix = f.island_mix;
+    if mix < 0.999 {
+        let x = cx - sw / 2.0 + m;
+        let rw = (sw - 2.0 * m).max(1.0);
+        let r = (g.radius * scale).min(rh / 2.0);
+        body_shape(pm, g, x, y, rw, rh, r, border_w, 1.0 - mix);
+
+        // The hover indicator, behind the glyphs.
+        if let Some(l) = f.layout {
+            draw_indicator(pm, scale, f, l, cx, cy, rh, 1.0 - mix);
+        }
+    }
+    if mix > 0.001 {
         // Three bodies instead of one. The centre island interpolates from the
         // *whole pill's* current width, so at fold 0 it is exactly whatever
-        // single shape the pill would otherwise be — the nub on the way in,
-        // the 62x28 recording pill on the way out — and no special case is
-        // needed at either end.
-        let l = f.layout.expect("islands implies a layout");
+        // single shape the pill would otherwise be — the nub on the way in —
+        // and no special case is needed at either end.
+        let l = f.island_layout;
         for i in [0usize, 2, 1] {
             let target = l.island_w(i);
             let iw = if i == 1 {
@@ -2325,7 +2392,7 @@ fn draw(
             let dx = lerp(0.0, l.slot_dx(i), f.fold) * scale;
             let ix = cx + dx - iw / 2.0 + m;
             let irw = (iw - 2.0 * m).max(1.0);
-            body_shape(pm, g, ix, y, irw, rh, irw.min(rh) / 2.0, border_w);
+            body_shape(pm, g, ix, y, irw, rh, irw.min(rh) / 2.0, border_w, mix);
             // The island *is* the hover indicator — there is no gap for a
             // separate disc to distinguish itself from.
             let a = if f.lit == Some(i) {
@@ -2335,6 +2402,7 @@ fn draw(
             } else {
                 0.0
             };
+            let a = a * mix;
             if a > 0.5 {
                 let mut pb = PathBuilder::new();
                 rounded_rect(&mut pb, ix, y, irw, rh, irw.min(rh) / 2.0);
@@ -2345,16 +2413,6 @@ fn draw(
                     pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
                 }
             }
-        }
-    } else {
-        let x = cx - sw / 2.0 + m;
-        let rw = (sw - 2.0 * m).max(1.0);
-        let r = (g.radius * scale).min(rh / 2.0);
-        body_shape(pm, g, x, y, rw, rh, r, border_w);
-
-        // The hover indicator, behind the glyphs.
-        if let Some(l) = f.layout {
-            draw_indicator(pm, scale, f, l, cx, cy, rh);
         }
     }
 
@@ -2407,8 +2465,11 @@ fn body_shape(
     h: f32,
     r: f32,
     border_w: f32,
+    alpha: f32,
 ) {
-    if g.fill_a < 0.5 && g.border_a < 0.5 {
+    let fill_a = g.fill_a * alpha;
+    let border_a = g.border_a * alpha;
+    if fill_a < 0.5 && border_a < 0.5 {
         return;
     }
     let mut pb = PathBuilder::new();
@@ -2420,18 +2481,18 @@ fn body_shape(
         g.fill_rgb.0.clamp(0.0, 255.0) as u8,
         g.fill_rgb.1.clamp(0.0, 255.0) as u8,
         g.fill_rgb.2.clamp(0.0, 255.0) as u8,
-        g.fill_a.clamp(0.0, 255.0) as u8,
+        fill_a.clamp(0.0, 255.0) as u8,
     );
     fill.anti_alias = true;
     pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
-    if g.border_a >= 0.5 {
+    if border_a >= 0.5 {
         let mut border = Paint::default();
         border.set_color_rgba8(
             g.border_rgb.0.clamp(0.0, 255.0) as u8,
             g.border_rgb.1.clamp(0.0, 255.0) as u8,
             g.border_rgb.2.clamp(0.0, 255.0) as u8,
-            g.border_a.clamp(0.0, 255.0) as u8,
+            border_a.clamp(0.0, 255.0) as u8,
         );
         border.anti_alias = true;
         pm.stroke_path(
@@ -2447,13 +2508,22 @@ fn body_shape(
     }
 }
 
-fn draw_indicator(pm: &mut Pixmap, scale: f32, f: &Frame, l: Layout, cx: f32, cy: f32, rh: f32) {
+fn draw_indicator(
+    pm: &mut Pixmap,
+    scale: f32,
+    f: &Frame,
+    l: Layout,
+    cx: f32,
+    cy: f32,
+    rh: f32,
+    alpha: f32,
+) {
     let ind = |i: usize| -> (f32, f32) {
         (cx + l.slot_dx(i) * scale, l.slot_w(i) * scale / 2.0)
     };
     let white = (255.0, 255.0, 255.0);
     // #29: a fill behind the glyph at white @ ~28.
-    let a = 28.0 / 255.0;
+    let a = 28.0 / 255.0 * alpha;
     if f.slide {
         match (f.lit, f.lit_prev) {
             (Some(to), Some(from)) => {
@@ -2595,8 +2665,8 @@ fn draw_label(
         if alpha <= 0.004 && box_alpha <= 0.004 {
             return;
         }
-        let tw = text.width(t, px);
-        let bw = tw + 2.0 * pad_x;
+        let (ink_lo, ink_hi) = text.ink_span(t, px);
+        let bw = (ink_hi - ink_lo) + 2.0 * pad_x;
         let bh = px * 1.35 + 2.0 * pad_y;
         let bx = centre_x + dx * scale - bw / 2.0;
         let by = bottom - bh;
@@ -2626,10 +2696,9 @@ fn draw_label(
                 None,
             );
         }
-        // Baseline: fontdue's ascent for this size is close enough to
-        // (px * 0.78) for a single line of UI text.
-        let baseline = by + pad_y + px * 0.80;
-        text.draw(pm, t, bx + pad_x, baseline, px, alpha);
+        // Centre the cap band in the box, and the ink between the paddings.
+        let baseline = by + bh / 2.0 + text.cap_height(px) / 2.0;
+        text.draw(pm, t, bx + pad_x - ink_lo, baseline, px, alpha);
     };
 
     let p = f.label_p;
