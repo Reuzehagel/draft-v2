@@ -2031,8 +2031,9 @@ impl App {
             if self.history_empty { "YES" } else { "no" },
             if self.ok { "ok (green)" } else { "failed (red)" }
         );
-        println!("  [d]ictate [g]lyph-size [t]ransition [s]cale [i]cons [v] indicator [l]abel [n] pad-label");
-        println!("  [c]ancel [y] copied-ms [e] history-empty [f]lip  [1-5] replay  [0] park expanded  [9] park recording  [p] png  [r]eset  [q]uit");
+        // No key list here any more — the control panel replaced the terminal
+        // keys, and this dump gets pasted into the ticket, so it must not
+        // advertise an interface that is gone.
     }
 }
 
