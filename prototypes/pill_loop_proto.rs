@@ -629,29 +629,27 @@ struct BodyStyle {
     note: &'static str,
 }
 
-const BODIES: &[BodyStyle] = &[
-    BodyStyle {
-        name: "UNIFIED",
-        islands: false,
-        pad: 0.0,
-        gap: 0.0,
-        note: "#29 as settled — one pill body, hover slabs so the gaps are live",
-    },
-    BodyStyle {
-        name: "ISLANDS",
-        islands: true,
-        pad: 5.0,
-        gap: 6.0,
-        note: "each button its own island; the 22px flankers become 32px circles, snug",
-    },
-    BodyStyle {
-        name: "ISLANDS-AIRY",
-        islands: true,
-        pad: 6.0,
-        gap: 10.0,
-        note: "same, with enough gap that the desktop clearly shows through between them",
-    },
-];
+/// Judged 2026-08-11: **two states, not three.** ISLANDS-AIRY is gone — the
+/// choice is islands or one body, and it is a toggle rather than a radio
+/// because both states are complete and neither can be put into a bad
+/// configuration. Islands is the default; the user said plainly they prefer it.
+const ISLAND_BODY: BodyStyle = BodyStyle {
+    name: "ISLANDS",
+    islands: true,
+    pad: 5.0,
+    gap: 6.0,
+    note: "each button its own island; the 22px flankers become 32px circles",
+};
+
+/// Named rather than indexed, because the click-started recording pill is
+/// always this one regardless of what the toggle says.
+const UNIFIED_BODY: BodyStyle = BodyStyle {
+    name: "UNIFIED",
+    islands: false,
+    pad: 0.0,
+    gap: 0.0,
+    note: "#29 as settled — one pill body, hover slabs so the gaps are live",
+};
 
 /// Q3, second half. #29 said "22px Lucide icons", which quietly conflates two
 /// numbers: the *button* is 22px, and the icon's 24-unit grid has to be mapped
@@ -986,7 +984,7 @@ struct App {
     text: TextRenderer,
 
     dictate: usize,
-    body: usize,
+    islands: bool,
     glyph: usize,
     handover: usize,
     indicator: usize,
@@ -1045,7 +1043,7 @@ fn main() -> eframe::Result<()> {
         icons: IconCache::new(),
         text: TextRenderer::load(),
         dictate: 0,
-        body: 0,
+        islands: true,
         glyph: 0,
         handover: 0,
         indicator: 0,
@@ -1124,7 +1122,11 @@ impl App {
     }
 
     fn body(&self) -> &'static BodyStyle {
-        &BODIES[self.body]
+        if self.islands {
+            &ISLAND_BODY
+        } else {
+            &UNIFIED_BODY
+        }
     }
     fn expanded_layout(&self) -> Layout {
         Layout {
@@ -1141,7 +1143,7 @@ impl App {
         Layout {
             centre_w: BARS_W,
             flank_w: BTN_D,
-            style: &BODIES[0],
+            style: &UNIFIED_BODY,
         }
     }
 
@@ -1838,7 +1840,15 @@ impl App {
         let exp = self.expanded_layout();
         let rec = self.recclick_layout();
 
-        println!("\n=== Q1 dictate   {}  —  {}", d.name, d.note);
+        let b = self.body();
+        println!("\n=== Q0 body      {}  —  {}", b.name, b.note);
+        if b.islands {
+            println!(
+                "      island = button + 2x{:.0} pad, {:.0}px of bare desktop between islands",
+                b.pad, b.gap
+            );
+        }
+        println!("=== Q1 dictate   {}  —  {}", d.name, d.note);
         println!(
             "      expanded = 2x{:.0} + {:.0} centre + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}",
             BTN_PAD,
@@ -1938,7 +1948,7 @@ impl App {
             return false;
         };
         if let Ok(b) = std::env::var("DRAFT_PROTO_BODY") {
-            self.body = b.parse::<usize>().unwrap_or(0).min(BODIES.len() - 1);
+            self.islands = b.trim() != "0";
         }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_millis(500) {
@@ -2129,17 +2139,29 @@ impl App {
                 });
 
                 ui.add_space(4.0);
-                question(
-                    ui,
-                    "Q0 · Is the hover bar one body, or three islands?",
-                    "Not in the ticket — it came out of looking at the thing. Islands apply to \
-                     the resident pill's hover bar ONLY; a click-started recording stays one \
-                     body, so clicking Dictate now has a shape change to make as well. They \
-                     also invert #29's slab argument: with a visible gap, losing hover between \
-                     buttons is honest rather than a flicker.",
-                    &mut self.body,
-                    BODIES.iter().map(|b| (b.name, b.note)),
-                );
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new("Q0 · Is the hover bar one body, or three islands?")
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Islands apply to the resident pill's hover bar ONLY; a click-started \
+                             recording stays one body, so clicking Dictate has a shape change to \
+                             make as well. They also invert #29's slab argument: with a visible \
+                             gap, losing hover between buttons is honest rather than a flicker.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(2.0);
+                    ui.checkbox(&mut self.islands, "Islands (off = one unified body)");
+                    ui.label(
+                        egui::RichText::new(self.body().note)
+                            .small()
+                            .weak(),
+                    );
+                });
                 question(
                     ui,
                     "Q1 · Does Dictate want to be bigger than its flankers?",
