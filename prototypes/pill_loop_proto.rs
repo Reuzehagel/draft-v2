@@ -574,37 +574,59 @@ fn blend_px(pm: &mut Pixmap, x: i32, y: i32, rgb: (f32, f32, f32), a: f32) {
 // The axes being swept
 // ---------------------------------------------------------------------------
 
-/// Q1 — does Dictate want to be bigger than its flankers? #18 sized every
-/// button at 22; Wispr's centre mic is visibly larger *and* brighter, and that
-/// reference is what prompted the fold-out. Growing the centre changes the
-/// width arithmetic and where the flankers start from, so it is a shape
-/// question, not a paint one.
-struct DictateSize {
+/// Q1 — does Dictate want to be bigger than its flankers?
+///
+/// Judged 2026-08-11, and neither candidate on the old axis was the answer.
+/// Both were about *scale* — one diameter for all three, or a bigger centre
+/// circle. What came back was about **proportion**: Dictate gets **wider**,
+/// and Copy and Settings step **down**. So the hierarchy runs in width and
+/// height at once, and the centre never becomes a bigger circle.
+///
+/// That forces a split this model did not have: **the glyph box is separate
+/// from the button.** Widening Dictate must not widen the mic. Before this,
+/// one number did both jobs, which is exactly how a 34-wide Dictate would
+/// have dragged a 34-wide microphone along with it.
+struct Proportions {
     name: &'static str,
-    d: f32,
-    /// Alpha of the centre button's own disc, before hover.
+    /// The centre button — under ISLANDS this is the island itself.
+    centre_w: f32,
+    /// The 24-unit icon grid's box inside the centre button.
+    centre_glyph: f32,
+    flank_w: f32,
+    flank_glyph: f32,
+    /// Alpha of the centre button's own disc, before hover. Only meaningful
+    /// under UNIFIED — under ISLANDS the island *is* the indicator.
     ring_a: f32,
     note: &'static str,
 }
 
-const DICTATE_SIZES: &[DictateSize] = &[
-    DictateSize {
-        name: "UNIFORM-22",
-        d: 22.0,
+const PROPORTIONS: &[Proportions] = &[
+    Proportions {
+        name: "HIERARCHY 34/26  (CHOSEN)",
+        centre_w: 34.0,
+        centre_glyph: 22.0,
+        flank_w: 26.0,
+        flank_glyph: 20.0,
+        ring_a: 0.0,
+        note: "Dictate is a 34x32 stadium; the flankers step down to 26px circles",
+    },
+    Proportions {
+        name: "UNIFORM 32  (rejected)",
+        centre_w: 32.0,
+        centre_glyph: 22.0,
+        flank_w: 32.0,
+        flank_glyph: 22.0,
         ring_a: 0.0,
         note: "#18 as settled — three equal buttons, nothing marked as primary",
     },
-    DictateSize {
-        name: "DOMINANT-28",
-        d: 28.0,
+    Proportions {
+        name: "DOMINANT CIRCLE 38/32  (rejected)",
+        centre_w: 38.0,
+        centre_glyph: 26.0,
+        flank_w: 32.0,
+        flank_glyph: 22.0,
         ring_a: 34.0,
-        note: "centre grows and carries a resting disc — the Wispr read",
-    },
-    DictateSize {
-        name: "DOMINANT-30-BRIGHT",
-        d: 30.0,
-        ring_a: 58.0,
-        note: "as far as this goes before the flankers look like afterthoughts",
+        note: "the centre grows as a circle instead of a stadium — the old Wispr read",
     },
 ];
 
@@ -633,12 +655,16 @@ struct BodyStyle {
 /// choice is islands or one body, and it is a toggle rather than a radio
 /// because both states are complete and neither can be put into a bad
 /// configuration. Islands is the default; the user said plainly they prefer it.
+/// `pad` is 0 because the proportions above now give the island *directly* —
+/// the number in the spec is the number on screen. It was 5 when the axis
+/// described a bare button that then grew padding, which meant the spec said
+/// 22 and the screen showed 32.
 const ISLAND_BODY: BodyStyle = BodyStyle {
     name: "ISLANDS",
     islands: true,
-    pad: 5.0,
+    pad: 0.0,
     gap: 6.0,
-    note: "each button its own island; the 22px flankers become 32px circles",
+    note: "each button is its own island, with bare desktop showing between them",
 };
 
 /// Named rather than indexed, because the click-started recording pill is
@@ -897,6 +923,10 @@ fn out_cubic(t: f32) -> f32 {
 struct Layout {
     centre_w: f32,
     flank_w: f32,
+    /// The icon grid's box, kept apart from the button width so a wide
+    /// Dictate does not drag a wide microphone along with it.
+    centre_glyph: f32,
+    flank_glyph: f32,
     style: &'static BodyStyle,
 }
 
@@ -934,6 +964,20 @@ impl Layout {
             self.flank_w
         }
     }
+    fn slot_glyph(&self, i: usize) -> f32 {
+        if i == 1 {
+            self.centre_glyph
+        } else {
+            self.flank_glyph
+        }
+    }
+    /// An island is as tall as it is wide, up to the pill's own height — so a
+    /// 26px flanker is a circle and a 34px Dictate is a stadium. This is the
+    /// half of the hierarchy that runs in height; without it a narrower
+    /// flanker would be a *vertical* stadium, which reads as a mistake.
+    fn island_h(&self, i: usize) -> f32 {
+        self.island_w(i).min(EXP_H)
+    }
     /// #29: slabs are full pill height, the button plus half the gap either
     /// side, and the 11px end padding is inert. Islands invert that — the
     /// hit region is the island, and the gap between islands really is dead,
@@ -960,7 +1004,10 @@ enum Item {
 struct Drawn {
     item: Item,
     dx: f32,
+    /// The button/island width. Drives the resting disc and the bar cluster.
     size: f32,
+    /// The icon grid's box. Equals `size` for anything that is not an icon.
+    glyph: f32,
     alpha: f32,
     /// Index into the *interactive* slot set, for the hover indicator.
     slot: Option<usize>,
@@ -1099,8 +1146,8 @@ fn main() -> eframe::Result<()> {
 }
 
 impl App {
-    fn dictate(&self) -> &'static DictateSize {
-        &DICTATE_SIZES[self.dictate]
+    fn dictate(&self) -> &'static Proportions {
+        &PROPORTIONS[self.dictate]
     }
     fn handover(&self) -> Handover {
         HANDOVERS[self.handover].0
@@ -1129,9 +1176,12 @@ impl App {
         }
     }
     fn expanded_layout(&self) -> Layout {
+        let p = self.dictate();
         Layout {
-            centre_w: self.dictate().d,
-            flank_w: BTN_D,
+            centre_w: p.centre_w,
+            flank_w: p.flank_w,
+            centre_glyph: p.centre_glyph,
+            flank_glyph: p.flank_glyph,
             style: self.body(),
         }
     }
@@ -1143,6 +1193,8 @@ impl App {
         Layout {
             centre_w: BARS_W,
             flank_w: BTN_D,
+            centre_glyph: BARS_W,
+            flank_glyph: BTN_D,
             style: &UNIFIED_BODY,
         }
     }
@@ -1330,7 +1382,7 @@ impl App {
     /// the pill through this is what makes the fold read as a fold rather than
     /// a resize.
     fn swap_pinch_w(&self) -> f32 {
-        2.0 * BTN_PAD + self.dictate().d.max(BARS_W)
+        2.0 * BTN_PAD + self.dictate().centre_w.max(BARS_W)
     }
 
     /// The pill's width this frame — normally the geometry lerp, except under
@@ -1383,6 +1435,7 @@ impl App {
                     dx: 0.0,
                     // BARS_W, not REC_W: the cluster sits *inside* the pill.
                     size: BARS_W,
+                    glyph: BARS_W,
                     alpha: 1.0,
                     slot: None,
                 }],
@@ -1412,12 +1465,16 @@ impl App {
                             .enumerate()
                     {
                         let dx = lerp(exp.slot_dx(i), rec.slot_dx(i), t);
+                        // Both the button and the glyph box travel, because
+                        // the two layouts no longer agree on either one.
+                        let size = lerp(exp.slot_w(i), rec.slot_w(i), t);
+                        let glyph = lerp(exp.slot_glyph(i), rec.slot_glyph(i), t);
                         if i == 1 {
-                            let size = lerp(exp.centre_w, rec.centre_w, t);
                             out.push(Drawn {
                                 item: Item::Icon(a_icon),
                                 dx,
-                                size: exp.centre_w,
+                                size,
+                                glyph,
                                 alpha: (1.0 - t * 2.0).max(0.0),
                                 slot: None,
                             });
@@ -1425,6 +1482,7 @@ impl App {
                                 item: Item::Bars,
                                 dx,
                                 size,
+                                glyph: size,
                                 alpha: ((t - 0.4) / 0.6).clamp(0.0, 1.0),
                                 slot: None,
                             });
@@ -1432,14 +1490,16 @@ impl App {
                             out.push(Drawn {
                                 item: Item::Icon(a_icon),
                                 dx,
-                                size: BTN_D,
+                                size,
+                                glyph,
                                 alpha: 1.0 - t,
                                 slot: None,
                             });
                             out.push(Drawn {
                                 item: Item::Icon(b_icon),
                                 dx,
-                                size: BTN_D,
+                                size,
+                                glyph,
                                 alpha: t,
                                 slot: None,
                             });
@@ -1481,6 +1541,7 @@ impl App {
                     dx: 0.0,
                     // BARS_W, not REC_W: the cluster sits *inside* the pill.
                     size: BARS_W,
+                    glyph: BARS_W,
                     alpha: t,
                     slot: None,
                 }]
@@ -1505,6 +1566,7 @@ impl App {
                         item: Item::Icon(icons[1]),
                         dx,
                         size: l.centre_w,
+                        glyph: l.centre_glyph,
                         alpha: k,
                         slot: Some(1),
                     });
@@ -1513,6 +1575,7 @@ impl App {
                         item: Item::Bars,
                         dx,
                         size: l.centre_w,
+                        glyph: l.centre_w,
                         alpha: k,
                         slot: None,
                     });
@@ -1522,6 +1585,7 @@ impl App {
                     item: Item::Icon(icons[i]),
                     dx,
                     size: l.flank_w,
+                    glyph: l.flank_glyph,
                     alpha: k,
                     slot: Some(i),
                 });
@@ -1840,29 +1904,52 @@ impl App {
         let exp = self.expanded_layout();
         let rec = self.recclick_layout();
 
+        // The arithmetic printed is the arithmetic *in force* — the two body
+        // styles do not share a formula, and printing #18's unified one
+        // regardless is how a width of 98 got explained by a sum that makes
+        // 124.
         let b = self.body();
         println!("\n=== Q0 body      {}  —  {}", b.name, b.note);
+        println!("=== Q1 sizes     {}  —  {}", d.name, d.note);
         if b.islands {
             println!(
-                "      island = button + 2x{:.0} pad, {:.0}px of bare desktop between islands",
-                b.pad, b.gap
+                "      expanded = {:.0} + {:.0} gap + {:.0} + {:.0} gap + {:.0} = {:.0} wide",
+                exp.island_w(0),
+                b.gap,
+                exp.island_w(1),
+                b.gap,
+                exp.island_w(2),
+                exp.width()
+            );
+            println!(
+                "      islands  = copy {:.0}x{:.0}   dictate {:.0}x{:.0}   settings {:.0}x{:.0}",
+                exp.island_w(0),
+                exp.island_h(0),
+                exp.island_w(1),
+                exp.island_h(1),
+                exp.island_w(2),
+                exp.island_h(2)
+            );
+        } else {
+            println!(
+                "      expanded = 2x{:.0} + {:.0} centre + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}",
+                BTN_PAD,
+                d.centre_w,
+                d.flank_w,
+                BTN_GAP,
+                exp.width(),
+                EXP_H
             );
         }
-        println!("=== Q1 dictate   {}  —  {}", d.name, d.note);
         println!(
-            "      expanded = 2x{:.0} + {:.0} centre + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}",
-            BTN_PAD,
-            d.d,
-            BTN_D,
-            BTN_GAP,
-            exp.width(),
-            EXP_H
+            "      glyph box: {:.0} in the centre, {:.0} in the flankers",
+            exp.centre_glyph, exp.flank_glyph
         );
         println!(
-            "      rec-click = 2x{:.0} + {:.0} bars + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}",
+            "      rec-click = 2x{:.0} + {:.0} bars + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}  (always one body)",
             BTN_PAD,
             BARS_W,
-            BTN_D,
+            rec.flank_w,
             BTN_GAP,
             rec.width(),
             EXP_H
@@ -1895,10 +1982,16 @@ impl App {
         );
         println!("=== Q3 glyph     {}  —  {}", gs.name, gs.note);
         println!(
-            "      24-grid mapped onto {:.1}px inside a {:.0}px button; stroke {:.2}px",
-            BTN_D * gs.frac,
-            BTN_D,
-            2.0 * BTN_D * gs.frac / 24.0
+            "      centre: 24-grid on {:.1}px of a {:.0} box, stroke {:.2}px",
+            exp.centre_glyph * gs.frac,
+            exp.centre_glyph,
+            2.0 * exp.centre_glyph * gs.frac / 24.0
+        );
+        println!(
+            "      flank:  24-grid on {:.1}px of a {:.0} box, stroke {:.2}px",
+            exp.flank_glyph * gs.frac,
+            exp.flank_glyph,
+            2.0 * exp.flank_glyph * gs.frac / 24.0
         );
         println!(
             "    history empty: {}    flash outcome: {}",
@@ -2165,10 +2258,12 @@ impl App {
                 question(
                     ui,
                     "Q1 · Does Dictate want to be bigger than its flankers?",
-                    "Wispr's centre mic is larger and brighter than its neighbours. Growing \
-                     it changes the pill's width and where the flankers start from.",
+                    "Answered as proportion rather than scale: Dictate is a wide stadium and \
+                     the flankers step DOWN to smaller circles, so the hierarchy runs in width \
+                     and height at once. Each option sets four numbers — the two button widths \
+                     and the two glyph boxes inside them, which are no longer the same thing.",
                     &mut self.dictate,
-                    DICTATE_SIZES.iter().map(|d| (d.name, d.note)),
+                    PROPORTIONS.iter().map(|d| (d.name, d.note)),
                 );
                 question(
                     ui,
@@ -2179,9 +2274,10 @@ impl App {
                 );
                 question(
                     ui,
-                    "Q3a · How big is the glyph inside the button?",
-                    "The button is 22px; the icon's 24-unit grid has to map onto something. \
-                     Smaller glyph = more air, thinner stroke.",
+                    "Q3a · How big is the glyph inside the button?  (CLOSED)",
+                    "The icon's 24-unit grid has to map onto some fraction of the glyph box \
+                     Q1 gives it. Smaller = more air, thinner stroke. Judged: AIR-0.72. The \
+                     other two are kept only as the reference that was judged against.",
                     &mut self.glyph,
                     GLYPH_SIZES.iter().map(|g| (g.name, g.note)),
                 );
@@ -2414,10 +2510,17 @@ fn draw(
             if iw <= 1.0 {
                 continue;
             }
+            // Islands shrink in height as well as width, so a 26px flanker is
+            // a circle rather than a vertical stadium. They stay centred on
+            // the pill's own axis, and the centre island travels from the
+            // pill's current height so the nub grows out of it cleanly.
+            let ih = lerp(g.h, l.island_h(i), f.fold) * scale;
             let dx = lerp(0.0, l.slot_dx(i), f.fold) * scale;
             let ix = cx + dx - iw / 2.0 + m;
             let irw = (iw - 2.0 * m).max(1.0);
-            body_shape(pm, g, ix, y, irw, rh, irw.min(rh) / 2.0, border_w, mix);
+            let irh = (ih - 2.0 * m).max(1.0).min(rh);
+            let iy = cy - irh / 2.0;
+            body_shape(pm, g, ix, iy, irw, irh, irw.min(irh) / 2.0, border_w, mix);
             // The island *is* the hover indicator — there is no gap for a
             // separate disc to distinguish itself from.
             let a = if f.lit == Some(i) {
@@ -2430,7 +2533,7 @@ fn draw(
             let a = a * mix;
             if a > 0.5 {
                 let mut pb = PathBuilder::new();
-                rounded_rect(&mut pb, ix, y, irw, rh, irw.min(rh) / 2.0);
+                rounded_rect(&mut pb, ix, iy, irw, irh, irw.min(irh) / 2.0);
                 if let Some(p) = pb.finish() {
                     let mut paint = Paint::default();
                     paint.set_color_rgba8(255, 255, 255, a as u8);
@@ -2468,7 +2571,7 @@ fn draw(
                 } else {
                     0.70
                 };
-                draw_icon(pm, icons, icon, gx, cy, d.size * scale * f.glyph_frac, d.alpha * dim);
+                draw_icon(pm, icons, icon, gx, cy, d.glyph * scale * f.glyph_frac, d.alpha * dim);
             }
         }
     }
