@@ -581,6 +581,51 @@ const DICTATE_SIZES: &[DictateSize] = &[
     },
 ];
 
+/// NEW AXIS, and a bigger one than it looks: is the button bar **one body**,
+/// or **three islands** with real desktop between them?
+///
+/// #29 assumed one body without ever asking — its slab argument ("circles
+/// would make the gaps dead zones where hover flickers off") is an argument
+/// *for* one body, and islands turn it inside out: with a visible gap, losing
+/// hover in the gap is honest rather than a flicker. So this axis reopens Q4
+/// rather than sitting beside it.
+///
+/// The pleasant accident: at `pad = 5` a 22px button becomes a **32px island**,
+/// which at height 32 is exactly a circle. The bars island stays a stadium.
+struct BodyStyle {
+    name: &'static str,
+    islands: bool,
+    /// Padding around each button inside its own island.
+    pad: f32,
+    /// Gap of bare desktop between islands.
+    gap: f32,
+    note: &'static str,
+}
+
+const BODIES: &[BodyStyle] = &[
+    BodyStyle {
+        name: "UNIFIED",
+        islands: false,
+        pad: 0.0,
+        gap: 0.0,
+        note: "#29 as settled — one pill body, hover slabs so the gaps are live",
+    },
+    BodyStyle {
+        name: "ISLANDS",
+        islands: true,
+        pad: 5.0,
+        gap: 6.0,
+        note: "each button its own island; the 22px flankers become 32px circles, snug",
+    },
+    BodyStyle {
+        name: "ISLANDS-AIRY",
+        islands: true,
+        pad: 6.0,
+        gap: 10.0,
+        note: "same, with enough gap that the desktop clearly shows through between them",
+    },
+];
+
 /// Q3, second half. #29 said "22px Lucide icons", which quietly conflates two
 /// numbers: the *button* is 22px, and the icon's 24-unit grid has to be mapped
 /// onto something. Mapping the grid 1:1 onto the button makes the glyph fill
@@ -824,15 +869,30 @@ fn out_cubic(t: f32) -> f32 {
 struct Layout {
     centre_w: f32,
     flank_w: f32,
+    style: &'static BodyStyle,
 }
 
 impl Layout {
     fn width(&self) -> f32 {
-        2.0 * BTN_PAD + self.centre_w + 2.0 * self.flank_w + 2.0 * BTN_GAP
+        if self.style.islands {
+            (0..3).map(|i| self.island_w(i)).sum::<f32>() + 2.0 * self.style.gap
+        } else {
+            2.0 * BTN_PAD + self.centre_w + 2.0 * self.flank_w + 2.0 * BTN_GAP
+        }
+    }
+    /// The island a button sits in. Under UNIFIED there are no islands, but
+    /// the number is still the button plus its share of the padding, which is
+    /// what the fold animates.
+    fn island_w(&self, i: usize) -> f32 {
+        self.slot_w(i) + 2.0 * self.style.pad
     }
     /// x offset of slot `i` (0,1,2) from the pill's centre.
     fn slot_dx(&self, i: usize) -> f32 {
-        let side = self.centre_w / 2.0 + BTN_GAP + self.flank_w / 2.0;
+        let side = if self.style.islands {
+            self.island_w(1) / 2.0 + self.style.gap + self.island_w(i) / 2.0
+        } else {
+            self.centre_w / 2.0 + BTN_GAP + self.flank_w / 2.0
+        };
         match i {
             0 => -side,
             2 => side,
@@ -847,10 +907,16 @@ impl Layout {
         }
     }
     /// #29: slabs are full pill height, the button plus half the gap either
-    /// side. The 11px end padding is inert.
+    /// side, and the 11px end padding is inert. Islands invert that — the
+    /// hit region is the island, and the gap between islands really is dead,
+    /// because you can see through it.
     fn slab(&self, i: usize) -> (f32, f32) {
         let dx = self.slot_dx(i);
-        let w = self.slot_w(i) + BTN_GAP;
+        let w = if self.style.islands {
+            self.island_w(i)
+        } else {
+            self.slot_w(i) + BTN_GAP
+        };
         (dx - w / 2.0, dx + w / 2.0)
     }
 }
@@ -890,6 +956,7 @@ struct App {
     text: TextRenderer,
 
     dictate: usize,
+    body: usize,
     glyph: usize,
     handover: usize,
     indicator: usize,
@@ -897,8 +964,8 @@ struct App {
     cancel: usize,
     copy_ms: usize,
     scale_ix: usize,
-    strip: bool,
     label_over_pad: bool,
+    strip: bool,
     history_empty: bool,
     ok: bool,
 
@@ -912,6 +979,8 @@ struct App {
     queue_copy_at: Option<Instant>,
     wave_epoch: Instant,
 
+    /// Whether the cursor is anywhere inside the pill at all.
+    cursor_inside: bool,
     /// Which slab the cursor is over, and when it got there.
     hovered: Option<usize>,
     hover_since: Instant,
@@ -930,6 +999,8 @@ struct App {
     parked: bool,
     /// Dumps the next composed frame to a PNG.
     save_next: bool,
+    /// First frame, for the headless capture hook.
+    started: Option<Instant>,
     /// Where the last PNG went, echoed in the panel.
     saved_note: String,
     /// A one-line log of what the last click did, so the panel says what
@@ -944,6 +1015,7 @@ fn main() -> eframe::Result<()> {
         icons: IconCache::new(),
         text: TextRenderer::load(),
         dictate: 0,
+        body: 0,
         glyph: 0,
         handover: 0,
         indicator: 0,
@@ -962,6 +1034,7 @@ fn main() -> eframe::Result<()> {
         next_at: None,
         queue_copy_at: None,
         wave_epoch: start,
+        cursor_inside: false,
         hovered: None,
         hover_since: start,
         lit: None,
@@ -974,6 +1047,7 @@ fn main() -> eframe::Result<()> {
         click_transparent: true,
         parked: false,
         save_next: false,
+        started: None,
         saved_note: String::new(),
         last_action: "nothing yet — hover the pill at the bottom of the screen".into(),
     };
@@ -1019,16 +1093,55 @@ impl App {
         CANCELS[self.cancel].0
     }
 
+    fn body(&self) -> &'static BodyStyle {
+        &BODIES[self.body]
+    }
     fn expanded_layout(&self) -> Layout {
         Layout {
             centre_w: self.dictate().d,
             flank_w: BTN_D,
+            style: self.body(),
         }
     }
     fn recclick_layout(&self) -> Layout {
         Layout {
             centre_w: BARS_W,
             flank_w: BTN_D,
+            style: self.body(),
+        }
+    }
+
+    /// How far the button bar is unfolded, 0 (everything collapsed into the
+    /// centre) to 1 (fully out). The island bodies need it as a scalar; the
+    /// items each carry it as their own alpha and offset.
+    fn fold_at(&self, now: Instant) -> f32 {
+        let raw = self.anim_t(now);
+        if self.anim.is_none() || raw >= 1.0 {
+            return if self.mode.shows_buttons() { 1.0 } else { 0.0 };
+        }
+        let t = out_cubic(raw);
+        let from = self.anim.as_ref().map(|a| a.from_mode);
+        if from == Some(Mode::Expanded) && self.mode == Mode::RecClick {
+            return match self.handover() {
+                // Nothing folds — the glyphs swap in place.
+                Handover::Morph => 1.0,
+                Handover::Swap => {
+                    if raw < 0.5 {
+                        1.0 - out_cubic(raw * 2.0)
+                    } else {
+                        out_cubic((raw - 0.5) * 2.0)
+                    }
+                }
+            };
+        }
+        match (
+            from.map(|m| m.shows_buttons()).unwrap_or(false),
+            self.mode.shows_buttons(),
+        ) {
+            (false, true) => t,
+            (true, false) => 1.0 - t,
+            (true, true) => 1.0,
+            (false, false) => 0.0,
         }
     }
     fn layout_for(&self, mode: Mode) -> Option<Layout> {
@@ -1215,7 +1328,8 @@ impl App {
                 Mode::RecHotkey | Mode::Processing | Mode::Done | Mode::Cancelled => vec![Drawn {
                     item: Item::Bars,
                     dx: 0.0,
-                    size: REC_W,
+                    // BARS_W, not REC_W: the cluster sits *inside* the pill.
+                    size: BARS_W,
                     alpha: 1.0,
                     slot: None,
                 }],
@@ -1312,7 +1426,8 @@ impl App {
                 vec![Drawn {
                     item: Item::Bars,
                     dx: 0.0,
-                    size: REC_W,
+                    // BARS_W, not REC_W: the cluster sits *inside* the pill.
+                    size: BARS_W,
                     alpha: t,
                     slot: None,
                 }]
@@ -1425,10 +1540,12 @@ impl App {
                     self.go(Mode::Expanded, now);
                 }
                 self.hovered = None;
+                self.cursor_inside = false;
             }
             Mode::Expanded | Mode::RecClick => {
                 let g = self.geom_of(self.mode);
                 let inside = win.contains(&g, cx, cy);
+                self.cursor_inside = inside;
                 if !inside {
                     if self.mode == Mode::Expanded {
                         self.go(Mode::Idle, now);
@@ -1450,7 +1567,10 @@ impl App {
                     }
                 }
             }
-            _ => self.hovered = None,
+            _ => {
+                self.hovered = None;
+                self.cursor_inside = false;
+            }
         }
 
         // The indicator can lag the cursor (DWELL) or track it (FADE/SLIDE).
@@ -1481,9 +1601,14 @@ impl App {
             Some(("Copied".to_string(), 0.0))
         } else {
             match (self.lit, self.layout_for(self.mode)) {
-                (Some(i), Some(l)) => self
-                    .label_for(i)
-                    .map(|s| (s.to_string(), l.slot_dx(i))),
+                (Some(i), Some(l)) => self.label_for(i).map(|s| (s.to_string(), l.slot_dx(i))),
+                // Q5's awkward corner: the cursor is on the pill but on no
+                // button — the inert end padding, or the gap between islands.
+                // Off, the label vanishes; on, the last one holds, so drifting
+                // into dead space doesn't flick it away.
+                (None, Some(_)) if self.cursor_inside && self.label_over_pad => {
+                    self.label_cur.clone()
+                }
                 _ => None,
             }
         };
@@ -1736,14 +1861,54 @@ impl eframe::App for App {
                 }
             }
         }
+        let started = *self.started.get_or_insert_with(Instant::now);
+        let shooting = self.shot_step(ctx, started);
         self.tick();
-        self.panel(ctx);
+        if !shooting {
+            self.panel(ctx);
+        }
         // The pill animates whether or not the panel is touched.
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
 
 impl App {
+    /// Headless capture, so the stills on the ticket can be regenerated rather
+    /// than re-taken by hand:
+    ///
+    /// ```text
+    /// DRAFT_PROTO_SHOT=expanded|recording|hotkey|strip
+    /// DRAFT_PROTO_BODY=0|1|2   DRAFT_PROTO_OUT=shot.png
+    /// ```
+    ///
+    /// Parks the state, saves one frame, quits.
+    fn shot_step(&mut self, ctx: &egui::Context, started: Instant) -> bool {
+        let Ok(which) = std::env::var("DRAFT_PROTO_SHOT") else {
+            return false;
+        };
+        if let Ok(b) = std::env::var("DRAFT_PROTO_BODY") {
+            self.body = b.parse::<usize>().unwrap_or(0).min(BODIES.len() - 1);
+        }
+        let elapsed = started.elapsed();
+        if elapsed < Duration::from_millis(500) {
+            let now = Instant::now();
+            match which.as_str() {
+                "recording" => self.play(9, now),
+                "hotkey" => {
+                    self.parked = true;
+                    self.go(Mode::RecHotkey, now);
+                }
+                "strip" => self.strip = true,
+                _ => self.play(0, now),
+            }
+        } else if elapsed < Duration::from_millis(900) {
+            self.save_next = true;
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        true
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         if take_pill_click() {
@@ -1785,9 +1950,9 @@ impl App {
                 (e / self.label_ms() as f32).clamp(0.0, 1.0)
             },
             label_motion: self.label_motion(),
-            label_over_pad: self.label_over_pad,
             history_empty: self.history_empty,
             dictate_ring_a: self.dictate().ring_a,
+            fold: self.fold_at(now),
             glyph_frac: GLYPH_SIZES[self.glyph].frac,
             strip: self.strip,
         };
@@ -1799,7 +1964,9 @@ impl App {
             }
             if self.save_next {
                 self.save_next = false;
-                self.saved_note = match w.save_png("pill-frame.png") {
+                let out = std::env::var("DRAFT_PROTO_OUT")
+                    .unwrap_or_else(|_| "pill-frame.png".into());
+                self.saved_note = match w.save_png(&out) {
                     Ok(path) => format!("saved {dbg} -> {path}"),
                     Err(e) => format!("save failed: {e}"),
                 };
@@ -1911,6 +2078,15 @@ impl App {
                 ui.add_space(4.0);
                 question(
                     ui,
+                    "Q0 · One body, or three islands?",
+                    "Not in the ticket — it came out of looking at the thing. #29 assumed one \
+                     body and never asked. Islands invert its slab argument: with a visible \
+                     gap, losing hover between buttons is honest rather than a flicker.",
+                    &mut self.body,
+                    BODIES.iter().map(|b| (b.name, b.note)),
+                );
+                question(
+                    ui,
                     "Q1 · Does Dictate want to be bigger than its flankers?",
                     "Wispr's centre mic is larger and brighter than its neighbours. Growing \
                      it changes the pill's width and where the flankers start from.",
@@ -1970,9 +2146,19 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.checkbox(
                         &mut self.label_over_pad,
-                        "…and show it over the inert 11px end padding",
+                        "…keep the label up over dead space",
                     );
                 });
+                ui.label(
+                    egui::RichText::new(
+                        "Dead space is the inert 11px end padding under UNIFIED, or the gap \
+                         between islands. Off, the label vanishes the moment the cursor leaves \
+                         a button; on, the last one holds until it reaches another. Drift the \
+                         cursor to the very end of the bar to see the difference.",
+                    )
+                    .small()
+                    .weak(),
+                );
                 question(
                     ui,
                     "Q6 · Does a silent cancel read as a cancel?",
@@ -2083,9 +2269,9 @@ struct Frame {
     label_prev: Option<(String, f32)>,
     label_p: f32,
     label_motion: LabelMotion,
-    label_over_pad: bool,
     history_empty: bool,
     dictate_ring_a: f32,
+    fold: f32,
     glyph_frac: f32,
     strip: bool,
 }
@@ -2113,54 +2299,63 @@ fn draw(
     let border_w = (g.border_w * scale).max(1.0);
     let m = border_w * 0.5 + 1.0 * scale;
 
-    let x = (w - sw) / 2.0 + m;
     let y = pill_bottom - sh + m;
-    let rw = (sw - 2.0 * m).max(1.0);
     let rh = (sh - 2.0 * m).max(1.0);
-    let r = (g.radius * scale).min(rh / 2.0);
-    let cx = x + rw / 2.0;
+    let cx = w / 2.0;
     let cy = y + rh / 2.0;
 
-    if g.fill_a >= 0.5 || g.border_a >= 0.5 {
-        let mut pb = PathBuilder::new();
-        rounded_rect(&mut pb, x, y, rw, rh, r);
-        if let Some(path) = pb.finish() {
-            let mut fill = Paint::default();
-            fill.set_color_rgba8(
-                g.fill_rgb.0.clamp(0.0, 255.0) as u8,
-                g.fill_rgb.1.clamp(0.0, 255.0) as u8,
-                g.fill_rgb.2.clamp(0.0, 255.0) as u8,
-                g.fill_a.clamp(0.0, 255.0) as u8,
-            );
-            fill.anti_alias = true;
-            pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
-
-            if g.border_a >= 0.5 {
-                let mut border = Paint::default();
-                border.set_color_rgba8(
-                    g.border_rgb.0.clamp(0.0, 255.0) as u8,
-                    g.border_rgb.1.clamp(0.0, 255.0) as u8,
-                    g.border_rgb.2.clamp(0.0, 255.0) as u8,
-                    g.border_a.clamp(0.0, 255.0) as u8,
-                );
-                border.anti_alias = true;
-                pm.stroke_path(
-                    &path,
-                    &border,
-                    &Stroke {
-                        width: border_w,
-                        ..Default::default()
-                    },
-                    Transform::identity(),
-                    None,
-                );
+    let islands = f.layout.map(|l| l.style.islands).unwrap_or(false);
+    if islands {
+        // Three bodies instead of one. The centre island interpolates from the
+        // *whole pill's* current width, so at fold 0 it is exactly whatever
+        // single shape the pill would otherwise be — the nub on the way in,
+        // the 62x28 recording pill on the way out — and no special case is
+        // needed at either end.
+        let l = f.layout.expect("islands implies a layout");
+        for i in [0usize, 2, 1] {
+            let target = l.island_w(i);
+            let iw = if i == 1 {
+                lerp(g.w, target, f.fold)
+            } else {
+                lerp(0.0, target, f.fold)
+            } * scale;
+            if iw <= 1.0 {
+                continue;
+            }
+            let dx = lerp(0.0, l.slot_dx(i), f.fold) * scale;
+            let ix = cx + dx - iw / 2.0 + m;
+            let irw = (iw - 2.0 * m).max(1.0);
+            body_shape(pm, g, ix, y, irw, rh, irw.min(rh) / 2.0, border_w);
+            // The island *is* the hover indicator — there is no gap for a
+            // separate disc to distinguish itself from.
+            let a = if f.lit == Some(i) {
+                28.0 * f.lit_p
+            } else if f.lit_prev == Some(i) {
+                28.0 * (1.0 - f.lit_p)
+            } else {
+                0.0
+            };
+            if a > 0.5 {
+                let mut pb = PathBuilder::new();
+                rounded_rect(&mut pb, ix, y, irw, rh, irw.min(rh) / 2.0);
+                if let Some(p) = pb.finish() {
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(255, 255, 255, a as u8);
+                    paint.anti_alias = true;
+                    pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+                }
             }
         }
-    }
+    } else {
+        let x = cx - sw / 2.0 + m;
+        let rw = (sw - 2.0 * m).max(1.0);
+        let r = (g.radius * scale).min(rh / 2.0);
+        body_shape(pm, g, x, y, rw, rh, r, border_w);
 
-    // The hover indicator, behind the glyphs.
-    if let Some(l) = f.layout {
-        draw_indicator(pm, scale, f, l, cx, cy, rh);
+        // The hover indicator, behind the glyphs.
+        if let Some(l) = f.layout {
+            draw_indicator(pm, scale, f, l, cx, cy, rh);
+        }
     }
 
     // Contents.
@@ -2198,6 +2393,58 @@ fn draw(
     // The label surface, above the pill.
     draw_label(pm, scale, f, text, w / 2.0, y);
 
+}
+
+/// One body — the whole pill under UNIFIED, one island under ISLANDS. Fill and
+/// hairline both come from the animated `Geom`, so an island carries the same
+/// hairline every state does (#18), three times over.
+fn body_shape(
+    pm: &mut Pixmap,
+    g: &Geom,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    border_w: f32,
+) {
+    if g.fill_a < 0.5 && g.border_a < 0.5 {
+        return;
+    }
+    let mut pb = PathBuilder::new();
+    rounded_rect(&mut pb, x, y, w, h, r);
+    let Some(path) = pb.finish() else { return };
+
+    let mut fill = Paint::default();
+    fill.set_color_rgba8(
+        g.fill_rgb.0.clamp(0.0, 255.0) as u8,
+        g.fill_rgb.1.clamp(0.0, 255.0) as u8,
+        g.fill_rgb.2.clamp(0.0, 255.0) as u8,
+        g.fill_a.clamp(0.0, 255.0) as u8,
+    );
+    fill.anti_alias = true;
+    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
+
+    if g.border_a >= 0.5 {
+        let mut border = Paint::default();
+        border.set_color_rgba8(
+            g.border_rgb.0.clamp(0.0, 255.0) as u8,
+            g.border_rgb.1.clamp(0.0, 255.0) as u8,
+            g.border_rgb.2.clamp(0.0, 255.0) as u8,
+            g.border_a.clamp(0.0, 255.0) as u8,
+        );
+        border.anti_alias = true;
+        pm.stroke_path(
+            &path,
+            &border,
+            &Stroke {
+                width: border_w,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
 fn draw_indicator(pm: &mut Pixmap, scale: f32, f: &Frame, l: Layout, cx: f32, cy: f32, rh: f32) {
@@ -2415,7 +2662,6 @@ fn draw_label(
             }
         }
     }
-    let _ = f.label_over_pad;
 }
 
 /// Q3, made unambiguous: every glyph at all four DPI scales in one frame, so
