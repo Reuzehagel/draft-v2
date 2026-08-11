@@ -33,7 +33,8 @@
 // Then, in the terminal:
 //   m        next motion profile   (SNAPBACK / INSTANT / SNAPPY / SMOOTH / SPRINGY)
 //   b        next hairline         (OFF / SOFT / CLEAR / BRIGHT)
-//   p        next Recording->Processing handoff  (HARD / FADE / SETTLE / SLOW-SETTLE)
+//   p        next Recording->Processing handoff
+//            (FLAT-320 / FLAT-200 / FLAT-450 / FREEZE-320 / HARD)
 //   x        next flash treatment  (HAIRLINE / THICK / GLOW / WASH)
 //   e        next button set — Expanded's width is *derived* from it, not chosen
 //   a        next expansion anchor (CENTRE / MIC)
@@ -138,44 +139,72 @@ const HAIRLINES: &[Hairline] = &[
     },
 ];
 
-/// ROUND 2 AXIS — the Recording -> Processing handoff, reported as too abrupt.
+/// What the bars decay *to* when capture stops.
+#[derive(Clone, Copy, PartialEq)]
+enum BarTarget {
+    /// Hold the heights the waveform happened to be at — what the shipped pill
+    /// does, via `PillAdapter::last_bars`.
+    Freeze,
+    /// Fall to a flat row of rest-height stubs.
+    Flat,
+}
+
+/// ROUND 2/3 AXIS — the Recording -> Processing handoff, reported as too abrupt
+/// in round 1 and still jittery under SLOW-SETTLE in round 2.
 ///
-/// Two things change at once there, and round 1 only animated one of them. The
-/// border colour swaps, and the bars *stop dead* — they hold their last live
-/// heights, so all motion ends on a single frame. The frozen heights are right;
-/// the instant stop is the jolt. `bars_ms` decays the live waveform toward those
-/// held heights so the motion settles instead of cutting.
+/// Two things change at once there, and round 1 only animated one: the border
+/// colour swaps, and the bars *stop dead* on a single frame. Round 2 decayed
+/// the live waveform into its held heights — but the held heights are a
+/// snapshot of noise, so the settle has nowhere meaningful to land, and the
+/// bars visibly hunt for a target that means nothing.
+///
+/// ROUND 3 adds FLAT: the waves fall to rest instead of freezing. Flat is a
+/// *state* — it reads as "stopped listening" — where a frozen height is an
+/// accident of when you let go of the key. It also deletes `last_bars` from the
+/// real adapter, which exists only to serve the freeze.
 struct Handoff {
     name: &'static str,
     colour_ms: u32,
     bars_ms: u32,
+    target: BarTarget,
     note: &'static str,
 }
 
 const HANDOFFS: &[Handoff] = &[
     Handoff {
+        name: "FLAT-320",
+        colour_ms: 320,
+        bars_ms: 320,
+        target: BarTarget::Flat,
+        note: "ROUND 3: the waves fall flat over the same 320ms you settled on",
+    },
+    Handoff {
+        name: "FLAT-200",
+        colour_ms: 320,
+        bars_ms: 200,
+        target: BarTarget::Flat,
+        note: "quicker drop — does the calm survive, or does it clip?",
+    },
+    Handoff {
+        name: "FLAT-450",
+        colour_ms: 320,
+        bars_ms: 450,
+        target: BarTarget::Flat,
+        note: "slower drop, outlasting the colour crossfade — calmer or laggy?",
+    },
+    Handoff {
+        name: "FREEZE-320",
+        colour_ms: 320,
+        bars_ms: 320,
+        target: BarTarget::Freeze,
+        note: "round 2's SLOW-SETTLE, with the phase bug fixed — the fair comparison",
+    },
+    Handoff {
         name: "HARD",
         colour_ms: 0,
         bars_ms: 0,
-        note: "round 1 / today — colour snaps, bars stop on one frame",
-    },
-    Handoff {
-        name: "FADE",
-        colour_ms: 180,
-        bars_ms: 0,
-        note: "colour crossfades, bars still stop dead — isolates which one jolts",
-    },
-    Handoff {
-        name: "SETTLE",
-        colour_ms: 180,
-        bars_ms: 180,
-        note: "the waveform decays to stillness as the colour crossfades",
-    },
-    Handoff {
-        name: "SLOW-SETTLE",
-        colour_ms: 320,
-        bars_ms: 320,
-        note: "same, drawn out — is a longer settle calmer or just laggy?",
+        target: BarTarget::Freeze,
+        note: "today — colour snaps, bars stop on one frame",
     },
 ];
 
@@ -574,15 +603,15 @@ fn main() -> Result<()> {
     let mut app = App {
         win: None,
         rx,
-        // Defaults are round 2's proposals, not round 1's behaviour — each
-        // axis keeps its round-1 setting as its first entry for comparison.
-        motion: 0,   // SNAPBACK
+        // ROUND 3 defaults are the configuration you settled on in round 2, so
+        // the harness opens on it and only the bar decay is left to judge.
+        motion: 2,   // SNAPPY
         hairline: 2, // CLEAR
-        handoff: 2,  // SETTLE
-        flash: 2,    // GLOW
-        set: 1,      // MIC-FIRST (3) — the set that tells the two anchors apart
-        anchor: 0,   // MIC
-        hover: false,
+        handoff: 0,  // FLAT-320 — the one thing round 3 changes
+        flash: 0,    // HAIRLINE — where you left it, but see the ticket
+        set: 0,      // MIC-CENTRE (3)
+        anchor: 1,   // CENTRE — identical to MIC while the mic is central
+        hover: true,
         ok: true,
         mode: Mode::Idle,
         mode_since: start,
@@ -590,6 +619,7 @@ fn main() -> Result<()> {
         queue: VecDeque::new(),
         next_at: None,
         held_bars: [0.5; BAR_COUNT],
+        wave_epoch: start,
     };
     el.run_app(&mut app)?;
     Ok(())
@@ -626,6 +656,13 @@ struct App {
     /// exactly these once the mode leaves `Recording`; the settle decays the
     /// live waveform into them rather than cutting to them.
     held_bars: [f32; BAR_COUNT],
+    /// The waveform's time origin. Deliberately NOT `mode_since`: round 2 drove
+    /// the waveform from time-since-mode, so at the handoff it restarted from a
+    /// different phase than it had frozen at and jumped sideways before easing.
+    /// That was the jitter — the settle was smooth, but it began somewhere the
+    /// bars had never been. One continuous clock, so the decay starts exactly
+    /// where the live waveform was.
+    wave_epoch: Instant,
 }
 
 impl App {
@@ -783,27 +820,36 @@ impl App {
         base
     }
 
-    /// Live waveform while recording; afterwards the held heights, reached by
-    /// decaying the waveform into them over the handoff's `bars_ms`.
-    fn bar_amps(&self, now: Instant) -> [f32; BAR_COUNT] {
-        let t = now.duration_since(self.mode_since).as_secs_f32();
-        if self.mode == Mode::Recording {
-            return live_waveform(t);
+    /// Where the bars come to rest once capture stops.
+    fn bar_target(&self) -> [f32; BAR_COUNT] {
+        match self.handoff().target {
+            BarTarget::Freeze => self.held_bars,
+            BarTarget::Flat => [0.0; BAR_COUNT],
         }
+    }
+
+    /// Live waveform while recording; afterwards the rest state, reached by
+    /// decaying the still-running waveform into it over the handoff's
+    /// `bars_ms`. The waveform keeps running underneath the decay — that is
+    /// what makes it read as losing energy rather than being dragged.
+    fn bar_amps(&self, now: Instant) -> [f32; BAR_COUNT] {
+        let wave_t = now.duration_since(self.wave_epoch).as_secs_f32();
+        if self.mode == Mode::Recording {
+            return live_waveform(wave_t);
+        }
+        let target = self.bar_target();
         let settle_ms = self.handoff().bars_ms as f32;
         if self.mode == Mode::Processing && settle_ms > 0.0 {
-            let k = (t * 1000.0 / settle_ms).clamp(0.0, 1.0);
-            // Ease the decay so the waveform loses energy rather than being
-            // linearly dragged to a stop.
-            let k = Ease::OutCubic.apply(k);
-            let live = live_waveform(t);
-            let mut out = self.held_bars;
+            let since = now.duration_since(self.mode_since).as_secs_f32();
+            let k = Ease::OutCubic.apply((since * 1000.0 / settle_ms).clamp(0.0, 1.0));
+            let live = live_waveform(wave_t);
+            let mut out = target;
             for i in 0..BAR_COUNT {
-                out[i] = lerp(live[i], self.held_bars[i], k);
+                out[i] = lerp(live[i], target[i], k);
             }
             return out;
         }
-        self.held_bars
+        target
     }
 
     fn anim_done(&self, now: Instant) -> bool {
@@ -817,8 +863,7 @@ impl App {
         // Capture the heights the real pill would freeze at, before the mode
         // (and therefore the waveform's time origin) changes.
         if self.mode == Mode::Recording && mode != Mode::Recording {
-            let t = now.duration_since(self.mode_since).as_secs_f32();
-            self.held_bars = live_waveform(t);
+            self.held_bars = live_waveform(now.duration_since(self.wave_epoch).as_secs_f32());
         }
         let t = self.tween_for(self.mode, mode);
         let from = self.current_geom(now);
@@ -959,8 +1004,13 @@ impl App {
 
         println!("=== handoff {}  —  {}", hd.name, hd.note);
         println!(
-            "      colour crossfade {}ms   bar settle {}ms",
-            hd.colour_ms, hd.bars_ms
+            "      colour crossfade {}ms   bars decay over {}ms to {}",
+            hd.colour_ms,
+            hd.bars_ms,
+            match hd.target {
+                BarTarget::Freeze => "their held heights (needs last_bars)",
+                BarTarget::Flat => "flat (no last_bars needed)",
+            }
         );
         println!("=== hairline {}  —  {}", hl.name, hl.note);
         println!(
