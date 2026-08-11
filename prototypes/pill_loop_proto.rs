@@ -2993,7 +2993,7 @@ fn rounded_rect(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, r: f32) {
     // poor circle: at r = w/2 — every disc, and every island now that the
     // flankers are round — it visibly reads as a squircle rather than a
     // circle. `K` is the standard circle-from-cubics constant.
-    const K: f32 = 0.552_284_75;
+    const K: f32 = 0.552_284_7;
     let c = r * K;
     pb.move_to(x + r, y);
     pb.line_to(x + w - r, y);
