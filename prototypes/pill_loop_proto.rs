@@ -97,6 +97,12 @@ const BTN_D: f32 = 22.0;
 /// smaller than any hover-bar button: they are a stop and an abort on a pill
 /// that is already busy, not a menu of things to pick from.
 const REC_BTN_D: f32 = 20.0;
+/// The recording pill spends its width differently from the hover bar: less
+/// inert padding at the ends, more gap in the middle, so Cancel and Confirm
+/// sit out near the pill's ends rather than crowding the waveform. The pill's
+/// overall width is unchanged — 4px moves from each end into each gap.
+const REC_END_PAD: f32 = 7.0;
+const REC_GAP: f32 = 12.0;
 const BTN_GAP: f32 = 8.0;
 const BTN_PAD: f32 = 11.0;
 const EXP_H: f32 = 32.0;
@@ -931,6 +937,12 @@ struct Layout {
     /// Dictate does not drag a wide microphone along with it.
     centre_glyph: f32,
     flank_glyph: f32,
+    /// Inert padding at each end, and the gap between the centre and a
+    /// flanker. UNIFIED only — under ISLANDS the spacing is `style.gap`.
+    /// Per-layout rather than global, because the recording pill wants its
+    /// two controls further out than the hover bar wants its three.
+    end_pad: f32,
+    gap: f32,
     style: &'static BodyStyle,
 }
 
@@ -939,7 +951,7 @@ impl Layout {
         if self.style.islands {
             (0..3).map(|i| self.island_w(i)).sum::<f32>() + 2.0 * self.style.gap
         } else {
-            2.0 * BTN_PAD + self.centre_w + 2.0 * self.flank_w + 2.0 * BTN_GAP
+            2.0 * self.end_pad + self.centre_w + 2.0 * self.flank_w + 2.0 * self.gap
         }
     }
     /// The island a button sits in. Under UNIFIED there are no islands, but
@@ -953,7 +965,7 @@ impl Layout {
         let side = if self.style.islands {
             self.island_w(1) / 2.0 + self.style.gap + self.island_w(i) / 2.0
         } else {
-            self.centre_w / 2.0 + BTN_GAP + self.flank_w / 2.0
+            self.centre_w / 2.0 + self.gap + self.flank_w / 2.0
         };
         match i {
             0 => -side,
@@ -991,7 +1003,7 @@ impl Layout {
         let w = if self.style.islands {
             self.island_w(i)
         } else {
-            self.slot_w(i) + BTN_GAP
+            self.slot_w(i) + self.gap
         };
         (dx - w / 2.0, dx + w / 2.0)
     }
@@ -1186,6 +1198,8 @@ impl App {
             flank_w: p.flank_w,
             centre_glyph: p.centre_glyph,
             flank_glyph: p.flank_glyph,
+            end_pad: BTN_PAD,
+            gap: BTN_GAP,
             style: self.body(),
         }
     }
@@ -1199,6 +1213,8 @@ impl App {
             flank_w: REC_BTN_D,
             centre_glyph: BARS_W,
             flank_glyph: REC_BTN_D,
+            end_pad: REC_END_PAD,
+            gap: REC_GAP,
             style: &UNIFIED_BODY,
         }
     }
@@ -1937,10 +1953,10 @@ impl App {
         } else {
             println!(
                 "      expanded = 2x{:.0} + {:.0} centre + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}",
-                BTN_PAD,
+                exp.end_pad,
                 d.centre_w,
                 d.flank_w,
-                BTN_GAP,
+                exp.gap,
                 exp.width(),
                 EXP_H
             );
@@ -1951,10 +1967,10 @@ impl App {
         );
         println!(
             "      rec-click = 2x{:.0} + {:.0} bars + 2x{:.0} flank + 2x{:.0} gap = {:.0}x{:.0}  (always one body)",
-            BTN_PAD,
+            rec.end_pad,
             BARS_W,
             rec.flank_w,
-            BTN_GAP,
+            rec.gap,
             rec.width(),
             EXP_H
         );
