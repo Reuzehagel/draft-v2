@@ -767,6 +767,83 @@ const HANDOVERS: &[(Handover, &str, u32, &str)] = &[
     ),
 ];
 
+/// Q8 (#37) — the axis Q2 could not have had. MORPH and SWAP describe what the
+/// **contents** do; once the hover bar became three islands (#33) the same
+/// click also has to get the **body** from three shapes to one, and nobody
+/// chose how. What ships today is not a decision, it is two independent lerps
+/// landing on top of each other: `island_mix` fades 1 -> 0 while `fold_at`
+/// returns a flat 1.0 under MORPH, so the islands hold their full 118 spacing
+/// and dissolve while a 112 body fades in underneath them.
+///
+/// The arithmetic that reframes the question: islands is `32 + 48 + 32` of
+/// button plus `2 x 3` of gap = **118**, and the click-started pill is
+/// `7 + 20 + 12 + 34 + 12 + 20 + 7` = **112**. The two 3px gaps *are* the whole
+/// width difference. Closing them lands exactly on the recording pill, and the
+/// flanker centres go -43 -> -40 -> -39, so "the neighbours move inward" is
+/// almost entirely the same event as "the gaps collapse" rather than a second
+/// tween beside it.
+///
+/// The shared lesson across all three: **never crossfade two bodies while they
+/// differ.** Make them coincide first, then switch — at which point the switch
+/// costs nothing to see.
+#[derive(Clone, Copy, PartialEq)]
+enum Seam {
+    /// What fell out. Islands hold expanded spacing at full size and fade;
+    /// the unified body fades in beneath. Two shapes visibly overlap.
+    Fade,
+    /// The gaps collapse to zero and the inner edges square off, so the three
+    /// islands *merge* into one 112x32 stadium. The body switch happens only
+    /// once the two are geometrically the same shape.
+    Close,
+    /// The flankers fold back into the centre island, the bar pinches to a
+    /// single body, and the recording pill grows back out of it. The only
+    /// option that reads as a deliberate hand-off rather than a settle.
+    Collapse,
+}
+
+const SEAMS: &[(Seam, &str, u32, &str)] = &[
+    (
+        Seam::Close,
+        "CLOSE",
+        170,
+        "gaps 3->0, inner corners 16->0, then one 112 body — geometry does the work",
+    ),
+    (
+        Seam::Fade,
+        "FADE  (status quo)",
+        170,
+        "islands dissolve at held 118 spacing while a 112 body appears under them",
+    ),
+    (
+        Seam::Collapse,
+        "COLLAPSE-REGROW",
+        260,
+        "fold into the centre, pinch, grow the recording pill back out — costs a beat",
+    ),
+];
+
+/// Q8's sub-toggle, and the honest form of the ticket's "one tween or two?".
+/// Once the flankers turn out to barely move, the question stops being about
+/// *position* and becomes about *timing*: does the body finish closing before
+/// the glyphs have finished becoming their replacements, or do both run on one
+/// progress? Leading the close means the shape settles first and the glyphs
+/// resolve inside a body that is already still.
+const SEAM_LEAD: f32 = 0.62;
+
+/// The body's shape on one frame of the handover.
+#[derive(Clone, Copy)]
+struct SeamState {
+    /// Bare desktop between islands, right now.
+    gap: f32,
+    /// The corner radius on an island's *inner* edges. The outer edges stay
+    /// fully round throughout — only the edges that are about to disappear
+    /// into a seam square off.
+    r_in: f32,
+    /// The islands and the unified body are now the same shape, so the body
+    /// can take over without anything being seen to change.
+    merged: bool,
+}
+
 /// Q4 — sliding the cursor along the bar changes the lit button three times in
 /// ~100px. With a fade on each, a fast sweep may smear.
 #[derive(Clone, Copy, PartialEq)]
@@ -1067,6 +1144,10 @@ struct App {
     islands: bool,
     glyph: usize,
     handover: usize,
+    seam: usize,
+    /// Q8's sub-toggle: the body close leads the glyph crossfade rather than
+    /// sharing its progress.
+    seam_lead: bool,
     indicator: usize,
     label_motion: usize,
     cancel: usize,
@@ -1126,6 +1207,8 @@ fn main() -> eframe::Result<()> {
         islands: true,
         glyph: 0,
         handover: 0,
+        seam: 0,
+        seam_lead: false,
         indicator: 0,
         label_motion: 0,
         cancel: 0,
@@ -1188,6 +1271,36 @@ impl App {
     fn handover_ms(&self) -> u32 {
         HANDOVERS[self.handover].2
     }
+    fn seam(&self) -> Seam {
+        SEAMS[self.seam].0
+    }
+    /// Whether the handover pinches through a single centred body — Q2's SWAP
+    /// asked for it of the contents, Q8's COLLAPSE asks for it of the body,
+    /// and they are the same motion, so either one turns it on. Worth seeing
+    /// plainly: the ticket's third option is not a new idea, it is SWAP with
+    /// the body finally taking part.
+    fn folds_through_centre(&self) -> bool {
+        self.handover() == Handover::Swap || self.seam() == Seam::Collapse
+    }
+    /// The seam owns the Expanded -> RecClick duration: it is the axis that
+    /// changes what has to happen in that window. FADE has nothing of its own
+    /// to time, so it defers to Q2's number and stays the status quo in full.
+    fn seam_ms(&self) -> u32 {
+        if self.seam() == Seam::Fade {
+            self.handover_ms()
+        } else {
+            SEAMS[self.seam].2
+        }
+    }
+    /// Progress of the *body* through the handover, which under LEAD runs
+    /// ahead of the contents so the shape is settled before the glyphs are.
+    fn seam_p(&self, raw: f32) -> f32 {
+        if self.seam_lead {
+            out_cubic((raw / SEAM_LEAD).clamp(0.0, 1.0))
+        } else {
+            out_cubic(raw)
+        }
+    }
     fn indicator(&self) -> Indicator {
         INDICATORS[self.indicator].0
     }
@@ -1246,12 +1359,58 @@ impl App {
         }
     }
 
+    /// Is this frame partway through the one transition Q8 owns?
+    fn in_handover(&self, now: Instant) -> bool {
+        matches!(&self.anim, Some(a)
+            if a.from_mode == Mode::Expanded
+                && self.mode == Mode::RecClick
+                && self.anim_t(now) < 1.0)
+    }
+
+    /// The body's shape partway through the handover, under a seam treatment
+    /// that has one. `None` means "draw it the way you always did" — either
+    /// this is not the handover, the style is UNIFIED (no islands to close),
+    /// or the seam is FADE.
+    fn seam_state(&self, now: Instant) -> Option<SeamState> {
+        if !self.body().islands || self.seam() == Seam::Fade || !self.in_handover(now) {
+            return None;
+        }
+        let p = self.seam_p(self.anim_t(now));
+        Some(match self.seam() {
+            // The whole treatment, in two numbers. The gap is the width
+            // difference, so closing it *is* the resize; squaring the inner
+            // corners is what turns three tangent shapes — which meet at a
+            // point and leave notches — into one clean 112x32 stadium.
+            Seam::Close => SeamState {
+                gap: lerp(ISLAND_BODY.gap, 0.0, p),
+                r_in: lerp(EXP_H / 2.0, 0.0, p),
+                merged: p >= 0.999,
+            },
+            // The flankers travel inward as they fold, so the gap closing is
+            // subsumed by the fold rather than run beside it.
+            Seam::Collapse => SeamState {
+                gap: ISLAND_BODY.gap,
+                r_in: EXP_H / 2.0,
+                merged: self.anim_t(now) >= 0.5,
+            },
+            Seam::Fade => unreachable!(),
+        })
+    }
+
     /// 1 = drawn as islands, 0 = drawn as one body. Only Expanded is ever
     /// islands; Idle is a single nub either way, so it inherits whatever it is
     /// travelling to or from and the crossfade never fires on a hover.
+    ///
+    /// Q8 amends this: a crossfade is only honest between shapes that already
+    /// agree. CLOSE and COLLAPSE both hold the islands at full opacity until
+    /// they *coincide* with the unified body, then hand over in one step —
+    /// which is invisible precisely because there is nothing left to see.
     fn island_mix(&self, now: Instant) -> f32 {
         if !self.body().islands {
             return 0.0;
+        }
+        if let Some(s) = self.seam_state(now) {
+            return if s.merged { 0.0 } else { 1.0 };
         }
         let islandy = |m: Mode| matches!(m, Mode::Expanded | Mode::Idle) as i32 as f32;
         let to = islandy(self.mode);
@@ -1274,6 +1433,15 @@ impl App {
         let t = out_cubic(raw);
         let from = self.anim.as_ref().map(|a| a.from_mode);
         if from == Some(Mode::Expanded) && self.mode == Mode::RecClick {
+            // Q8's COLLAPSE folds the body through the centre whatever Q2 says
+            // about the contents — that fold *is* the treatment.
+            if self.folds_through_centre() {
+                return if raw < 0.5 {
+                    1.0 - out_cubic(raw * 2.0)
+                } else {
+                    out_cubic((raw - 0.5) * 2.0)
+                };
+            }
             return match self.handover() {
                 // Nothing folds — the glyphs swap in place.
                 Handover::Morph => 1.0,
@@ -1382,7 +1550,7 @@ impl App {
         match (from, to) {
             (Mode::Idle, Mode::Expanded) => 110,
             (Mode::Expanded, Mode::Idle) => 90,
-            (Mode::Expanded, Mode::RecClick) => self.handover_ms(),
+            (Mode::Expanded, Mode::RecClick) => self.seam_ms(),
             // #18: the 320ms handoff, and #29: both buttons leave on it.
             (_, Mode::Processing) => 320,
             (_, Mode::Cancelled) => 90,
@@ -1439,7 +1607,7 @@ impl App {
         if !(a.from_mode == Mode::Expanded && self.mode == Mode::RecClick) {
             return g.w;
         }
-        if self.handover() != Handover::Swap {
+        if !self.folds_through_centre() {
             return g.w;
         }
         let t = self.anim_t(now);
@@ -1500,7 +1668,19 @@ impl App {
                 self.fold(&exp, 1.0 - t, [Icon::Copy, Icon::Mic, Icon::Sliders], true)
             }
 
-            // Q2, the hinge.
+            // Q2, the hinge — now sharing it with Q8. COLLAPSE folds the
+            // contents with the body regardless of what Q2 asked for; there is
+            // no coherent way for the glyphs to hold still while the shape
+            // they sit in pinches out from under them.
+            (Some(Mode::Expanded), Mode::RecClick) if self.folds_through_centre() => {
+                if raw_t < 0.5 {
+                    let k = 1.0 - out_cubic((raw_t * 2.0).clamp(0.0, 1.0));
+                    self.fold(&exp, k, [Icon::Copy, Icon::Mic, Icon::Sliders], true)
+                } else {
+                    let k = out_cubic(((raw_t - 0.5) * 2.0).clamp(0.0, 1.0));
+                    self.fold(&rec, k, [Icon::X, Icon::Mic, Icon::Check], false)
+                }
+            }
             (Some(Mode::Expanded), Mode::RecClick) => match self.handover() {
                 Handover::Morph => {
                     // Positions lerp between the two layouts; glyphs crossfade
@@ -2011,6 +2191,35 @@ impl App {
             exp.slab(2).1
         );
         println!("=== Q2 handover  {} ({}ms)  —  {}", hn, hms, hnote);
+        {
+            let (_, sn, _, snote) = SEAMS[self.seam];
+            println!(
+                "=== Q8 seam      {} ({}ms, body {})  —  {}",
+                sn,
+                self.seam_ms(),
+                if self.seam_lead { "leads" } else { "shares" },
+                snote
+            );
+            let closed = exp.width() - 2.0 * ISLAND_BODY.gap;
+            println!(
+                "      islands {:.0} - 2x{:.0} gap = {:.0} ; rec-click = {:.0}  ({})",
+                exp.width(),
+                ISLAND_BODY.gap,
+                closed,
+                rec.width(),
+                if (closed - rec.width()).abs() < 0.5 {
+                    "the gaps ARE the width difference"
+                } else {
+                    "they no longer agree — CLOSE needs a second tween"
+                }
+            );
+            println!(
+                "      flanker centre: {:.0} expanded -> {:.0} closed -> {:.0} recording",
+                exp.slot_dx(0),
+                -(closed / 2.0 - exp.island_w(0) / 2.0),
+                rec.slot_dx(0)
+            );
+        }
         println!("=== Q4 indicator {}  —  {}", vn, vnote);
         println!("=== Q5 label     {} ({}ms)  —  {}", ln, lms, lnote);
         println!(
@@ -2156,6 +2365,7 @@ impl App {
             dictate_ring_a: self.dictate().ring_a,
             fold: self.fold_at(now),
             island_mix: self.island_mix(now),
+            seam: self.seam_state(now),
             island_layout: self.expanded_layout(),
             glyph_frac: GLYPH_SIZES[self.glyph].frac,
             strip: self.strip,
@@ -2320,6 +2530,36 @@ impl App {
                     &mut self.handover,
                     HANDOVERS.iter().map(|h| (h.1, h.3)),
                 );
+                question(
+                    ui,
+                    "Q8 · …and how does the *body* get from three islands to one?  (#37)",
+                    "Q2 above is about the contents. This is the shape: 118 wide as three \
+                     islands, 112 as one recording pill — and the two 3px gaps are the whole \
+                     difference, so closing them lands exactly on 112 with the flankers moving \
+                     4px (3 of which are the gaps). Watch 'click session ✓'. Under UNIFIED \
+                     there is no shape change and this axis does nothing except COLLAPSE.",
+                    &mut self.seam,
+                    SEAMS.iter().map(|s| (s.1, s.3)),
+                );
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new("Q8b · Does the body finish before the glyphs do?")
+                            .strong(),
+                    );
+                    ui.checkbox(
+                        &mut self.seam_lead,
+                        format!("Body leads (closes over the first {:.0}%)", SEAM_LEAD * 100.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "The ticket asked 'one tween or two?' about position. The flankers \
+                             turn out barely to move, so the real question is timing: off, the \
+                             shape and the glyphs resolve together; on, the body is already \
+                             still by the time copy has finished becoming cancel.",
+                        )
+                        .small(),
+                    );
+                });
                 question(
                     ui,
                     "Q3a · How big is the glyph inside the button?  (CLOSED)",
@@ -2494,6 +2734,7 @@ struct Frame {
     dictate_ring_a: f32,
     fold: f32,
     island_mix: f32,
+    seam: Option<SeamState>,
     island_layout: Layout,
     glyph_frac: f32,
     strip: bool,
@@ -2558,17 +2799,45 @@ fn draw(
             if iw <= 1.0 {
                 continue;
             }
+            // Q8 CLOSE: the islands keep their widths and heights and only
+            // give up the desktop between them. Everything else the handover
+            // needs — the 118 -> 112 resize, the flankers moving inward — is
+            // already carried by that one number.
+            let seam_dx = f.seam.map(|s| {
+                let side = l.island_w(1) / 2.0 + s.gap + l.island_w(i) / 2.0;
+                match i {
+                    0 => -side,
+                    2 => side,
+                    _ => 0.0,
+                }
+            });
             // Islands shrink in height as well as width, so a 26px flanker is
             // a circle rather than a vertical stadium. They stay centred on
             // the pill's own axis, and the centre island travels from the
             // pill's current height so the nub grows out of it cleanly.
             let ih = lerp(g.h, l.island_h(i), f.fold) * scale;
-            let dx = lerp(0.0, l.slot_dx(i), f.fold) * scale;
+            let dx = match seam_dx {
+                Some(d) => d,
+                None => lerp(0.0, l.slot_dx(i), f.fold),
+            } * scale;
             let ix = cx + dx - iw / 2.0 + m;
             let irw = (iw - 2.0 * m).max(1.0);
             let irh = (ih - 2.0 * m).max(1.0).min(rh);
             let iy = cy - irh / 2.0;
-            body_shape(pm, g, ix, iy, irw, irh, irw.min(irh) / 2.0, border_w, mix);
+            let r_round = irw.min(irh) / 2.0;
+            // Three tangent round shapes do not make a stadium — they meet at
+            // a single point and leave a notch above and below. Squaring only
+            // the edges that are closing is what makes the union exact.
+            let (rl, rr) = match (f.seam, i) {
+                (Some(s), 0) => (r_round, (s.r_in * scale).min(r_round)),
+                (Some(s), 2) => ((s.r_in * scale).min(r_round), r_round),
+                (Some(s), _) => {
+                    let ri = (s.r_in * scale).min(r_round);
+                    (ri, ri)
+                }
+                (None, _) => (r_round, r_round),
+            };
+            body_shape_lr(pm, g, ix, iy, irw, irh, rl, rr, border_w, mix);
             // The island *is* the hover indicator — there is no gap for a
             // separate disc to distinguish itself from.
             let a = if f.lit == Some(i) {
@@ -2671,13 +2940,32 @@ fn body_shape(
     border_w: f32,
     alpha: f32,
 ) {
+    body_shape_lr(pm, g, x, y, w, h, r, r, border_w, alpha);
+}
+
+/// The same body, with the two ends rounded independently. Q8's CLOSE needs
+/// it: an island whose inner edge is about to become the middle of a larger
+/// pill has to stop being round there, or the merged shape keeps a notch.
+#[allow(clippy::too_many_arguments)]
+fn body_shape_lr(
+    pm: &mut Pixmap,
+    g: &Geom,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rl: f32,
+    rr: f32,
+    border_w: f32,
+    alpha: f32,
+) {
     let fill_a = g.fill_a * alpha;
     let border_a = g.border_a * alpha;
     if fill_a < 0.5 && border_a < 0.5 {
         return;
     }
     let mut pb = PathBuilder::new();
-    rounded_rect(&mut pb, x, y, w, h, r);
+    rounded_rect_lr(&mut pb, x, y, w, h, rl, rr);
     let Some(path) = pb.finish() else { return };
 
     let mut fill = Paint::default();
@@ -3046,28 +3334,34 @@ fn draw_proof_strip(
 }
 
 fn rounded_rect(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, r: f32) {
-    let r = r.min(w / 2.0).min(h / 2.0);
-    if r <= 0.5 {
+    rounded_rect_lr(pb, x, y, w, h, r, r);
+}
+
+/// Cubic, not quadratic. A quad with its control point on the corner is a poor
+/// circle: at r = w/2 — every disc, and every island now that the flankers are
+/// round — it visibly reads as a squircle rather than a circle. `K` is the
+/// standard circle-from-cubics constant.
+fn rounded_rect_lr(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, rl: f32, rr: f32) {
+    let cap = (w / 2.0).min(h / 2.0);
+    let rl = rl.clamp(0.0, cap);
+    let rr = rr.clamp(0.0, cap);
+    if rl <= 0.5 && rr <= 0.5 {
         if let Some(rect) = Rect::from_xywh(x, y, w, h) {
             pb.push_rect(rect);
         }
         return;
     }
-    // Cubic, not quadratic. A quad with its control point on the corner is a
-    // poor circle: at r = w/2 — every disc, and every island now that the
-    // flankers are round — it visibly reads as a squircle rather than a
-    // circle. `K` is the standard circle-from-cubics constant.
     const K: f32 = 0.552_284_7;
-    let c = r * K;
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + c, y, x + w, y + r - c, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + c, x + w - r + c, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - c, y + h, x, y + h - r + c, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - c, x + r - c, y, x + r, y);
+    let (cl, cr) = (rl * K, rr * K);
+    pb.move_to(x + rl, y);
+    pb.line_to(x + w - rr, y);
+    pb.cubic_to(x + w - rr + cr, y, x + w, y + rr - cr, x + w, y + rr);
+    pb.line_to(x + w, y + h - rr);
+    pb.cubic_to(x + w, y + h - rr + cr, x + w - rr + cr, y + h, x + w - rr, y + h);
+    pb.line_to(x + rl, y + h);
+    pb.cubic_to(x + rl - cl, y + h, x, y + h - rl + cl, x, y + h - rl);
+    pb.line_to(x, y + rl);
+    pb.cubic_to(x, y + rl - cl, x + rl - cl, y, x + rl, y);
     pb.close();
 }
 
