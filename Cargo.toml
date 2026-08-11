@@ -9,6 +9,11 @@ license = "MIT"
 name = "draft"
 path = "src/main.rs"
 
+# PROTOTYPE — throwaway, delete along with prototypes/ once wayfinder #18 lands.
+[[bin]]
+name = "pill-transitions-proto"
+path = "prototypes/pill_transitions_proto.rs"
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
