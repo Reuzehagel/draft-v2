@@ -61,12 +61,7 @@ use std::time::{Duration, Instant};
 use tiny_skia::{
     FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::platform::windows::WindowAttributesExtWindows;
-use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 
 // The window never resizes. It is wide enough for the icon proof strip and
 // tall enough for the label surface #29 put above the pill — which is the
@@ -881,13 +876,6 @@ struct Drawn {
 // App
 // ---------------------------------------------------------------------------
 
-enum Msg {
-    Next(char),
-    Play(u8),
-    Reset,
-    Quit,
-}
-
 struct Anim {
     from: Geom,
     to: Geom,
@@ -898,7 +886,6 @@ struct Anim {
 
 struct App {
     win: Option<PillWindow>,
-    rx: std::sync::mpsc::Receiver<Msg>,
     icons: IconCache,
     text: TextRenderer,
 
@@ -941,46 +928,19 @@ struct App {
     click_transparent: bool,
     /// `0` parks a state so it can be stared at; hover polling is suspended.
     parked: bool,
-    /// `p` dumps the next composed frame to a PNG.
+    /// Dumps the next composed frame to a PNG.
     save_next: bool,
+    /// Where the last PNG went, echoed in the panel.
+    saved_note: String,
+    /// A one-line log of what the last click did, so the panel says what
+    /// happened instead of the terminal.
+    last_action: String,
 }
 
-fn main() -> Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_err() {
-                let _ = tx.send(Msg::Quit);
-                return;
-            }
-            let msg = match line.trim() {
-                "q" => Msg::Quit,
-                "r" => Msg::Reset,
-                "0" => Msg::Play(0),
-                "9" => Msg::Play(9),
-                "1" => Msg::Play(1),
-                "2" => Msg::Play(2),
-                "3" => Msg::Play(3),
-                "4" => Msg::Play(4),
-                "5" => Msg::Play(5),
-                s if s.len() == 1 => Msg::Next(s.chars().next().unwrap()),
-                _ => continue,
-            };
-            let quit = matches!(msg, Msg::Quit);
-            if tx.send(msg).is_err() || quit {
-                return;
-            }
-        }
-    });
-
-    let el = EventLoop::new()?;
-    el.set_control_flow(ControlFlow::Poll);
+fn main() -> eframe::Result<()> {
     let start = Instant::now();
-    let mut app = App {
+    let app = App {
         win: None,
-        rx,
         icons: IconCache::new(),
         text: TextRenderer::load(),
         dictate: 0,
@@ -1014,9 +974,26 @@ fn main() -> Result<()> {
         click_transparent: true,
         parked: false,
         save_next: false,
+        saved_note: String::new(),
+        last_action: "nothing yet — hover the pill at the bottom of the screen".into(),
     };
-    el.run_app(&mut app)?;
-    Ok(())
+
+    // The control panel is an ordinary eframe window; the pill is a raw Win32
+    // layered window created alongside it. eframe owns the message loop, and
+    // because both live on the same thread the pill's wndproc still gets its
+    // messages.
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([470.0, 820.0])
+            .with_position([40.0, 40.0])
+            .with_title("Draft pill — interaction loop prototype"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "draft-pill-loop-proto",
+        opts,
+        Box::new(|_cc| Ok(Box::new(app))),
+    )
 }
 
 impl App {
@@ -1747,79 +1724,31 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.win.is_none() {
-            match PillWindow::create(el) {
-                Ok(w) => {
-                    w.show();
-                    self.win = Some(w);
-                    self.report();
-                }
+            match PillWindow::create() {
+                Ok(w) => self.win = Some(w),
                 Err(e) => {
-                    eprintln!("window creation failed: {e}");
-                    el.exit();
-                }
-            }
-        }
-    }
-
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let now = Instant::now();
-                self.click(now);
-            }
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        let now = Instant::now();
-        while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                Msg::Quit => {
-                    _el.exit();
+                    eprintln!("pill window creation failed: {e}");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
-                Msg::Reset => {
-                    self.queue.clear();
-                    self.next_at = None;
-                    self.copied_until = None;
-                    self.parked = false;
-                    self.go(Mode::Idle, now);
-                }
-                Msg::Play(n) => self.play(n, now),
-                Msg::Next(c) => {
-                    match c {
-                        'd' => self.dictate = (self.dictate + 1) % DICTATE_SIZES.len(),
-                        'g' => self.glyph = (self.glyph + 1) % GLYPH_SIZES.len(),
-                        't' => self.handover = (self.handover + 1) % HANDOVERS.len(),
-                        'v' => self.indicator = (self.indicator + 1) % INDICATORS.len(),
-                        'l' => self.label_motion = (self.label_motion + 1) % LABEL_MOTIONS.len(),
-                        'c' => self.cancel = (self.cancel + 1) % CANCELS.len(),
-                        'y' => self.copy_ms = (self.copy_ms + 1) % COPY_MS.len(),
-                        's' => self.scale_ix = (self.scale_ix + 1) % SCALES.len(),
-                        'i' => self.strip = !self.strip,
-                        'n' => self.label_over_pad = !self.label_over_pad,
-                        'e' => self.history_empty = !self.history_empty,
-                        'f' => self.ok = !self.ok,
-                        'p' => {
-                            self.save_next = true;
-                            continue;
-                        }
-                        _ => continue,
-                    }
-                    self.report();
-                }
             }
         }
+        self.tick();
+        self.panel(ctx);
+        // The pill animates whether or not the panel is touched.
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+}
 
+impl App {
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if take_pill_click() {
+            self.click(now);
+        }
         self.pump_queue(now);
         self.poll_hover(now);
 
@@ -1870,18 +1799,242 @@ impl ApplicationHandler for App {
             }
             if self.save_next {
                 self.save_next = false;
-                match w.save_png("pill-frame.png") {
-                    Ok(path) => println!("  saved {dbg} -> {path}"),
-                    Err(e) => eprintln!("  save failed: {e}"),
-                }
+                self.saved_note = match w.save_png("pill-frame.png") {
+                    Ok(path) => format!("saved {dbg} -> {path}"),
+                    Err(e) => format!("save failed: {e}"),
+                };
             }
         }
-
-        std::thread::sleep(Duration::from_millis(16));
     }
 }
 
+/// One titled group per question: the question in words, why it is a question,
+/// then the candidates with their trade-offs under the selected one.
+fn question<'a>(
+    ui: &mut egui::Ui,
+    title: &str,
+    why: &str,
+    value: &mut usize,
+    options: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    ui.group(|ui| {
+        ui.label(egui::RichText::new(title).strong());
+        ui.label(egui::RichText::new(why).small().weak());
+        ui.add_space(2.0);
+        let mut notes: Vec<&str> = Vec::new();
+        for (i, (name, note)) in options.enumerate() {
+            ui.radio_value(value, i, name);
+            notes.push(note);
+        }
+        if let Some(note) = notes.get(*value) {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(*note).small().italics().weak());
+        }
+    });
+}
+
+/// The control panel. Its job is to make the seven questions the ticket asks
+/// *legible* — one titled group each, with every candidate named and the
+/// trade-off written under it — rather than a wall of one-letter keys. What is
+/// being judged is on screen at the bottom; what is being chosen is here.
 impl App {
+    fn panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Draft pill — the whole interaction loop");
+                ui.label(
+                    egui::RichText::new(
+                        "The pill is at the bottom of the screen. Hover it, click Dictate, \
+                         then cancel or confirm. Everything here changes it live.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "now: {:?}  ·  {}",
+                        self.mode, self.last_action
+                    ))
+                    .monospace()
+                    .small(),
+                );
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Replay").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        let now = Instant::now();
+                        if ui.button("hover in / out").clicked() {
+                            self.play(1, now);
+                        }
+                        if ui.button("click session ✓").clicked() {
+                            self.play(2, now);
+                        }
+                        if ui.button("click session ✗").clicked() {
+                            self.play(3, now);
+                        }
+                        if ui.button("hotkey session").clicked() {
+                            self.play(4, now);
+                        }
+                        if ui.button("copy acknowledgement").clicked() {
+                            self.play(5, now);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let now = Instant::now();
+                        if ui.button("hold expanded").clicked() {
+                            self.play(0, now);
+                        }
+                        if ui.button("hold recording").clicked() {
+                            self.play(9, now);
+                        }
+                        if ui.button("reset").clicked() {
+                            self.queue.clear();
+                            self.next_at = None;
+                            self.copied_until = None;
+                            self.parked = false;
+                            self.go(Mode::Idle, now);
+                        }
+                        if ui.button("save PNG").clicked() {
+                            self.save_next = true;
+                        }
+                        if ui.button("print spec").clicked() {
+                            self.report();
+                        }
+                    });
+                    if !self.saved_note.is_empty() {
+                        ui.label(egui::RichText::new(&self.saved_note).small().weak());
+                    }
+                });
+
+                ui.add_space(4.0);
+                question(
+                    ui,
+                    "Q1 · Does Dictate want to be bigger than its flankers?",
+                    "Wispr's centre mic is larger and brighter than its neighbours. Growing \
+                     it changes the pill's width and where the flankers start from.",
+                    &mut self.dictate,
+                    DICTATE_SIZES.iter().map(|d| (d.name, d.note)),
+                );
+                question(
+                    ui,
+                    "Q2 · Expanded → Recording: morph or swap?",
+                    "Clicking Dictate has to turn [copy][dictate][settings] into [×] ~~~ [✓].",
+                    &mut self.handover,
+                    HANDOVERS.iter().map(|h| (h.1, h.3)),
+                );
+                question(
+                    ui,
+                    "Q3a · How big is the glyph inside the button?",
+                    "The button is 22px; the icon's 24-unit grid has to map onto something. \
+                     Smaller glyph = more air, thinner stroke.",
+                    &mut self.glyph,
+                    GLYPH_SIZES.iter().map(|g| (g.name, g.note)),
+                );
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Q3b · Do the icons survive at every DPI?").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Forcing the scale fakes the DPI — the pill changes physical size \
+                             as a side effect. For a true test, change Windows display scaling \
+                             and leave this on NATIVE.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, (name, _)) in SCALES.iter().enumerate() {
+                            ui.radio_value(&mut self.scale_ix, i, *name);
+                        }
+                    });
+                    ui.checkbox(
+                        &mut self.strip,
+                        "icon proof sheet — every glyph at all four DPIs at once",
+                    );
+                });
+                question(
+                    ui,
+                    "Q4 · Does hover chatter as the cursor sweeps the bar?",
+                    "Three buttons change in ~100px. Slide the cursor fast along the pill.",
+                    &mut self.indicator,
+                    INDICATORS.iter().map(|i| (i.1, i.2)),
+                );
+                question(
+                    ui,
+                    "Q5 · What does the label do between buttons?",
+                    "It sits above the pill and names what the cursor is on.",
+                    &mut self.label_motion,
+                    LABEL_MOTIONS.iter().map(|l| (l.1, l.3)),
+                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.label_over_pad,
+                        "…and show it over the inert 11px end padding",
+                    );
+                });
+                question(
+                    ui,
+                    "Q6 · Does a silent cancel read as a cancel?",
+                    "× returns straight to Idle with no flash — but 'the pill just went away' \
+                     is also what a crash looks like.",
+                    &mut self.cancel,
+                    CANCELS.iter().map(|c| (c.1, c.3)),
+                );
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Q7 · Does \"Copied\" land?").strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "The clipboard usually already holds that text, so the click is \
+                             invisible without the label.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        for (i, ms) in COPY_MS.iter().enumerate() {
+                            ui.radio_value(&mut self.copy_ms, i, format!("{ms} ms"));
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Other states").strong());
+                    ui.checkbox(&mut self.history_empty, "history empty — Copy's disabled look");
+                    ui.checkbox(&mut self.ok, "session succeeded (uncheck for the red flash)");
+                });
+
+                ui.add_space(6.0);
+                let exp = self.expanded_layout();
+                let rec = self.recclick_layout();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "expanded {:.0}×{:.0}   ·   recording(click) {:.0}×{:.0}   ·   \
+                         glyph {:.1}px, stroke {:.2}px",
+                        exp.width(),
+                        EXP_H,
+                        rec.width(),
+                        EXP_H,
+                        BTN_D * GLYPH_SIZES[self.glyph].frac,
+                        2.0 * BTN_D * GLYPH_SIZES[self.glyph].frac / 24.0,
+                    ))
+                    .monospace()
+                    .small()
+                    .weak(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Judge it over a black desktop and a white one — the hairline and the \
+                         glyph alpha have the same exposure.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        });
+    }
+
     fn bar_amps(&self, now: Instant) -> [f32; BAR_COUNT] {
         let wave_t = now.duration_since(self.wave_epoch).as_secs_f32();
         let recording = matches!(self.mode, Mode::RecClick | Mode::RecHotkey);
@@ -2374,7 +2527,6 @@ fn cursor_pos() -> Option<(i32, i32)> {
 // ---------------------------------------------------------------------------
 
 struct PillWindow {
-    window: Window,
     scale: f32,
     win_x: i32,
     win_y: i32,
@@ -2385,50 +2537,40 @@ struct PillWindow {
 }
 
 impl PillWindow {
-    fn create(el: &ActiveEventLoop) -> Result<Self> {
-        let primary = el
-            .primary_monitor()
-            .or_else(|| el.available_monitors().next())
-            .ok_or_else(|| anyhow!("no monitor available"))?;
-        let scale = primary.scale_factor() as f32;
-        let monitor_pos = primary.position();
-        let monitor_size = primary.size();
+    /// A raw Win32 layered window, not a winit one — the control panel owns
+    /// the event loop now, and the pill has never needed anything winit
+    /// provides beyond an HWND. It is created on the same thread, so the
+    /// panel's message pump dispatches to `pill_proc` for free.
+    fn create() -> Result<Self> {
+        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSX};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+        };
+
+        let scale = unsafe {
+            let dc = GetDC(None);
+            let dpi = GetDeviceCaps(dc, LOGPIXELSX);
+            ReleaseDC(None, dc);
+            (dpi as f32 / 96.0).max(1.0)
+        };
 
         let phys_w = (BOX_W as f32 * scale) as i32;
         let phys_h = (BOX_H as f32 * scale) as i32;
         let margin = (BOTTOM_MARGIN as f32 * scale) as i32;
-        // #27 measures the margin from `rcWork`; approximated here by the
-        // primary monitor's work area, which is what winit hands us minus the
-        // taskbar. Close enough for judging motion.
-        let x = monitor_pos.x + (monitor_size.width as i32 - phys_w) / 2;
-        let y = monitor_pos.y + monitor_size.height as i32 - phys_h - margin - taskbar_h();
+        // #27 measures the margin from `rcWork`, so the taskbar comes off first.
+        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        let x = (sw - phys_w) / 2;
+        let y = sh - phys_h - margin - taskbar_h();
 
-        let attrs = WindowAttributes::default()
-            .with_title("Draft Pill Loop Prototype")
-            .with_inner_size(LogicalSize::new(BOX_W, BOX_H))
-            .with_position(LogicalPosition::new(
-                x as f64 / scale as f64,
-                y as f64 / scale as f64,
-            ))
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_skip_taskbar(true)
-            .with_visible(false);
-
-        let window = el.create_window(attrs)?;
-        let size = window.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
+        let hwnd = create_pill_hwnd(x, y, phys_w, phys_h)?;
+        let (w, h) = (phys_w.max(1) as u32, phys_h.max(1) as u32);
         let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap"))?;
         let hires =
             Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE).ok_or_else(|| anyhow!("hires"))?;
         let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid"))?;
-        let layered = LayeredSurface::new(&window, w, h)?;
-        install_noactivate_guard(layered.hwnd);
+        let layered = LayeredSurface::new(hwnd, w, h)?;
 
         Ok(Self {
-            window,
             scale,
             win_x: x,
             win_y: y,
@@ -2439,12 +2581,8 @@ impl PillWindow {
         })
     }
 
-    fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+    fn hwnd(&self) -> HWND {
         self.layered.hwnd
-    }
-
-    fn show(&self) {
-        self.window.set_visible(true);
     }
 
     /// Dumps the composed frame, alpha and all, so a still can be attached to
@@ -2533,40 +2671,79 @@ fn taskbar_h() -> i32 {
     0
 }
 
-/// #20's cost: `WS_EX_NOACTIVATE` has a documented hover-to-activate hole, so
-/// the expanded moment needs a wndproc answering `WM_MOUSEACTIVATE`. Without
-/// this, clicking the pill can steal focus — which breaks the whole product.
-static PREV_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+/// A left-click landed on the pill. The wndproc runs inside the panel's
+/// message pump, so it just raises a flag the next tick consumes.
+static PILL_CLICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn install_noactivate_guard(hwnd: windows::Win32::Foundation::HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
-    unsafe {
-        let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, guard_proc as *const () as isize);
-        let _ = PREV_PROC.set(prev);
+fn take_pill_click() -> bool {
+    PILL_CLICKED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #20's cost, load-bearing: `WS_EX_NOACTIVATE` has a documented
+/// hover-to-activate hole, so the pill needs a wndproc answering
+/// `WM_MOUSEACTIVATE`. Without it, clicking the pill can steal focus — which
+/// breaks the whole product, since Draft pastes into whatever is focused.
+unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, MA_NOACTIVATE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+    };
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_LBUTTONDOWN => {
+            PILL_CLICKED.store(true, std::sync::atomic::Ordering::Relaxed);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
 
-unsafe extern "system" fn guard_proc(
-    hwnd: windows::Win32::Foundation::HWND,
-    msg: u32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::LRESULT;
+fn create_pill_hwnd(x: i32, y: i32, w: i32, h: i32) -> Result<HWND> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, MA_NOACTIVATE, WM_MOUSEACTIVATE,
+        CreateWindowExW, RegisterClassExW, ShowWindow, CS_HREDRAW, CS_VREDRAW, SW_SHOWNOACTIVATE,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_POPUP,
     };
-    if msg == WM_MOUSEACTIVATE {
-        return LRESULT(MA_NOACTIVATE as isize);
+
+    let class: Vec<u16> = "DraftPillProtoClass\0".encode_utf16().collect();
+    unsafe {
+        let hinstance = GetModuleHandleW(None)?;
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(pill_proc),
+            hInstance: hinstance.into(),
+            lpszClassName: PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        // A duplicate registration is fine; only the first one counts.
+        RegisterClassExW(&wc);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED
+                | WS_EX_TRANSPARENT
+                | WS_EX_NOACTIVATE
+                | WS_EX_TOOLWINDOW
+                | WS_EX_TOPMOST,
+            PCWSTR(class.as_ptr()),
+            PCWSTR(class.as_ptr()),
+            WS_POPUP,
+            x,
+            y,
+            w,
+            h,
+            None,
+            None,
+            hinstance,
+            None,
+        )?;
+        if hwnd.is_invalid() {
+            return Err(anyhow!("CreateWindowExW returned null"));
+        }
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        Ok(hwnd)
     }
-    let prev = *PREV_PROC.get().unwrap_or(&0);
-    let f: unsafe extern "system" fn(
-        windows::Win32::Foundation::HWND,
-        u32,
-        windows::Win32::Foundation::WPARAM,
-        windows::Win32::Foundation::LPARAM,
-    ) -> LRESULT = std::mem::transmute(prev as usize as *const ());
-    CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
 }
 
 /// #20: a bare `SetWindowLongPtrW` on the event-loop thread, no
@@ -2595,9 +2772,7 @@ struct LayeredSurface {
 }
 
 impl LayeredSurface {
-    fn new(window: &Window, w: u32, h: u32) -> Result<Self> {
-        let hwnd = hwnd_from_window(window)?;
-        apply_layered_styles(hwnd);
+    fn new(hwnd: HWND, w: u32, h: u32) -> Result<Self> {
         let (mem_dc, dib, bits) = create_dib(w, h)?;
         Ok(Self {
             hwnd,
@@ -2671,17 +2846,6 @@ impl Drop for LayeredSurface {
     }
 }
 
-fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND> {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let handle = window
-        .window_handle()
-        .map_err(|e| anyhow!("window handle: {e}"))?;
-    let RawWindowHandle::Win32(h) = handle.as_raw() else {
-        return Err(anyhow!("not a Win32 window"));
-    };
-    Ok(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _))
-}
-
 unsafe fn rearm_layered(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED,
@@ -2690,23 +2854,6 @@ unsafe fn rearm_layered(hwnd: windows::Win32::Foundation::HWND) {
     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !layered);
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | layered);
-}
-
-fn apply_layered_styles(hwnd: windows::Win32::Foundation::HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    };
-    unsafe {
-        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new_style = (cur as u32)
-            | WS_EX_LAYERED.0
-            | WS_EX_TRANSPARENT.0
-            | WS_EX_NOACTIVATE.0
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_TOPMOST.0;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-    }
 }
 
 fn create_dib(
