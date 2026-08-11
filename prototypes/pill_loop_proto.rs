@@ -686,7 +686,7 @@ const ISLAND_BODY: BodyStyle = BodyStyle {
     name: "ISLANDS",
     islands: true,
     pad: 0.0,
-    gap: 6.0,
+    gap: 3.0,
     note: "each button is its own island, with bare desktop showing between them",
 };
 
