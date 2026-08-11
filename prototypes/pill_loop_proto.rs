@@ -616,6 +616,15 @@ struct Proportions {
 /// non-uniform option expressible at all.
 const PROPORTIONS: &[Proportions] = &[
     Proportions {
+        name: "WIDE DICTATE 48",
+        centre_w: 48.0,
+        centre_glyph: 22.0,
+        flank_w: 32.0,
+        flank_glyph: 22.0,
+        ring_a: 0.0,
+        note: "flankers stay uniform circles; Dictate alone stretches into a long stadium",
+    },
+    Proportions {
         name: "UNIFORM 32",
         centre_w: 32.0,
         centre_glyph: 22.0,
