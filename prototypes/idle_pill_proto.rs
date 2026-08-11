@@ -8,6 +8,7 @@
 // Then, in the terminal:
 //   <Enter>  next idle candidate
 //   r        cycle the recording reference (none -> 86x42 -> 62x28 -> none)
+//   + / -    walk the bottom margin by 4px (round 4; hold Enter to repeat)
 //   q        quit
 //
 // It copies (rather than imports) the layered-window plumbing from
@@ -27,11 +28,21 @@ use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
 // The window is always the size of the recording pill; every idle variant is
 // drawn *inside* that box, bottom-aligned and centred, so the pill's bottom
-// edge stays put at the same 80px margin no matter which variant is showing.
+// edge stays put at the same margin no matter which variant is showing.
 const BOX_W: u32 = 86;
 const BOX_H: u32 = 42;
-const BOTTOM_MARGIN: u32 = 80;
+/// Round 4 measures this from the monitor's **work area**, not its full rect —
+/// #22 moved the anchor, so on a monitor with a taskbar the pill rises by the
+/// taskbar height at an unchanged number. 80 is today's value, kept as the
+/// starting point so the walk begins from the familiar position; `+`/`-` move it.
+const BOTTOM_MARGIN: i32 = 80;
 const SUPERSAMPLE: u32 = 4;
+
+/// #18's hairline: a light edge on *every* state including the nub, superseding
+/// #17's "no border". This is what round 4 exists to account for — round 3 swept
+/// alpha with no edge at all, so its verdict is void.
+const HAIRLINE_RGB: (u8, u8, u8) = (220, 224, 232);
+const HAIRLINE_A: u8 = 120;
 
 // The recording pill, for the shrink maths. Still 86x42 as shipped, even
 // though HALF is the front-runner to replace it — the percentages stay
@@ -56,7 +67,10 @@ const REC_HALF: Variant = Variant {
     h: 28.0,
     radius: 14.0,
     fill_a: 245,
-    border_a: 48,
+    // Round 4: #18's hairline goes on every state, so the proposed recording
+    // pill wears the same edge the nub does. (REC above keeps its old border,
+    // being the shipped thing rather than the proposed one.)
+    border_a: HAIRLINE_A,
     bars: 7,
     note: "HALF's silhouette carrying the full 7-bar recording treatment",
 };
@@ -78,61 +92,89 @@ struct Variant {
     note: &'static str,
 }
 
-// Round 3. Geometry is settled: NUB-36, i.e. 36x10, fully rounded (r=5), no
-// border, no bars. (Round 1 fanned out across six silhouettes and narrowed to
-// NUB and DOT; round 2 walked the nub's width down and picked the bar over the
-// blob.) Rounds 1-2 both held fill alpha at 140 throughout, so opacity is the
-// one axis this ticket names that has never actually been varied — everything
-// below is NUB-36 with only the alpha moving.
+// Round 4. Geometry is settled: NUB-36, i.e. 36x10, fully rounded (r=5), no
+// bars. (Round 1 fanned out across six silhouettes and narrowed to NUB and DOT;
+// round 2 walked the nub's width down and picked the bar over the blob; round 3
+// swept the fill alpha.) Round 3's sweep is **void**: it ran borderless, and #18
+// has since put a hairline on every state including the nub. Against a black
+// desktop a near-black body has no contrast at any alpha — the edge is what
+// makes the nub visible, so the body's job changed underneath the sweep.
 //
-// Judge these over a *white* window as well as a dark one: the fill is
-// near-black, so 140 is dark-desktop-flattering and may vanish on a bright one.
+// So the question narrows: with the hairline carrying visibility, how dense
+// should the body be? It may want to go *down* — a dimmer body is less intrusive
+// for something on screen all day — or the hairline may make it irrelevant, which
+// is what the alpha-0 variant is here to test.
+//
+// Judge each over a *white* window and a *black* one, and over a busy photo
+// wallpaper: the light hairline is the mirror of the dark body's failure case.
 const VARIANTS: &[Variant] = &[
     Variant {
-        name: "NUB-36 @ 100",
-        w: 36.0,
-        h: 10.0,
-        radius: 5.0,
-        fill_a: 100,
-        border_a: 0,
-        bars: 0,
-        note: "barely there — does it survive a bright background at all?",
-    },
-    Variant {
-        name: "NUB-36 @ 140",
+        name: "NUB-36 @ 140, NO hairline (round 3's answer)",
         w: 36.0,
         h: 10.0,
         radius: 5.0,
         fill_a: 140,
         border_a: 0,
         bars: 0,
-        note: "the alpha you have been looking at for two rounds",
+        note: "the baseline being retried — what #18 changed out from under",
     },
     Variant {
-        name: "NUB-36 @ 180",
+        name: "NUB-36 @ 0 + hairline",
+        w: 36.0,
+        h: 10.0,
+        radius: 5.0,
+        fill_a: 0,
+        border_a: HAIRLINE_A,
+        bars: 0,
+        note: "outline only, no body at all — is the fill simply redundant?",
+    },
+    Variant {
+        name: "NUB-36 @ 60 + hairline",
+        w: 36.0,
+        h: 10.0,
+        radius: 5.0,
+        fill_a: 60,
+        border_a: HAIRLINE_A,
+        bars: 0,
+        note: "a hint of body to stop the outline reading as hollow",
+    },
+    Variant {
+        name: "NUB-36 @ 100 + hairline",
+        w: 36.0,
+        h: 10.0,
+        radius: 5.0,
+        fill_a: 100,
+        border_a: HAIRLINE_A,
+        bars: 0,
+        note: "below the carried-forward value, where the edge does the work",
+    },
+    Variant {
+        name: "NUB-36 @ 140 + hairline",
+        w: 36.0,
+        h: 10.0,
+        radius: 5.0,
+        fill_a: 140,
+        border_a: HAIRLINE_A,
+        bars: 0,
+        note: "the unexamined value, now with the edge it never had",
+    },
+    Variant {
+        name: "NUB-36 @ 180 + hairline",
         w: 36.0,
         h: 10.0,
         radius: 5.0,
         fill_a: 180,
-        border_a: 0,
+        border_a: HAIRLINE_A,
         bars: 0,
-        note: "solid enough to read as an object rather than a smudge",
-    },
-    Variant {
-        name: "NUB-36 @ 220",
-        w: 36.0,
-        h: 10.0,
-        radius: 5.0,
-        fill_a: 220,
-        border_a: 0,
-        bars: 0,
-        note: "near-opaque; the recording pill sits at 245",
+        note: "reads as a solid object; is that too present for always-on?",
     },
 ];
 
 enum Msg {
     Next,
     NextReference,
+    /// Round 4: nudge the bottom margin by ±4px and reposition live.
+    Margin(i32),
     Quit,
 }
 
@@ -149,6 +191,12 @@ fn main() -> Result<()> {
             let msg = match line.trim() {
                 "q" => Msg::Quit,
                 "r" => Msg::NextReference,
+                s if !s.is_empty() && s.chars().all(|c| c == '+') => {
+                    Msg::Margin(4 * s.len() as i32)
+                }
+                s if !s.is_empty() && s.chars().all(|c| c == '-') => {
+                    Msg::Margin(-4 * s.len() as i32)
+                }
                 _ => Msg::Next,
             };
             let quit = matches!(msg, Msg::Quit);
@@ -206,7 +254,16 @@ impl App {
                 );
             }
         }
-        println!("  [Enter] next idle   [r] cycle recording reference   [q] quit");
+        if let Some(w) = self.win.as_ref() {
+            let inset = w.taskbar_inset();
+            println!(
+                "  margin={} from rcWork  (taskbar inset {}px, so {}px above where 80-from-full-rect puts it today)",
+                w.margin,
+                inset,
+                w.margin + inset - BOTTOM_MARGIN,
+            );
+        }
+        println!("  [Enter] next idle   [r] recording reference   [+/-] margin ±4   [q] quit");
     }
 
     fn redraw(&mut self) {
@@ -262,6 +319,12 @@ impl ApplicationHandler for App {
                         Some(_) => None,
                     };
                 }
+                Msg::Margin(d) => {
+                    if let Some(w) = self.win.as_mut() {
+                        let next = w.margin + d;
+                        w.set_margin(next);
+                    }
+                }
             }
             self.redraw();
             self.report();
@@ -305,7 +368,7 @@ fn draw_variant(pm: &mut Pixmap, scale: f32, v: &Variant) {
 
     if v.border_a > 0 {
         let mut border = Paint::default();
-        border.set_color_rgba8(170, 172, 178, v.border_a);
+        border.set_color_rgba8(HAIRLINE_RGB.0, HAIRLINE_RGB.1, HAIRLINE_RGB.2, v.border_a);
         border.anti_alias = true;
         let stroke = Stroke {
             width: border_w,
@@ -387,6 +450,13 @@ struct PillWindow {
     hires: Pixmap,
     mid: Pixmap,
     layered: LayeredSurface,
+    /// Round 4: the live bottom margin, in logical px, measured from `rcWork`.
+    margin: i32,
+    /// The primary monitor's work area and full rect, in physical px. The gap
+    /// between their bottoms is the taskbar inset — the amount #22's re-anchor
+    /// raises the pill at an unchanged margin number.
+    work: (i32, i32, i32, i32),
+    full_bottom: i32,
 }
 
 impl PillWindow {
@@ -397,13 +467,15 @@ impl PillWindow {
             .ok_or_else(|| anyhow!("no monitor available"))?;
         let scale = primary.scale_factor() as f32;
         let monitor_pos = primary.position();
-        let monitor_size = primary.size();
+        // #22 anchors the pill to the monitor's *work area*, so the prototype
+        // has to as well or the margin walk measures the wrong thing.
+        let (work, full_bottom) = primary_work_area(monitor_pos.x, monitor_pos.y);
 
         let phys_w = (BOX_W as f32 * scale) as i32;
         let phys_h = (BOX_H as f32 * scale) as i32;
         let margin = (BOTTOM_MARGIN as f32 * scale) as i32;
-        let x = monitor_pos.x + (monitor_size.width as i32 - phys_w) / 2;
-        let y = monitor_pos.y + monitor_size.height as i32 - phys_h - margin;
+        let x = work.0 + (work.2 - work.0 - phys_w) / 2;
+        let y = work.3 - phys_h - margin;
 
         let attrs = WindowAttributes::default()
             .with_title("Draft Idle Pill Prototype")
@@ -435,11 +507,32 @@ impl PillWindow {
             hires,
             mid,
             layered,
+            margin: BOTTOM_MARGIN,
+            work,
+            full_bottom,
         })
     }
 
     fn show(&self) {
         self.window.set_visible(true);
+    }
+
+    /// Round 4: move the pill without recreating it, so the margin can be
+    /// walked against a live desktop rather than guessed from a number.
+    fn set_margin(&mut self, margin: i32) {
+        self.margin = margin.clamp(0, 400);
+        let phys_h = (BOX_H as f32 * self.scale) as i32;
+        let phys_w = (BOX_W as f32 * self.scale) as i32;
+        let x = self.work.0 + (self.work.2 - self.work.0 - phys_w) / 2;
+        let y = self.work.3 - phys_h - (self.margin as f32 * self.scale) as i32;
+        self.window
+            .set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+    }
+
+    /// The taskbar inset, in logical px: how much higher #22's work-area anchor
+    /// puts the pill than today's full-rect anchor at the same margin number.
+    fn taskbar_inset(&self) -> i32 {
+        ((self.full_bottom - self.work.3) as f32 / self.scale).round() as i32
     }
 
     fn render(&mut self, v: &Variant) -> Result<()> {
@@ -544,6 +637,30 @@ impl Drop for LayeredSurface {
             if !self.dib.is_invalid() {
                 let _ = DeleteObject(self.dib);
             }
+        }
+    }
+}
+
+/// `rcWork` (left, top, right, bottom) and `rcMonitor.bottom` for the monitor
+/// containing the given point, all in physical px. Falls back to a zero inset
+/// if `GetMonitorInfoW` fails — the prototype would rather be slightly wrong
+/// than not run.
+fn primary_work_area(x: i32, y: i32) -> ((i32, i32, i32, i32), i32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            let w = mi.rcWork;
+            ((w.left, w.top, w.right, w.bottom), mi.rcMonitor.bottom)
+        } else {
+            ((x, y, x, y), y)
         }
     }
 }
