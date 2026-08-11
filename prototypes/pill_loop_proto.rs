@@ -668,21 +668,24 @@ struct GlyphSize {
     note: &'static str,
 }
 
+/// Judged 2026-08-11: **AIR-0.72 wins and the axis is closed.** The other two
+/// were called bad outright, so they stay only as the reference the choice was
+/// made against — first in the list is the default, and that is now 0.72.
 const GLYPH_SIZES: &[GlyphSize] = &[
     GlyphSize {
-        name: "FULL (grid = button)",
-        frac: 1.0,
-        note: "stroke 1.83px on a 22 button — heaviest, but the glyph touches the disc edge",
+        name: "AIR-0.72  (CHOSEN)",
+        frac: 0.72,
+        note: "conventional icon-button proportions; stroke 1.32px on a 22 button",
     },
     GlyphSize {
-        name: "AIR-0.86",
+        name: "AIR-0.86  (rejected)",
         frac: 0.86,
         note: "a ring of air inside the hover disc; stroke drops to 1.57px",
     },
     GlyphSize {
-        name: "AIR-0.72",
-        frac: 0.72,
-        note: "conventional icon-button proportions; stroke 1.32px — the muddiness test",
+        name: "FULL (grid = button)  (rejected)",
+        frac: 1.0,
+        note: "stroke 1.83px — heaviest, and the glyph touches the disc edge",
     },
 ];
 
