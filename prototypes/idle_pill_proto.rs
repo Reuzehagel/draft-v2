@@ -6,8 +6,8 @@
 //
 // Run:  cargo run --bin idle-pill-proto
 // Then, in the terminal:
-//   <Enter>  next variant
-//   r        toggle the 86x42 recording pill for side-by-side comparison
+//   <Enter>  next idle candidate
+//   r        cycle the recording reference (none -> 86x42 -> 62x28 -> none)
 //   q        quit
 //
 // It copies (rather than imports) the layered-window plumbing from
@@ -78,70 +78,55 @@ struct Variant {
     note: &'static str,
 }
 
-// Round 2. Round 1 narrowed the field to NUB and DOT, with a note that the nub
-// wants to be less wide — so this walks the nub down in width and pits the two
-// silhouettes against each other. GHOST, MINI-BARS and CAPSULE are out; HALF
-// has moved up to be a recording reference.
+// Round 3. Geometry is settled: NUB-36, i.e. 36x10, fully rounded (r=5), no
+// border, no bars. (Round 1 fanned out across six silhouettes and narrowed to
+// NUB and DOT; round 2 walked the nub's width down and picked the bar over the
+// blob.) Rounds 1-2 both held fill alpha at 140 throughout, so opacity is the
+// one axis this ticket names that has never actually been varied — everything
+// below is NUB-36 with only the alpha moving.
+//
+// Judge these over a *white* window as well as a dark one: the fill is
+// near-black, so 140 is dark-desktop-flattering and may vanish on a bright one.
 const VARIANTS: &[Variant] = &[
     Variant {
-        name: "NUB-44",
-        w: 44.0,
+        name: "NUB-36 @ 100",
+        w: 36.0,
         h: 10.0,
         radius: 5.0,
-        fill_a: 140,
+        fill_a: 100,
         border_a: 0,
         bars: 0,
-        note: "round 1's nub, unchanged — the width you wanted to come down from",
+        note: "barely there — does it survive a bright background at all?",
     },
     Variant {
-        name: "NUB-36",
+        name: "NUB-36 @ 140",
         w: 36.0,
         h: 10.0,
         radius: 5.0,
         fill_a: 140,
         border_a: 0,
         bars: 0,
-        note: "one step narrower; still clearly a bar, not a dash",
+        note: "the alpha you have been looking at for two rounds",
     },
     Variant {
-        name: "NUB-30",
-        w: 30.0,
+        name: "NUB-36 @ 180",
+        w: 36.0,
         h: 10.0,
         radius: 5.0,
-        fill_a: 140,
+        fill_a: 180,
         border_a: 0,
         bars: 0,
-        note: "3:1 — about where a bar stops reading as a bar",
+        note: "solid enough to read as an object rather than a smudge",
     },
     Variant {
-        name: "NUB-24",
-        w: 24.0,
+        name: "NUB-36 @ 220",
+        w: 36.0,
         h: 10.0,
         radius: 5.0,
-        fill_a: 140,
+        fill_a: 220,
         border_a: 0,
         bars: 0,
-        note: "past the bar/blob line on purpose, to find where it broke",
-    },
-    Variant {
-        name: "DOT-14",
-        w: 14.0,
-        h: 14.0,
-        radius: 7.0,
-        fill_a: 210,
-        border_a: 0,
-        bars: 0,
-        note: "round 1's dot, unchanged",
-    },
-    Variant {
-        name: "DOT-11",
-        w: 11.0,
-        h: 11.0,
-        radius: 5.5,
-        fill_a: 210,
-        border_a: 0,
-        bars: 0,
-        note: "a smaller dot — is the dot's appeal its size or its shape?",
+        note: "near-opaque; the recording pill sits at 245",
     },
 ];
 
