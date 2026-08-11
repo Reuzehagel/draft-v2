@@ -801,24 +801,36 @@ enum Seam {
     Collapse,
 }
 
+/// Judged 2026-08-11: **FADE, and the axis closes.** Not "the default
+/// survived" — the default was *examined* and the reason it wins is a
+/// measurement. The entire shape change is **6px of width over 170ms**, and
+/// the flankers move 4. That is below the threshold at which any treatment can
+/// register, so CLOSE's exactness bought nothing that could be seen and
+/// COLLAPSE's extra beat was spent on a distance too small to need one.
+///
+/// The generalisable form, worth more than the pixel answer: **a transition
+/// can be too small to deserve a treatment.** Geometric honesty is not a
+/// visible property below some displacement, and design effort spent under
+/// that threshold is invisible by construction rather than by bad execution.
+/// Ask what a treatment is *worth seeing* before asking which one is right.
 const SEAMS: &[(Seam, &str, u32, &str)] = &[
     (
-        Seam::Close,
-        "CLOSE",
-        170,
-        "gaps 3->0, inner corners 16->0, then one 112 body — geometry does the work",
-    ),
-    (
         Seam::Fade,
-        "FADE  (status quo)",
+        "FADE  (CHOSEN)",
         170,
         "islands dissolve at held 118 spacing while a 112 body appears under them",
     ),
     (
+        Seam::Close,
+        "CLOSE  (rejected)",
+        170,
+        "gaps 3->0, inner corners 16->0, then one 112 body — exact, and indistinguishable",
+    ),
+    (
         Seam::Collapse,
-        "COLLAPSE-REGROW",
+        "COLLAPSE-REGROW  (rejected)",
         260,
-        "fold into the centre, pinch, grow the recording pill back out — costs a beat",
+        "fold into the centre, pinch, grow back out — a beat spent on 6px",
     ),
 ];
 
@@ -826,8 +838,12 @@ const SEAMS: &[(Seam, &str, u32, &str)] = &[
 /// Once the flankers turn out to barely move, the question stops being about
 /// *position* and becomes about *timing*: does the body finish closing before
 /// the glyphs have finished becoming their replacements, or do both run on one
-/// progress? Leading the close means the shape settles first and the glyphs
-/// resolve inside a body that is already still.
+/// progress?
+///
+/// Judged 2026-08-11: **no perceptible difference, so no lead.** It only ever
+/// applied under CLOSE, which lost — but the finding stands on its own and is
+/// the same one: 6px has no timing. Kept as the reference the call was made
+/// against, not as a live option.
 const SEAM_LEAD: f32 = 0.62;
 
 /// The body's shape on one frame of the handover.
