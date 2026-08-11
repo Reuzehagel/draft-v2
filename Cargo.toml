@@ -9,6 +9,11 @@ license = "MIT"
 name = "draft"
 path = "src/main.rs"
 
+# PROTOTYPE — throwaway, delete along with prototypes/ once wayfinder #33 lands.
+[[bin]]
+name = "pill-loop-proto"
+path = "prototypes/pill_loop_proto.rs"
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +40,8 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 egui = "0.29"
 keyring = { version = "3", features = ["windows-native"] }
 transcribe-rs = { version = "0.3", default-features = false, features = ["onnx"] }
+svgtypes = "0.16.1"
+fontdue = "0.9.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

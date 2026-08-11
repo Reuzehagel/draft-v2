@@ -6,3 +6,6 @@ Cargo.lock
 node_modules/
 dist/
 .claude/
+
+# prototype frame dumps
+pill-frame.png
