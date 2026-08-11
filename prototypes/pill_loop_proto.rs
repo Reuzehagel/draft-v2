@@ -101,6 +101,10 @@ const REC_BTN_D: f32 = 20.0;
 /// inert padding at the ends, more gap in the middle, so Cancel and Confirm
 /// sit out near the pill's ends rather than crowding the waveform. The pill's
 /// overall width is unchanged — 4px moves from each end into each gap.
+/// How far the UNIFIED hover indicator sits inside the pill's top and bottom
+/// edges. Non-zero so it reads as a shape within a shape rather than a band
+/// slicing the pill into thirds.
+const INDICATOR_INSET: f32 = 3.0;
 const REC_END_PAD: f32 = 7.0;
 const REC_GAP: f32 = 12.0;
 const BTN_GAP: f32 = 8.0;
@@ -1204,11 +1208,21 @@ impl App {
             &UNIFIED_BODY
         }
     }
+    /// The two body styles do not want the same numbers, and pretending they
+    /// do is what made UNIFIED 150px wide for three 22px glyphs.
+    ///
+    /// Under ISLANDS a slot width is a **shape you can see**, so Q1's numbers
+    /// are used as given. Under UNIFIED nothing is drawn at the slot's edge —
+    /// the width is only an invisible hover slab — so paying 48px for the
+    /// centre buys air and no hierarchy. There the slot collapses onto the
+    /// glyph box, which is #18's original arithmetic, and Dictate has to be
+    /// marked some other way than by shape.
     fn expanded_layout(&self) -> Layout {
         let p = self.dictate();
+        let islands = self.body().islands;
         Layout {
-            centre_w: p.centre_w,
-            flank_w: p.flank_w,
+            centre_w: if islands { p.centre_w } else { p.centre_glyph },
+            flank_w: if islands { p.flank_w } else { p.flank_glyph },
             centre_glyph: p.centre_glyph,
             flank_glyph: p.flank_glyph,
             end_pad: BTN_PAD,
@@ -2708,49 +2722,69 @@ fn draw_indicator(
     rh: f32,
     alpha: f32,
 ) {
-    let ind = |i: usize| -> (f32, f32) {
-        (cx + l.slot_dx(i) * scale, l.slot_w(i) * scale / 2.0)
-    };
+    // The indicator used to be a *circle sized to the slot width*, which is
+    // fine only while every slot is as wide as the pill is tall. A 48-wide
+    // Dictate slot drew a 48px circle inside a 32px pill: it overflowed top
+    // and bottom and bulged in the middle, and the flankers' circles ran into
+    // the pill's own rounded ends. The `let _ = rh;` at the bottom was the
+    // tell — the pill's height was not an input at all.
+    //
+    // It is now a rounded rect that lives *inside* the pill: full slot width,
+    // inset from the top and bottom edges, radius half its height. It reads as
+    // a pill within a pill at any slot width, and can never fight the outer
+    // corners because it never reaches them.
+    let inset = INDICATOR_INSET * scale;
+    let h = (rh - 2.0 * inset).max(1.0);
+    let ind = |i: usize| -> (f32, f32) { (cx + l.slot_dx(i) * scale, l.slot_w(i) * scale) };
     let white = (255.0, 255.0, 255.0);
     // #29: a fill behind the glyph at white @ ~28.
     let a = 28.0 / 255.0 * alpha;
+    let mut hi = |x: f32, w: f32, a: f32| {
+        if a <= 0.004 || w <= 1.0 {
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        rounded_rect(&mut pb, x - w / 2.0, cy - h / 2.0, w, h, h / 2.0);
+        let Some(p) = pb.finish() else { return };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(
+            white.0 as u8,
+            white.1 as u8,
+            white.2 as u8,
+            (a.clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        paint.anti_alias = true;
+        pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+    };
     if f.slide {
         match (f.lit, f.lit_prev) {
             (Some(to), Some(from)) => {
-                let (x0, r0) = ind(from);
-                let (x1, r1) = ind(to);
-                disc(
-                    pm,
-                    lerp(x0, x1, f.lit_p),
-                    cy,
-                    lerp(r0, r1, f.lit_p),
-                    white,
-                    a,
-                );
+                let (x0, w0) = ind(from);
+                let (x1, w1) = ind(to);
+                hi(lerp(x0, x1, f.lit_p), lerp(w0, w1, f.lit_p), a);
             }
             (Some(to), None) => {
-                let (x1, r1) = ind(to);
-                disc(pm, x1, cy, r1, white, a * f.lit_p);
+                let (x1, w1) = ind(to);
+                hi(x1, w1, a * f.lit_p);
             }
             (None, Some(from)) => {
-                let (x0, r0) = ind(from);
-                disc(pm, x0, cy, r0, white, a * (1.0 - f.lit_p));
+                let (x0, w0) = ind(from);
+                hi(x0, w0, a * (1.0 - f.lit_p));
             }
             (None, None) => {}
         }
     } else {
         if let Some(to) = f.lit {
-            let (x1, r1) = ind(to);
-            disc(pm, x1, cy, r1, white, a * f.lit_p);
+            let (x1, w1) = ind(to);
+            hi(x1, w1, a * f.lit_p);
         }
         if let Some(from) = f.lit_prev {
             if Some(from) != f.lit {
-                let (x0, r0) = ind(from);
-                disc(pm, x0, cy, r0, white, a * (1.0 - f.lit_p));
+                let (x0, w0) = ind(from);
+                hi(x0, w0, a * (1.0 - f.lit_p));
             }
         }
     }
-    let _ = rh;
 }
 
 fn disc(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, rgb: (f32, f32, f32), a: f32) {
