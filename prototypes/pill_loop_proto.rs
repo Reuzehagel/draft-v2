@@ -610,18 +610,13 @@ struct Proportions {
     note: &'static str,
 }
 
+/// Reopened 2026-08-11 — the axis is live again and nothing on it is marked
+/// chosen. UNIFORM leads because it is the default to think from, not because
+/// it won. The glyph-box split below stays either way: it is what makes any
+/// non-uniform option expressible at all.
 const PROPORTIONS: &[Proportions] = &[
     Proportions {
-        name: "HIERARCHY 34/26  (CHOSEN)",
-        centre_w: 34.0,
-        centre_glyph: 22.0,
-        flank_w: 26.0,
-        flank_glyph: 20.0,
-        ring_a: 0.0,
-        note: "Dictate is a 34x32 stadium; the flankers step down to 26px circles",
-    },
-    Proportions {
-        name: "UNIFORM 32  (rejected)",
+        name: "UNIFORM 32",
         centre_w: 32.0,
         centre_glyph: 22.0,
         flank_w: 32.0,
@@ -630,7 +625,16 @@ const PROPORTIONS: &[Proportions] = &[
         note: "#18 as settled — three equal buttons, nothing marked as primary",
     },
     Proportions {
-        name: "DOMINANT CIRCLE 38/32  (rejected)",
+        name: "HIERARCHY 34/26",
+        centre_w: 34.0,
+        centre_glyph: 22.0,
+        flank_w: 26.0,
+        flank_glyph: 20.0,
+        ring_a: 0.0,
+        note: "Dictate is a 34x32 stadium; the flankers step down to 26px circles",
+    },
+    Proportions {
+        name: "DOMINANT CIRCLE 38/32",
         centre_w: 38.0,
         centre_glyph: 26.0,
         flank_w: 32.0,
@@ -2277,11 +2281,11 @@ impl App {
                 });
                 question(
                     ui,
-                    "Q1 · Does Dictate want to be bigger than its flankers?",
-                    "Answered as proportion rather than scale: Dictate is a wide stadium and \
-                     the flankers step DOWN to smaller circles, so the hierarchy runs in width \
-                     and height at once. Each option sets four numbers — the two button widths \
-                     and the two glyph boxes inside them, which are no longer the same thing.",
+                    "Q1 · Does Dictate want to be bigger than its flankers?  (REOPENED)",
+                    "Each option sets four numbers — the two button widths and the two glyph \
+                     boxes inside them, which are no longer the same thing, so a wider Dictate \
+                     does not drag a wider microphone along with it. Back on UNIFORM by \
+                     default; nothing here is marked chosen.",
                     &mut self.dictate,
                     PROPORTIONS.iter().map(|d| (d.name, d.note)),
                 );
