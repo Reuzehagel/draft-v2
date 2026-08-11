@@ -93,6 +93,10 @@ const BORDER_NEUTRAL: (f32, f32, f32) = (150.0, 152.0, 160.0);
 
 // #29's arithmetic. `BTN_D` is the *flanker* diameter; the centre is an axis.
 const BTN_D: f32 = 22.0;
+/// Cancel and Confirm, on the click-started recording pill. Deliberately
+/// smaller than any hover-bar button: they are a stop and an abort on a pill
+/// that is already busy, not a menu of things to pick from.
+const REC_BTN_D: f32 = 20.0;
 const BTN_GAP: f32 = 8.0;
 const BTN_PAD: f32 = 11.0;
 const EXP_H: f32 = 32.0;
@@ -1192,9 +1196,9 @@ impl App {
     fn recclick_layout(&self) -> Layout {
         Layout {
             centre_w: BARS_W,
-            flank_w: BTN_D,
+            flank_w: REC_BTN_D,
             centre_glyph: BARS_W,
-            flank_glyph: BTN_D,
+            flank_glyph: REC_BTN_D,
             style: &UNIFIED_BODY,
         }
     }
@@ -2564,6 +2568,18 @@ fn draw(
                         f.dictate_ring_a / 255.0 * d.alpha,
                     );
                 }
+                // The recording pill's two controls carry their own chrome.
+                // Confirm is the primary action of a click-started session,
+                // and a stroked glyph among stroked glyphs has no way to say
+                // so; a filled disc does. Cancel gets a faint one — present,
+                // round, plainly secondary. Both are round, matching the
+                // pill's own fully-rounded ends.
+                let r = d.size * scale / 2.0;
+                match icon {
+                    Icon::Check => disc(pm, gx, cy, r, (255.0, 255.0, 255.0), d.alpha * 0.94),
+                    Icon::X => disc(pm, gx, cy, r, (255.0, 255.0, 255.0), d.alpha * 0.10),
+                    _ => {}
+                }
                 let dim = if f.history_empty && icon == Icon::Copy {
                     0.35
                 } else if f.lit == d.slot && d.slot.is_some() {
@@ -2571,7 +2587,23 @@ fn draw(
                 } else {
                     0.70
                 };
-                draw_icon(pm, icons, icon, gx, cy, d.glyph * scale * f.glyph_frac, d.alpha * dim);
+                // Knocked out of the filled disc rather than drawn over it.
+                let ink = if icon == Icon::Check {
+                    BODY
+                } else {
+                    (255.0, 255.0, 255.0)
+                };
+                let dim = if icon == Icon::Check { 1.0 } else { dim };
+                draw_icon_in(
+                    pm,
+                    icons,
+                    icon,
+                    gx,
+                    cy,
+                    d.glyph * scale * f.glyph_frac,
+                    d.alpha * dim,
+                    ink,
+                );
             }
         }
     }
@@ -2720,6 +2752,23 @@ fn draw_icon(
     box_px: f32,
     alpha: f32,
 ) {
+    draw_icon_in(pm, icons, icon, cx, cy, box_px, alpha, (255.0, 255.0, 255.0));
+}
+
+/// As `draw_icon`, but in a given colour — Confirm is a filled white disc with
+/// its glyph knocked out in the pill's own body colour, which is the only way
+/// a stroked glyph sitting among other stroked glyphs can say "primary".
+#[allow(clippy::too_many_arguments)]
+fn draw_icon_in(
+    pm: &mut Pixmap,
+    icons: &IconCache,
+    icon: Icon,
+    cx: f32,
+    cy: f32,
+    box_px: f32,
+    alpha: f32,
+    rgb: (f32, f32, f32),
+) {
     let Some(base) = icons.get(icon) else { return };
     // Lucide draws inside a 24 box; the glyph occupies roughly 20 of it, so a
     // 22px button wants the whole grid mapped to ~ the button diameter.
@@ -2729,7 +2778,12 @@ fn draw_icon(
         return;
     };
     let mut paint = Paint::default();
-    paint.set_color_rgba8(255, 255, 255, (alpha.clamp(0.0, 1.0) * 235.0) as u8);
+    paint.set_color_rgba8(
+        rgb.0 as u8,
+        rgb.1 as u8,
+        rgb.2 as u8,
+        (alpha.clamp(0.0, 1.0) * 235.0) as u8,
+    );
     paint.anti_alias = true;
     let stroke = Stroke {
         width: 2.0 * k,
