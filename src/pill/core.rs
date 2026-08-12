@@ -1,0 +1,600 @@
+// Pill core — the pill's whole life as a pure state machine, peer to `Session`.
+//
+// `Session` used to author the pill: it emitted `SetPill`/`DismissPill` and held
+// the terminal flash in its own phase. That only works while the pill's life *is*
+// the session's life, which the resident pill breaks. So the pill gets its own
+// core and `Session` becomes one of its drivers — the residency toggle, the
+// fullscreen watcher and the hover poller are the others (see ADR-0003).
+//
+// State is two axes, never one flat enum:
+//
+//   Presence — what the pill does with no session running
+//   Activity — what a session is asking it to show
+//
+// **Activity outranks presence.** That single rule buys two decisions without
+// transition bookkeeping: a session stays visible even behind a fullscreen app,
+// and hover cannot expand a recording pill. It also means the state a session
+// returns to is *derived* from presence, never remembered — a remembered
+// return-state is already wrong if presence changed while the session ran.
+//
+// Pure, like `Session`: events plus `now: Instant` in, `Command`s out. No winit,
+// no Win32, no `Instant::now()`. The races this exists to make assertable —
+// fullscreen hide against a chord press, hover during a session, residency
+// toggled mid-flash — are unreachable by tests if they live in the adapter.
+
+use std::time::{Duration, Instant};
+
+/// How long the pill lingers on a successful delivery, showing the green
+/// border before it fades and disappears.
+pub const SUCCESS_LINGER: Duration = Duration::from_millis(500);
+
+/// Failures linger longer than successes — a red flash the user might miss in
+/// 500 ms deserves an extra beat to register as "that one didn't land".
+pub const ERROR_LINGER: Duration = Duration::from_millis(1200);
+
+/// How long the terminal flash holds before the pill leaves. Shared with the
+/// pill adapter, which uses it to time the fade; the core uses it in `tick` to
+/// decide when the flash retires.
+pub fn linger(ok: bool) -> Duration {
+    if ok {
+        SUCCESS_LINGER
+    } else {
+        ERROR_LINGER
+    }
+}
+
+/// What the pill does when no session is running.
+///
+/// `expanded` is a flag inside `Resident` rather than a third axis, because
+/// expansion is meaningless when the pill is off or suppressed.
+///
+/// Only `Off` is reachable in the shipped app so far: the drivers that set the
+/// other two — the fullscreen watcher (#22) and the residency toggle plus hover
+/// poller (#23, #19) — are not built yet. The rules are here, and tested, ahead
+/// of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub enum Presence {
+    /// Residency toggled off — the pill exists only for the length of a session.
+    Off,
+    /// A fullscreen app has focus. Suppresses the *resident* pill only, never
+    /// session feedback.
+    Suppressed,
+    /// On screen with nothing happening; `expanded` is set by hover.
+    Resident { expanded: bool },
+}
+
+/// How a session began. Decides presentation only, never control: a hotkey
+/// release finishes a click-started session exactly as its check would.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    Hotkey,
+    /// The pill's own Dictate button. Nothing can produce one until the button
+    /// bar lands (#29); the mode it derives is asserted in the tests below.
+    #[allow(dead_code)]
+    Click,
+}
+
+/// What a session is currently asking the pill to show. Outranks [`Presence`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Activity {
+    /// No session — the pill is whatever presence says it is.
+    None,
+    Recording {
+        origin: Origin,
+    },
+    Processing {
+        since: Instant,
+    },
+    /// The terminal flash, retired by [`Pill::tick`] once its linger elapses.
+    Done {
+        ok: bool,
+        since: Instant,
+    },
+}
+
+/// The pill's logical mode: what the core derives from presence × activity and
+/// hands the adapter. One mode per transition; the adapter derives every frame's
+/// bars, breathing pulse and fade from it. `since` is the core's `now` at the
+/// transition, so the adapter's animation clock and the core's linger clock
+/// share one origin.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PillMode {
+    /// Off screen. The window may still exist (residency keeps it alive).
+    Hidden,
+    /// Resident and idle: the nub.
+    Idle,
+    /// Resident and hovered.
+    Expanded,
+    /// Live capture: the adapter animates bars from the ring buffer.
+    Recording { origin: Origin },
+    /// Worker running: frozen bars under a breathing border.
+    Processing { since: Instant },
+    /// Terminal green/red flash.
+    Done { ok: bool, since: Instant },
+}
+
+/// What a session tells the Pill core it is doing. Deliberately smaller than
+/// [`Activity`]: a session knows nothing about residency, and it does not stamp
+/// the flash's clock — the core does, because the flash outlives the session.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SessionActivity {
+    /// No session is asking for anything (never started, dropped, or nothing
+    /// usable was said).
+    None,
+    Recording {
+        origin: Origin,
+    },
+    Processing {
+        since: Instant,
+    },
+    /// The last thing a session says. What follows the flash is the core's call.
+    Finished {
+        ok: bool,
+    },
+}
+
+/// An effect for the pill adapter to perform. The core returns these; it never
+/// performs them, so a test can assert on the list instead of on private state.
+///
+/// The window is created once and shown/hidden, and destroyed only when the pill
+/// has no reason to exist at all — create-on-demand would churn a layered window
+/// on every chord press and every hover, and hover polling wants a stable rect.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Command {
+    /// Create the pill window, hidden and unpainted.
+    Create,
+    /// Hand over a new logical mode. Always precedes the `Show` that reveals it,
+    /// so the first visible frame is already the right one.
+    SetMode(PillMode),
+    Show,
+    Hide,
+    /// Tear the window down.
+    Destroy,
+}
+
+/// The pill's owner: presence × activity in, commands out.
+pub struct Pill {
+    presence: Presence,
+    activity: Activity,
+    /// Whether the adapter currently holds a window (mirrors Create/Destroy).
+    window: bool,
+    /// Whether that window is on screen (mirrors Show/Hide).
+    shown: bool,
+    /// The last mode handed over, so unchanged modes emit nothing.
+    mode: Option<PillMode>,
+}
+
+impl Pill {
+    pub fn new() -> Self {
+        Self {
+            // Residency does not exist yet, so the pill starts (and, until the
+            // toggle lands, stays) session-scoped.
+            presence: Presence::Off,
+            activity: Activity::None,
+            window: false,
+            shown: false,
+            mode: None,
+        }
+    }
+
+    /// Apply a session's report. `Finished` is stamped here, not by the session:
+    /// the session ends the moment its outcome is known, and the flash outlives it.
+    pub fn on_session(&mut self, activity: SessionActivity, now: Instant) -> Vec<Command> {
+        self.activity = match activity {
+            SessionActivity::None => Activity::None,
+            SessionActivity::Recording { origin } => Activity::Recording { origin },
+            SessionActivity::Processing { since } => Activity::Processing { since },
+            SessionActivity::Finished { ok } => Activity::Done { ok, since: now },
+        };
+        self.settle()
+    }
+
+    /// Set the presence axis. The drivers that call this — the residency toggle
+    /// (#23), the fullscreen watcher (#22) and the hover poller (#19) — are not
+    /// built yet, which is why presence is `Off` for the whole of this ticket.
+    #[allow(dead_code)]
+    pub fn set_presence(&mut self, presence: Presence) -> Vec<Command> {
+        self.presence = presence;
+        self.settle()
+    }
+
+    /// Retire the terminal flash once its linger has elapsed. Emits the
+    /// transition exactly once on the crossing, then nothing — the animation is
+    /// otherwise self-driven in the adapter.
+    pub fn tick(&mut self, now: Instant) -> Vec<Command> {
+        if let Activity::Done { ok, since } = self.activity {
+            if now.saturating_duration_since(since) >= linger(ok) {
+                self.activity = Activity::None;
+                return self.settle();
+            }
+        }
+        Vec::new()
+    }
+
+    /// The pill mode for the current axes. Activity outranks presence: whenever
+    /// a session is saying anything at all, presence has no say.
+    fn derive_mode(&self) -> PillMode {
+        match self.activity {
+            Activity::Recording { origin } => PillMode::Recording { origin },
+            Activity::Processing { since } => PillMode::Processing { since },
+            Activity::Done { ok, since } => PillMode::Done { ok, since },
+            Activity::None => match self.presence {
+                Presence::Off | Presence::Suppressed => PillMode::Hidden,
+                Presence::Resident { expanded: false } => PillMode::Idle,
+                Presence::Resident { expanded: true } => PillMode::Expanded,
+            },
+        }
+    }
+
+    /// Reconcile the window against the axes and emit only what changed.
+    fn settle(&mut self) -> Vec<Command> {
+        let mode = self.derive_mode();
+        // A window is worth holding while the pill is resident (even suppressed,
+        // where it is only hidden) or while a session is using it.
+        let want_window = self.presence != Presence::Off || self.activity != Activity::None;
+        let want_shown = want_window && mode != PillMode::Hidden;
+
+        let mut cmds = Vec::new();
+        if want_window && !self.window {
+            cmds.push(Command::Create);
+            self.window = true;
+            self.mode = None;
+        }
+        if self.window && self.mode != Some(mode) {
+            cmds.push(Command::SetMode(mode));
+            self.mode = Some(mode);
+        }
+        if want_shown != self.shown {
+            cmds.push(if want_shown {
+                Command::Show
+            } else {
+                Command::Hide
+            });
+            self.shown = want_shown;
+        }
+        if !want_window && self.window {
+            cmds.push(Command::Destroy);
+            self.window = false;
+            self.mode = None;
+        }
+        cmds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(ms: u64) -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(Instant::now);
+        base + Duration::from_millis(ms)
+    }
+
+    /// The last mode the core handed over while reaching `presence` × `activity`
+    /// from scratch, read off the command lists — never off private state.
+    /// `None` means it never handed over a mode at all.
+    fn mode_for(presence: Presence, activity: SessionActivity) -> Option<PillMode> {
+        let mut p = Pill::new();
+        let mut cmds = p.set_presence(presence);
+        cmds.extend(p.on_session(activity, t(0)));
+        cmds.iter().rev().find_map(|c| match c {
+            Command::SetMode(m) => Some(*m),
+            _ => None,
+        })
+    }
+
+    /// Every presence × activity pair, as one table. The rows where they
+    /// disagree are the point: activity wins in all of them.
+    #[test]
+    fn mode_is_derived_from_presence_and_activity() {
+        let rec = SessionActivity::Recording {
+            origin: Origin::Hotkey,
+        };
+        let proc = SessionActivity::Processing { since: t(0) };
+        let fin = SessionActivity::Finished { ok: true };
+        let cases = [
+            // Presence alone, with no session running. `Off` × `None` derives
+            // `Hidden` like `Suppressed` does, but from a standing start there
+            // is no window to hand it to, so nothing is emitted at all —
+            // reaching that same cell *with* a window is asserted in
+            // `a_session_that_never_shows_anything_leaves_no_window_behind`.
+            (Presence::Off, SessionActivity::None, None),
+            (
+                Presence::Suppressed,
+                SessionActivity::None,
+                Some(PillMode::Hidden),
+            ),
+            (
+                Presence::Resident { expanded: false },
+                SessionActivity::None,
+                Some(PillMode::Idle),
+            ),
+            (
+                Presence::Resident { expanded: true },
+                SessionActivity::None,
+                Some(PillMode::Expanded),
+            ),
+            // Recording, from each presence.
+            (
+                Presence::Off,
+                rec,
+                Some(PillMode::Recording {
+                    origin: Origin::Hotkey,
+                }),
+            ),
+            (
+                Presence::Suppressed,
+                rec,
+                Some(PillMode::Recording {
+                    origin: Origin::Hotkey,
+                }),
+            ),
+            (
+                Presence::Resident { expanded: false },
+                rec,
+                Some(PillMode::Recording {
+                    origin: Origin::Hotkey,
+                }),
+            ),
+            (
+                Presence::Resident { expanded: true },
+                rec,
+                Some(PillMode::Recording {
+                    origin: Origin::Hotkey,
+                }),
+            ),
+            // Processing, from each presence.
+            (
+                Presence::Off,
+                proc,
+                Some(PillMode::Processing { since: t(0) }),
+            ),
+            (
+                Presence::Suppressed,
+                proc,
+                Some(PillMode::Processing { since: t(0) }),
+            ),
+            (
+                Presence::Resident { expanded: false },
+                proc,
+                Some(PillMode::Processing { since: t(0) }),
+            ),
+            (
+                Presence::Resident { expanded: true },
+                proc,
+                Some(PillMode::Processing { since: t(0) }),
+            ),
+            // The terminal flash, from each presence.
+            (
+                Presence::Off,
+                fin,
+                Some(PillMode::Done {
+                    ok: true,
+                    since: t(0),
+                }),
+            ),
+            (
+                Presence::Suppressed,
+                fin,
+                Some(PillMode::Done {
+                    ok: true,
+                    since: t(0),
+                }),
+            ),
+            (
+                Presence::Resident { expanded: false },
+                fin,
+                Some(PillMode::Done {
+                    ok: true,
+                    since: t(0),
+                }),
+            ),
+            (
+                Presence::Resident { expanded: true },
+                fin,
+                Some(PillMode::Done {
+                    ok: true,
+                    since: t(0),
+                }),
+            ),
+        ];
+        for (presence, activity, expected) in cases {
+            assert_eq!(
+                mode_for(presence, activity),
+                expected,
+                "presence {presence:?} x activity {activity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_is_visible_even_when_a_fullscreen_app_suppresses_the_pill() {
+        let mut p = Pill::new();
+        // Resident, then a fullscreen app takes focus: hidden, window kept.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![
+                Command::Create,
+                Command::SetMode(PillMode::Idle),
+                Command::Show
+            ]
+        );
+        assert_eq!(
+            p.set_presence(Presence::Suppressed),
+            vec![Command::SetMode(PillMode::Hidden), Command::Hide]
+        );
+        // A chord press is an explicit request — suppression never wins over it.
+        assert_eq!(
+            p.on_session(
+                SessionActivity::Recording {
+                    origin: Origin::Hotkey
+                },
+                t(0)
+            ),
+            vec![
+                Command::SetMode(PillMode::Recording {
+                    origin: Origin::Hotkey
+                }),
+                Command::Show
+            ]
+        );
+    }
+
+    #[test]
+    fn hover_cannot_expand_a_recording_pill() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: false });
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        // The cursor drifts over the pill mid-capture: no mode change at all.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: true }),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn tick_past_linger_retires_the_flash_exactly_once() {
+        let mut p = Pill::new();
+        p.on_session(SessionActivity::Processing { since: t(0) }, t(0));
+        assert_eq!(
+            p.on_session(SessionActivity::Finished { ok: true }, t(2000)),
+            vec![Command::SetMode(PillMode::Done {
+                ok: true,
+                since: t(2000)
+            })]
+        );
+        // Before the linger elapses: nothing.
+        let early = t(2000) + SUCCESS_LINGER - Duration::from_millis(1);
+        assert!(p.tick(early).is_empty());
+        // Once past it, the pill goes — presence is Off, so it has nowhere to
+        // return to...
+        let late = t(2000) + SUCCESS_LINGER;
+        assert_eq!(
+            p.tick(late),
+            vec![
+                Command::SetMode(PillMode::Hidden),
+                Command::Hide,
+                Command::Destroy
+            ]
+        );
+        // ...and never again.
+        assert!(p.tick(late + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn a_failed_flash_holds_for_the_longer_linger() {
+        let mut p = Pill::new();
+        p.on_session(SessionActivity::Finished { ok: false }, t(0));
+        // A success would already be gone by here.
+        assert!(p.tick(t(0) + SUCCESS_LINGER).is_empty());
+        assert_eq!(p.tick(t(0) + ERROR_LINGER).len(), 3);
+    }
+
+    #[test]
+    fn the_state_after_a_session_is_derived_from_presence_not_remembered() {
+        let mut p = Pill::new();
+        // The session starts with the pill off...
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        // ...and residency is switched on while it runs. Activity outranks
+        // presence, so nothing changes on screen yet.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![]
+        );
+        p.on_session(SessionActivity::Finished { ok: true }, t(1000));
+        // The flash retires to the *current* presence, not to where it started.
+        assert_eq!(
+            p.tick(t(1000) + SUCCESS_LINGER),
+            vec![Command::SetMode(PillMode::Idle)]
+        );
+    }
+
+    #[test]
+    fn residency_switched_off_mid_flash_takes_the_window_with_it() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: false });
+        p.on_session(SessionActivity::Finished { ok: true }, t(0));
+        // Toggled off during the flash: the flash still owns the pill.
+        assert_eq!(p.set_presence(Presence::Off), vec![]);
+        // And when it retires there is nothing left to return to.
+        assert_eq!(
+            p.tick(t(0) + SUCCESS_LINGER),
+            vec![
+                Command::SetMode(PillMode::Hidden),
+                Command::Hide,
+                Command::Destroy
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resident_window_is_created_once_and_survives_a_whole_session() {
+        let mut p = Pill::new();
+        let mut cmds = p.set_presence(Presence::Resident { expanded: false });
+        cmds.extend(p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        ));
+        cmds.extend(p.on_session(SessionActivity::Processing { since: t(500) }, t(500)));
+        cmds.extend(p.on_session(SessionActivity::Finished { ok: true }, t(900)));
+        cmds.extend(p.tick(t(900) + SUCCESS_LINGER));
+        assert_eq!(
+            cmds.iter().filter(|c| **c == Command::Create).count(),
+            1,
+            "{cmds:?}"
+        );
+        assert!(!cmds.contains(&Command::Destroy), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_session_that_never_shows_anything_leaves_no_window_behind() {
+        let mut p = Pill::new();
+        // Too short a capture, or nothing usable said: straight back to None.
+        assert!(p.on_session(SessionActivity::None, t(0)).is_empty());
+        assert!(p
+            .on_session(
+                SessionActivity::Recording {
+                    origin: Origin::Hotkey
+                },
+                t(0)
+            )
+            .contains(&Command::Create));
+        assert_eq!(
+            p.on_session(SessionActivity::None, t(100)),
+            vec![
+                Command::SetMode(PillMode::Hidden),
+                Command::Hide,
+                Command::Destroy
+            ]
+        );
+    }
+
+    #[test]
+    fn a_click_started_session_reaches_the_adapter_as_one() {
+        let mut p = Pill::new();
+        assert!(p
+            .on_session(
+                SessionActivity::Recording {
+                    origin: Origin::Click
+                },
+                t(0)
+            )
+            .contains(&Command::SetMode(PillMode::Recording {
+                origin: Origin::Click
+            })));
+    }
+}

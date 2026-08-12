@@ -106,6 +106,18 @@ impl PillWindow {
         self.window.set_visible(true);
     }
 
+    /// Take the pill off screen without destroying it — the window survives so
+    /// a later reveal doesn't have to rebuild a layered window.
+    pub fn hide(&self) {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+            let _ = ShowWindow(self.layered.hwnd, SW_HIDE);
+        };
+        #[cfg(not(windows))]
+        self.window.set_visible(false);
+    }
+
     pub fn render_recording(&mut self, bar_heights: &[f32]) -> Result<()> {
         self.ensure_size()?;
         crate::pill::render::draw_recording(
