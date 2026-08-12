@@ -6,12 +6,16 @@
 // This sidesteps the chroma-key bleed we got from softbuffer + LWA_COLORKEY.
 //
 // Never call a winit window mutator on the pill. winit's `WindowFlags::apply_diff`
-// writes GWL_EXSTYLE *absolutely*, from a flag set that knows nothing about
-// WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW or WS_EX_TRANSPARENT — so `set_visible`,
-// `set_cursor_hittest` and friends silently drop the styles the pill depends on
-// (notably NOACTIVATE, which is what keeps the pill from stealing focus).
-// Everything that touches window state here goes through the raw HWND, and
-// GWL_EXSTYLE is always read-modify-written.
+// writes GWL_EXSTYLE *absolutely*, from its own flag set — which carries neither
+// WS_EX_NOACTIVATE nor WS_EX_TOOLWINDOW at all, and reaches WS_EX_LAYERED and
+// WS_EX_TRANSPARENT only via `set_cursor_hittest`, which ORs the pair on. So
+// `set_visible` and friends silently drop the styles the pill depends on —
+// notably NOACTIVATE, which is what keeps the pill from stealing focus — and
+// `set_cursor_hittest` clears the layered bit as the price of hit-testing.
+// That is why the click-through flip is a raw SetWindowLongPtrW (see #20).
+//
+// So `window` is private: everything that touches window state goes through the
+// raw HWND, and GWL_EXSTYLE is always read-modify-written.
 
 use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
 use anyhow::{anyhow, Result};
@@ -30,7 +34,7 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
 pub struct PillWindow {
-    pub window: Window,
+    window: Window,
     pub scale: f32,
     pixmap: Pixmap,
     hires: Pixmap,
@@ -209,7 +213,7 @@ struct LayeredSurface {
 impl LayeredSurface {
     fn new(window: &Window, w: u32, h: u32) -> Result<Self> {
         let hwnd = hwnd_from_window(window)?;
-        apply_layered_styles(hwnd)?;
+        unsafe { apply_pill_ex_styles(hwnd) };
         let (mem_dc, dib, bits) = create_dib(w, h)?;
         Ok(Self {
             hwnd,
@@ -334,9 +338,14 @@ fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND>
     Ok(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _))
 }
 
-/// The extended-style bits the pill owns. winit sets none of them and clears
-/// all of them the moment one of its mutators runs, so they are re-asserted as
-/// a set rather than one at a time.
+/// The extended-style bits the pill owns. winit clears all of them the moment
+/// one of its mutators runs, so they are re-asserted as a set rather than one
+/// at a time.
+///
+/// WS_EX_TOPMOST is carried here only so a re-assertion doesn't *drop* it —
+/// setting the bit through SetWindowLongPtrW does not restack the window. The
+/// actual z-order comes from `WindowLevel::AlwaysOnTop` at creation and would
+/// need a SetWindowPos(HWND_TOPMOST) to restore if it were ever lost.
 #[cfg(windows)]
 const PILL_EX_STYLE: u32 = {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -369,25 +378,32 @@ unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
     };
     let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, without_layered(cur) as isize);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
+    // Re-read rather than reusing `cur`: the write above is itself a window
+    // state change, and reusing the stale value would make the second write
+    // absolute again — the very hazard this is here to close.
+    apply_pill_ex_styles(hwnd);
 }
 
+/// OR the pill's ex-style bits onto whatever GWL_EXSTYLE holds right now.
 #[cfg(windows)]
-fn apply_layered_styles(hwnd: windows::Win32::Foundation::HWND) -> Result<()> {
+unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
     };
-    unsafe {
-        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
-    }
-    Ok(())
+    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
 }
 
 /// Show the pill without letting it take focus, and without going through
 /// winit — `Window::set_visible` funnels into `WindowFlags::apply_diff`, which
 /// rewrites GWL_EXSTYLE absolutely and would drop every bit
-/// [`apply_layered_styles`] just set.
+/// [`apply_pill_ex_styles`] just set.
+///
+/// The cost is that winit's cached flags still say "hidden": it was created
+/// `with_visible(false)` and nothing told winit otherwise. That is only safe
+/// because nothing calls a winit mutator on the pill — `apply_diff` runs off
+/// winit's own flag changes, so with no such calls there is no diff to apply.
+/// Adding one would both clobber the ex-styles and hide the window.
 #[cfg(windows)]
 unsafe fn show_no_activate(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
