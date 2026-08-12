@@ -1,12 +1,12 @@
 # Draft — Domain Glossary
 
-The ubiquitous language for Draft's dictation flow. Use these terms exactly in code, tests, issues, and design docs — don't drift to synonyms.
+The ubiquitous language for Draft. Dictation is the main flow but not the only one — a **Transcription run** reaches a **Transcriber** without any of it. Use these terms exactly in code, tests, issues, and design docs — don't drift to synonyms.
 
 ## Dictation lifecycle
 
 - **Session** — one dictation from hotkey press to pasted (or discarded) result. Owns the activation FSM(s), the live capture handle, and the monotonic **session id** used to reconcile a worker's **Outcome**. The deepened `Session` module is a pure core: its methods take an event plus `now: Instant` and return **Command**s; it performs no I/O itself. A session ends the moment its outcome is known — the terminal flash outlives it and belongs to the **Pill core**.
 - **Session kind** — what a session is for: `Dictate` (transcript pasted at cursor) or `Command` (spoken instruction whose LLM answer is pasted). Set at start, read at stop to route the worker.
-- **Outcome** — a worker's terminal result for a session, reported back over a channel and matched to the session by **session id**; a stale worker's outcome (id mismatch) is ignored.
+- **Outcome** — the terminal result of a transcription: `Delivered`, `Empty`, or `Failed`. A **Session** receives it from a worker over a channel and matches it by **session id** (a stale worker's outcome — id mismatch — is ignored); a **Transcription run** returns it as an exit code.
 - **Command** — an effect the pure `Session` core returns for the event-loop adapter to perform: e.g. start capture, set pill mode, spawn transcription, dismiss pill. The command list is the test surface.
 
 ## Pill
@@ -23,3 +23,9 @@ The ubiquitous language for Draft's dictation flow. Use these terms exactly in c
 - **Provider** — a concrete adapter satisfying `Transcriber`: local Parakeet, Mistral, Reson8, or OpenAI/Groq via `openai_compat`. Selected by config; constructed by `transcribe::build(cfg)`, which owns key-loading, vocabulary baking, and fallback-wrapping in one place.
 - **Fallback** — `FallbackTranscriber` wraps a cloud provider with the local model: on any primary error it transcribes locally instead, so a connectivity blip degrades quality rather than losing words.
 - **Vocabulary hint** — a free-text decoder prompt built from the user's term list, baked into prompt-capable providers (OpenAI, Groq) at construction. Providers without biasing support ignore it; it is not part of the `Transcriber` interface.
+- **Transcription run** — one execution of the `transcribe` subcommand: a media file in, text out. Not a **Session** — it has no activation, no capture, no pill, and no paste. It shares only the **Transcriber** and the **Replacements**.
+
+## Post-processing
+
+- **Replacements** — the user's find/replace rules, applied to any transcript whatever produced it. They correct vocabulary, so they are true of a **Session** and a **Transcription run** alike.
+- **Voice commands** — spoken instructions to Draft ("new paragraph") turned into their effect. They belong to a **Session** only: a recorded file's speaker is not addressing Draft, so applying them there corrupts text that merely contains the phrase.
