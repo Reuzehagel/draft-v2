@@ -16,9 +16,15 @@
 //
 // So `window` is private: everything that touches window state goes through the
 // raw HWND, and GWL_EXSTYLE is always read-modify-written.
+//
+// WS_EX_NOACTIVATE also has a documented hover-to-activate hole, which the
+// window's wndproc subclass closes by answering WM_MOUSEACTIVATE itself — see
+// `pill::hook`.
 
+use crate::pill::hook::HookEvent;
 use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
 use anyhow::{anyhow, Result};
+use crossbeam_channel::Sender;
 use tiny_skia::Pixmap;
 
 // Render the pill at this multiple of device resolution, then downscale to
@@ -34,6 +40,12 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
 pub struct PillWindow {
+    /// Held only for its `Drop` — and declared first so it runs first: the
+    /// subclass has to come off while the HWND is still alive, and dropping
+    /// `window` is what destroys it.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    hook: crate::pill::hook::PillHook,
     window: Window,
     pub scale: f32,
     pixmap: Pixmap,
@@ -45,7 +57,10 @@ pub struct PillWindow {
 }
 
 impl PillWindow {
-    pub fn create(el: &ActiveEventLoop) -> Result<Self> {
+    /// Build the pill window and install its one wndproc hook. `hook_tx` is the
+    /// app loop's end of that hook — the messages winit never surfaces arrive
+    /// there for as long as this window lives.
+    pub fn create(el: &ActiveEventLoop, hook_tx: Sender<HookEvent>) -> Result<Self> {
         let primary = el
             .primary_monitor()
             .or_else(|| el.available_monitors().next())
@@ -85,8 +100,14 @@ impl PillWindow {
 
         #[cfg(windows)]
         let layered = LayeredSurface::new(&window, w, h)?;
+        #[cfg(windows)]
+        let hook = crate::pill::hook::PillHook::install(layered.hwnd, hook_tx);
+        #[cfg(not(windows))]
+        let _ = hook_tx;
 
         Ok(Self {
+            #[cfg(windows)]
+            hook,
             window,
             scale,
             pixmap,
