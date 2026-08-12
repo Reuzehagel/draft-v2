@@ -13,7 +13,7 @@ Two processes from one binary:
 - **Main process** (`main.rs`): single-instance gate, tray icon, global hotkeys, winit event loop. It is the *adapter* — it performs the Commands that `session.rs` returns.
 - **Settings subprocess**: the same exe relaunched with `--settings`, running eframe/egui (`settings_ui/`). The main process polls for its exit and reloads `config.toml` afterward — settings never talk to the main process directly.
 
-Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/toggle/double-press-lock) → `session.rs` (pure core: events + `now` in, Commands out) → `audio/` (cpal capture, resample to 16 kHz mono) → worker thread → `transcribe/` → `postprocess/` (voice commands, then replacements) → `paste.rs` (clipboard+Ctrl+V or SendInput unicode). `pill/` is a peer core, not downstream of dictation.
+Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/toggle/double-press-lock) → `session.rs` (pure core: events + `now` in, Commands out) → `audio/` (cpal capture, resample to 16 kHz mono) → worker thread → `transcribe/` → `postprocess/` (replacements, then voice commands) → `paste.rs` (clipboard+Ctrl+V or SendInput unicode). `pill/` is a peer core, not downstream of dictation.
 
 Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat model as an instruction and pastes the answer; it skips the postprocess pipeline.
 
