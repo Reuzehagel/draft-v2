@@ -4,6 +4,18 @@
 // through UpdateLayeredWindow each frame.
 //
 // This sidesteps the chroma-key bleed we got from softbuffer + LWA_COLORKEY.
+//
+// Never call a winit window mutator on the pill. winit's `WindowFlags::apply_diff`
+// writes GWL_EXSTYLE *absolutely*, from its own flag set — which carries neither
+// WS_EX_NOACTIVATE nor WS_EX_TOOLWINDOW at all, and reaches WS_EX_LAYERED and
+// WS_EX_TRANSPARENT only via `set_cursor_hittest`, which ORs the pair on. So
+// `set_visible` and friends silently drop the styles the pill depends on —
+// notably NOACTIVATE, which is what keeps the pill from stealing focus — and
+// `set_cursor_hittest` clears the layered bit as the price of hit-testing.
+// That is why the click-through flip is a raw SetWindowLongPtrW (see #20).
+//
+// So `window` is private: everything that touches window state goes through the
+// raw HWND, and GWL_EXSTYLE is always read-modify-written.
 
 use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
 use anyhow::{anyhow, Result};
@@ -22,7 +34,7 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
 pub struct PillWindow {
-    pub window: Window,
+    window: Window,
     pub scale: f32,
     pixmap: Pixmap,
     hires: Pixmap,
@@ -86,6 +98,11 @@ impl PillWindow {
     }
 
     pub fn show(&self) {
+        #[cfg(windows)]
+        unsafe {
+            show_no_activate(self.layered.hwnd)
+        };
+        #[cfg(not(windows))]
         self.window.set_visible(true);
     }
 
@@ -196,7 +213,7 @@ struct LayeredSurface {
 impl LayeredSurface {
     fn new(window: &Window, w: u32, h: u32) -> Result<Self> {
         let hwnd = hwnd_from_window(window)?;
-        apply_layered_styles(hwnd)?;
+        unsafe { apply_pill_ex_styles(hwnd) };
         let (mem_dc, dib, bits) = create_dib(w, h)?;
         Ok(Self {
             hwnd,
@@ -233,13 +250,20 @@ impl LayeredSurface {
         // square for a frame — doing that every frame made the pill visibly
         // flicker between its rounded shape and a bare rectangle.
         //
-        // winit's message pump can still re-enter `SetLayeredWindowAttributes`
-        // on window state changes (visibility, focus, DPI), which is mutually
-        // exclusive with UpdateLayeredWindow's per-pixel-alpha mode and makes
-        // it fail with E_INVALIDARG. So re-arm ONLY on failure, then retry.
+        // UpdateLayeredWindow fails with E_INVALIDARG when WS_EX_LAYERED is
+        // absent, and winit clears it: any window-state change it processes
+        // (visibility, DPI, level) runs `WindowFlags::apply_diff`, which writes
+        // GWL_EXSTYLE absolutely from a flag set that has no layered bit. So
+        // re-arm ONLY on failure — and re-assert the whole pill set, since the
+        // same write also took NOACTIVATE, TOOLWINDOW and TRANSPARENT with it.
         unsafe {
             if self.update_layered().is_err() {
-                rearm_layered(self.hwnd);
+                use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
+                tracing::debug!(
+                    ex_style = format_args!("{:#x}", GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)),
+                    "layered present failed; re-arming pill ex-styles"
+                );
+                rearm_ex_styles(self.hwnd);
                 self.update_layered()?;
             }
         }
@@ -314,34 +338,76 @@ fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND>
     Ok(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _))
 }
 
+/// The extended-style bits the pill owns. winit clears all of them the moment
+/// one of its mutators runs, so they are re-asserted as a set rather than one
+/// at a time.
+///
+/// WS_EX_TOPMOST is carried here only so a re-assertion doesn't *drop* it —
+/// setting the bit through SetWindowLongPtrW does not restack the window. The
+/// actual z-order comes from `WindowLevel::AlwaysOnTop` at creation and would
+/// need a SetWindowPos(HWND_TOPMOST) to restore if it were ever lost.
 #[cfg(windows)]
-unsafe fn rearm_layered(hwnd: windows::Win32::Foundation::HWND) {
+const PILL_EX_STYLE: u32 = {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
-    let layered = WS_EX_LAYERED.0 as isize;
-    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !layered);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | layered);
+    WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0
+};
+
+/// The pill's bits ORed onto whatever GWL_EXSTYLE currently holds — never an
+/// absolute write, so bits Windows or winit set for their own reasons survive.
+#[cfg(windows)]
+fn with_pill_ex_style(cur: u32) -> u32 {
+    cur | PILL_EX_STYLE
 }
 
+/// The same value with WS_EX_LAYERED knocked out, for the first half of the
+/// re-arm (see [`rearm_ex_styles`]).
 #[cfg(windows)]
-fn apply_layered_styles(hwnd: windows::Win32::Foundation::HWND) -> Result<()> {
+fn without_layered(cur: u32) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
+    cur & !WS_EX_LAYERED.0
+}
+
+/// Re-assert every pill ex-style bit, dropping WS_EX_LAYERED first so the
+/// window genuinely re-enters layered mode rather than seeing a no-op write.
+#[cfg(windows)]
+unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
     };
-    unsafe {
-        let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let new_style = (cur as u32)
-            | WS_EX_LAYERED.0
-            | WS_EX_TRANSPARENT.0
-            | WS_EX_NOACTIVATE.0
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_TOPMOST.0;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
-    }
-    Ok(())
+    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, without_layered(cur) as isize);
+    // Re-read rather than reusing `cur`: the write above is itself a window
+    // state change, and reusing the stale value would make the second write
+    // absolute again — the very hazard this is here to close.
+    apply_pill_ex_styles(hwnd);
+}
+
+/// OR the pill's ex-style bits onto whatever GWL_EXSTYLE holds right now.
+#[cfg(windows)]
+unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
+    };
+    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
+}
+
+/// Show the pill without letting it take focus, and without going through
+/// winit — `Window::set_visible` funnels into `WindowFlags::apply_diff`, which
+/// rewrites GWL_EXSTYLE absolutely and would drop every bit
+/// [`apply_pill_ex_styles`] just set.
+///
+/// The cost is that winit's cached flags still say "hidden": it was created
+/// `with_visible(false)` and nothing told winit otherwise. That is only safe
+/// because nothing calls a winit mutator on the pill — `apply_diff` runs off
+/// winit's own flag changes, so with no such calls there is no diff to apply.
+/// Adding one would both clobber the ex-styles and hide the window.
+#[cfg(windows)]
+unsafe fn show_no_activate(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 }
 
 #[cfg(windows)]
@@ -394,5 +460,54 @@ fn create_dib(
         }
         SelectObject(mem_dc, dib);
         Ok((mem_dc, dib, bits as *mut u8))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT,
+    };
+
+    // The bit that keeps the pill from stealing focus is the whole reason the
+    // clobber matters — it must be in the set we re-assert, not just LAYERED.
+    #[test]
+    fn the_pill_set_covers_every_style_the_pill_depends_on() {
+        for bit in [
+            WS_EX_LAYERED,
+            WS_EX_TRANSPARENT,
+            WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST,
+        ] {
+            assert_eq!(PILL_EX_STYLE & bit.0, bit.0, "missing {bit:?}");
+        }
+    }
+
+    // Read-modify-write, never an absolute write: bits set by Windows or winit
+    // for their own reasons have to survive our re-assertion.
+    #[test]
+    fn applying_the_pill_set_preserves_foreign_bits() {
+        let cur = WS_EX_APPWINDOW.0;
+        assert_eq!(with_pill_ex_style(cur), cur | PILL_EX_STYLE);
+    }
+
+    #[test]
+    fn applying_the_pill_set_is_idempotent() {
+        let once = with_pill_ex_style(WS_EX_APPWINDOW.0);
+        assert_eq!(with_pill_ex_style(once), once);
+    }
+
+    // The re-arm's first write must drop LAYERED and nothing else — clearing
+    // NOACTIVATE for even one message would let the pill take focus.
+    #[test]
+    fn the_rearm_clears_only_the_layered_bit() {
+        let cur = with_pill_ex_style(WS_EX_APPWINDOW.0);
+        let cleared = without_layered(cur);
+        assert_eq!(cleared & WS_EX_LAYERED.0, 0);
+        assert_eq!(cleared, cur & !WS_EX_LAYERED.0);
+        assert_eq!(with_pill_ex_style(cleared), cur);
     }
 }
