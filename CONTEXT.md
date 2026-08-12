@@ -4,16 +4,18 @@ The ubiquitous language for Draft's dictation flow. Use these terms exactly in c
 
 ## Dictation lifecycle
 
-- **Session** — one dictation from hotkey press to pasted (or discarded) result. Owns the activation FSM(s), the live capture handle, the post-capture **Tail**, and the monotonic **session id** used to reconcile a worker's **Outcome**. The deepened `Session` module is a pure core: its methods take an event plus `now: Instant` and return **Command**s; it performs no I/O itself.
+- **Session** — one dictation from hotkey press to pasted (or discarded) result. Owns the activation FSM(s), the live capture handle, and the monotonic **session id** used to reconcile a worker's **Outcome**. The deepened `Session` module is a pure core: its methods take an event plus `now: Instant` and return **Command**s; it performs no I/O itself. A session ends the moment its outcome is known — the terminal flash outlives it and belongs to the **Pill core**.
 - **Session kind** — what a session is for: `Dictate` (transcript pasted at cursor) or `Command` (spoken instruction whose LLM answer is pasted). Set at start, read at stop to route the worker.
-- **Tail** — the post-capture pill state: `Processing` while the worker runs, then `Done{ok}` for the terminal green/red flash. `None` when idle or recording.
 - **Outcome** — a worker's terminal result for a session, reported back over a channel and matched to the session by **session id**; a stale worker's outcome (id mismatch) is ignored.
 - **Command** — an effect the pure `Session` core returns for the event-loop adapter to perform: e.g. start capture, set pill mode, spawn transcription, dismiss pill. The command list is the test surface.
 
 ## Pill
 
-- **Pill** — the overlay showing mic bars during capture, a breathing border while the worker runs, then a green/red flash. Self-animating: the `Session` core sets its logical **mode**; the pill adapter derives every frame's bars, breathing pulse, and fade itself.
-- **Pill mode** — the logical state `Session` assigns the pill: `Recording` → `Processing` → `Done{ok}` → dismissed. Transitions are commands; per-frame animation is not.
+- **Pill** — the overlay. It shows mic bars during capture, a breathing border while the worker runs, then a green/red flash — and, when resident, it stays on screen with nothing happening. Self-animating: it is given a logical **pill mode**; the pill adapter derives every frame's bars, breathing pulse, and fade itself.
+- **Pill core** — the pure core that owns the pill's whole life, peer to the **Session** core rather than downstream of it. Holds **Presence** and **Activity**, derives the **pill mode** from them, and returns commands (create, destroy, show, hide, set mode) for the adapter. Dictation is only one of its drivers; the residency toggle, the fullscreen watcher, and the hover poller are the others. It owns the terminal flash's linger, so `Session` never schedules a pill change.
+- **Presence** — what the pill does when no session is running: `Off` (residency toggled off), `Suppressed` (a fullscreen app has focus), or `Resident{expanded}` (on screen; `expanded` set by hover).
+- **Activity** — what a session is currently asking the pill to show: `None`, `Recording`, `Processing{since}`, or `Done{ok, since}`. **Activity outranks presence**, so a session is always visible — even behind a fullscreen app — and hover can never expand a pill that is recording.
+- **Pill mode** — the logical state the **Pill core** derives from **presence** and **activity** and hands the adapter: `Hidden`, `Idle`, `Expanded`, `Recording`, `Processing`, `Done{ok}`. Transitions are commands; per-frame animation is not. `Session` does not assign it — `Session` reports activity, and the pill core decides.
 
 ## Transcription
 
