@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::pill::core::{Pill, PillMode};
+use crate::pill::hook::HookEvent;
 use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
 use winit::application::ApplicationHandler;
@@ -93,6 +94,9 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
+    // Owned here rather than by the window, so the pill can be created and
+    // destroyed under a receiver that outlives every one of them.
+    let (hook_tx, hook_rx) = crossbeam_channel::unbounded();
 
     let mut app = App {
         tray,
@@ -101,7 +105,8 @@ fn main() -> Result<()> {
         hotkey_rx,
         session,
         pill_core: Pill::new(),
-        pill: PillAdapter::new(),
+        pill: PillAdapter::new(hook_tx),
+        hook_rx,
         transcriber,
         cfg,
         settings_child: None,
@@ -156,6 +161,10 @@ struct App {
     /// residency toggle, the fullscreen watcher and the hover poller follow.
     pill_core: Pill,
     pill: PillAdapter,
+    /// The messages winit doesn't surface, posted by the pill window's wndproc
+    /// subclass. Nothing acts on them yet — the home monitor (#43), the
+    /// fullscreen watcher (#45) and the wakeup ladder (#49) are their consumers.
+    hook_rx: crossbeam_channel::Receiver<HookEvent>,
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
     settings_child: Option<std::process::Child>,
@@ -442,6 +451,20 @@ impl ApplicationHandler for App {
             self.refresh_tray();
         }
 
+        // The messages winit doesn't surface, arriving from the pill window's
+        // wndproc subclass. Drained and logged rather than acted on: the hook
+        // is a prefactor, and its consumers land one ticket at a time. Draining
+        // is not optional — an unread channel would grow for the life of the
+        // process.
+        while let Ok(ev) = self.hook_rx.try_recv() {
+            match ev {
+                HookEvent::DisplayChanged => tracing::info!("display topology changed"),
+                HookEvent::DpiChanged { dpi } => tracing::info!(dpi, "pill monitor dpi changed"),
+                HookEvent::DisplayPower { on } => tracing::info!(on, "session display power"),
+                HookEvent::SessionLock { locked } => tracing::info!(locked, "session lock"),
+            }
+        }
+
         // At most one message, only when a newer release exists.
         if let Ok(info) = self.update_rx.try_recv() {
             self.update_available = Some(info);
@@ -584,6 +607,9 @@ impl App {
 /// `Recording`. It holds no lifecycle rules.
 struct PillAdapter {
     window: Option<pill::window::PillWindow>,
+    /// Handed to each window it creates, so the wndproc hook can post to the
+    /// app loop.
+    hook_tx: crossbeam_channel::Sender<HookEvent>,
     bands: audio::level::BandMeter,
     /// Most recent waveform bars, frozen and reused once capture stops.
     last_bars: Vec<f32>,
@@ -594,9 +620,10 @@ struct PillAdapter {
 }
 
 impl PillAdapter {
-    fn new() -> Self {
+    fn new(hook_tx: crossbeam_channel::Sender<HookEvent>) -> Self {
         Self {
             window: None,
+            hook_tx,
             bands: audio::level::BandMeter::new(pill::BAR_COUNT),
             last_bars: vec![0.0; pill::BAR_COUNT],
             mode: None,
@@ -615,7 +642,7 @@ impl PillAdapter {
     /// Build the window, off screen. A failure leaves us without one; every
     /// later command is a no-op until the core asks for another.
     fn create(&mut self, el: &ActiveEventLoop) {
-        match pill::window::PillWindow::create(el) {
+        match pill::window::PillWindow::create(el, self.hook_tx.clone()) {
             Ok(pw) => self.window = Some(pw),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create pill window");
