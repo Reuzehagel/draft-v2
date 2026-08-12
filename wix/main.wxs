@@ -7,8 +7,11 @@
     cargo wix --no-build --nocapture
 
   The MSI installs to %LOCALAPPDATA%\Programs\Draft so it works without
-  admin. It ships draft.exe and the onnxruntime.dll that ort placed in
-  target\release. The HKCU\Run autostart entry is NOT written by the
+  admin. It ships draft.exe, its console sibling draft-cli.exe, and the
+  onnxruntime.dll that ort placed in target\release. Both binaries are
+  installed side by side: draft-cli.exe reads the same config.toml and the
+  same credentials, and is useless without them.
+  The HKCU\Run autostart entry is NOT written by the
   installer — Draft manages that itself from the settings window so the
   user's choice survives reinstall.
 -->
@@ -48,6 +51,12 @@
                     KeyPath="yes"
                     Checksum="yes" />
             </Component>
+            <Component Id="CliExecutable" Guid="e5d4c3b2-1a09-4f8e-b7c6-5d4e3f2a1b09">
+              <File Id="DraftCliExe"
+                    Source="target\release\draft-cli.exe"
+                    KeyPath="yes"
+                    Checksum="yes" />
+            </Component>
             <Component Id="OnnxRuntimeDll" Guid="c4b1f3e2-7d8a-4e2b-9f3c-1a5e8d6b4f02">
               <File Id="OnnxRuntime"
                     Source="target\release\onnxruntime.dll"
@@ -81,6 +90,7 @@
     <Feature Id="Complete" Title="Draft" Level="1" Display="expand"
              ConfigurableDirectory="APPLICATIONFOLDER" AllowAdvertise="no">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="CliExecutable" />
       <ComponentRef Id="OnnxRuntimeDll" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
