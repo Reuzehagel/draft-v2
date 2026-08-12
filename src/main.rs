@@ -67,9 +67,9 @@ fn main() -> Result<()> {
     let (cfg, first_run) = config::Config::load_with_first_run()?;
     tracing::info!(?cfg, first_run, "config loaded");
 
-    let _update_state = update::spawn_check();
+    let update_rx = update::spawn_check();
 
-    let tray = tray::build(&format!("Draft — {}", cfg.hotkey))?;
+    let tray = tray::build(&tray_status(&cfg, None))?;
     let menu_rx = tray::menu_event_receiver();
 
     let command_spec = cfg.push_to_command.then(|| cfg.command_hotkey.clone());
@@ -103,6 +103,8 @@ fn main() -> Result<()> {
         settings_child: None,
         outcome_tx,
         outcome_rx,
+        update_rx,
+        update_available: None,
     };
     if first_run {
         tracing::info!("first run detected; opening settings");
@@ -112,6 +114,18 @@ fn main() -> Result<()> {
 
     drop(guard);
     Ok(())
+}
+
+/// Gather what the tray should currently say. Called at the events that can
+/// change it — startup, config reload, a finished dictation, the update check
+/// reporting — never on a timer.
+fn tray_status(cfg: &config::Config, update: Option<&update::UpdateInfo>) -> tray::Status {
+    tray::Status {
+        hotkey: cfg.hotkey.clone(),
+        provider: cfg.provider,
+        update: update.map(|u| u.latest_version.clone()),
+        has_history: !history::is_empty(),
+    }
 }
 
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
@@ -141,6 +155,10 @@ struct App {
     /// Workers report their outcome here; polled each loop on the UI thread.
     outcome_tx: crossbeam_channel::Sender<(u64, session::Outcome)>,
     outcome_rx: crossbeam_channel::Receiver<(u64, session::Outcome)>,
+    /// One-shot: the update check reports here if a newer release exists.
+    update_rx: crossbeam_channel::Receiver<update::UpdateInfo>,
+    /// Kept so the tooltip still mentions the update after later refreshes.
+    update_available: Option<update::UpdateInfo>,
 }
 
 impl App {
@@ -313,6 +331,12 @@ impl App {
         });
     }
 
+    /// Re-read what the tray should say and push it to the shell.
+    fn refresh_tray(&self) {
+        self.tray
+            .apply(&tray_status(&self.cfg, self.update_available.as_ref()));
+    }
+
     /// Put the most recent transcript back on the clipboard, so a paste that
     /// landed nowhere can be recovered with a manual Ctrl+V. No-op (logged) if
     /// the history is empty or the clipboard can't be opened.
@@ -388,6 +412,15 @@ impl ApplicationHandler for App {
         while let Ok((id, outcome)) = self.outcome_rx.try_recv() {
             let cmds = self.session.on_outcome(id, outcome, Instant::now());
             self.run_commands(cmds, el);
+            // A finished dictation may have been the first transcript ever
+            // recorded, which is what enables "Copy last transcription".
+            self.refresh_tray();
+        }
+
+        // At most one message, only when a newer release exists.
+        if let Ok(info) = self.update_rx.try_recv() {
+            self.update_available = Some(info);
+            self.refresh_tray();
         }
 
         // Free the on-device model if dictation has been idle long enough.
@@ -461,6 +494,9 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "config reload failed");
+                // The settings session may still have cleared the history even
+                // though its config didn't load — don't leave the menu stale.
+                self.refresh_tray();
                 return;
             }
         };
@@ -510,6 +546,9 @@ impl App {
         self.session
             .set_transcriber_available(self.transcriber.is_some());
         self.cfg = new_cfg;
+        // The tooltip names the hotkey and provider, and settings can clear
+        // the history — so the tray follows a settings change without a restart.
+        self.refresh_tray();
     }
 }
 

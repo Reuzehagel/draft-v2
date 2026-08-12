@@ -97,6 +97,22 @@ pub enum Provider {
     Reson8,
 }
 
+impl Provider {
+    /// Human-readable name, shared by the settings UI and the tray tooltip so
+    /// the two never disagree about what a provider is called.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::LocalParakeet => "Local (Parakeet)",
+            Provider::Mistral => "Mistral (Voxtral)",
+            Provider::Groq => "Groq",
+            Provider::Openai => "OpenAI",
+            Provider::Xai => "xAI",
+            Provider::Elevenlabs => "ElevenLabs",
+            Provider::Reson8 => "Reson8",
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

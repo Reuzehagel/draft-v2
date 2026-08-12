@@ -445,9 +445,9 @@ impl SettingsApp {
     fn tab_transcription(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         group(ui, |ui| {
             row(ui, "Provider", "Where your audio is transcribed.", |ui| {
-                let sel = provider_label(self.cfg.provider);
+                let sel = self.cfg.provider.label();
                 let options: Vec<(Provider, &str)> =
-                    ALL_PROVIDERS.iter().map(|&p| (p, provider_label(p))).collect();
+                    ALL_PROVIDERS.iter().map(|&p| (p, p.label())).collect();
                 combo(ui, "provider", &mut self.cfg.provider, sel, &options);
             });
 
@@ -888,7 +888,7 @@ impl SettingsApp {
             let configured = !self.keys.get(dlg.provider).trim().is_empty();
             let scrim_clicked = modal_card(ctx, "key_dialog", |ui| {
                 ui.label(
-                    RichText::new(format!("{} API key", provider_label(dlg.provider)))
+                    RichText::new(format!("{} API key", dlg.provider.label()))
                         .size(15.0)
                         .strong()
                         .color(FG),
@@ -1074,15 +1074,4 @@ fn relative_time(now: i64, ts: i64) -> String {
     }
 }
 
-fn provider_label(p: Provider) -> &'static str {
-    match p {
-        Provider::LocalParakeet => "Local (Parakeet)",
-        Provider::Mistral => "Mistral (Voxtral)",
-        Provider::Groq => "Groq",
-        Provider::Openai => "OpenAI",
-        Provider::Xai => "xAI",
-        Provider::Elevenlabs => "ElevenLabs",
-        Provider::Reson8 => "Reson8",
-    }
-}
 

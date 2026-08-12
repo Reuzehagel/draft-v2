@@ -69,6 +69,16 @@ pub fn last() -> Option<Entry> {
         .and_then(|l| serde_json::from_str(l).ok())
 }
 
+/// Whether any transcript has been recorded. A metadata check, not a read —
+/// the tray asks this after every dictation just to decide whether to offer
+/// "Copy last transcription", and that runs on the UI thread.
+pub fn is_empty() -> bool {
+    let Ok(path) = history_path() else {
+        return true;
+    };
+    std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true)
+}
+
 /// Wipe the history file. Best-effort — a missing file is already "clear".
 pub fn clear() -> Result<()> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

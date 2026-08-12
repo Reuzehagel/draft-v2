@@ -1,13 +1,14 @@
 // Best-effort update check. On startup we spawn a thread that hits the
-// GitHub Releases API; the result lands in an atomic that the tray
-// tooltip + settings window can read at their leisure. Network failure
-// is silent — this is informational, never blocking.
+// GitHub Releases API; if (and only if) a newer release exists it sends one
+// message down a channel the event loop already drains, and the tray tooltip
+// picks it up. Network failure is silent — this is informational, never
+// blocking, and nothing is sent when we're already current.
 //
 // Set RELEASES_URL to your repo's releases endpoint when publishing. An
-// empty value short-circuits the check (useful during dev).
+// empty value short-circuits the check (useful during dev) — the channel is
+// then simply never written to, so the tooltip stays silent about updates.
 
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
 
 const RELEASES_URL: &str = "";
 const USER_AGENT: &str = concat!("Draft/", env!("CARGO_PKG_VERSION"));
@@ -16,51 +17,33 @@ const USER_AGENT: &str = concat!("Draft/", env!("CARGO_PKG_VERSION"));
 pub struct UpdateInfo {
     pub latest_version: String,
     /// Release page to open — consumed once the update UI is wired up
-    /// (the whole check is dormant until RELEASES_URL is set).
+    /// (the tooltip only names the version).
     #[allow(dead_code)]
     pub url: String,
 }
 
-#[derive(Default)]
-pub struct UpdateState {
-    pub checked: bool,
-    pub available: Option<UpdateInfo>,
-    pub error: Option<String>,
-}
-
-pub type SharedUpdateState = Arc<Mutex<UpdateState>>;
-
-pub fn spawn_check() -> SharedUpdateState {
-    let state: SharedUpdateState = Arc::new(Mutex::new(UpdateState::default()));
+/// Start the check. The returned receiver yields at most one `UpdateInfo`, and
+/// only when a newer release exists; every other outcome (dormant, offline,
+/// already current) leaves it empty forever.
+pub fn spawn_check() -> crossbeam_channel::Receiver<UpdateInfo> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
     if RELEASES_URL.is_empty() {
-        return state;
+        return rx;
     }
-    let st = state.clone();
-    std::thread::spawn(move || {
-        match check() {
-            Ok(Some(info)) => {
-                tracing::info!(
-                    latest = %info.latest_version,
-                    current = env!("CARGO_PKG_VERSION"),
-                    "update available"
-                );
-                let mut s = st.lock().unwrap();
-                s.checked = true;
-                s.available = Some(info);
-            }
-            Ok(None) => {
-                let mut s = st.lock().unwrap();
-                s.checked = true;
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "update check failed (silently ignored)");
-                let mut s = st.lock().unwrap();
-                s.checked = true;
-                s.error = Some(e.to_string());
-            }
+    std::thread::spawn(move || match check() {
+        Ok(Some(info)) => {
+            tracing::info!(
+                latest = %info.latest_version,
+                current = env!("CARGO_PKG_VERSION"),
+                "update available"
+            );
+            // A failed send only means the app is shutting down.
+            let _ = tx.send(info);
         }
+        Ok(None) => tracing::debug!("update check: already on the latest release"),
+        Err(e) => tracing::debug!(error = %e, "update check failed (silently ignored)"),
     });
-    state
+    rx
 }
 
 #[derive(Deserialize)]
