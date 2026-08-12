@@ -1,9 +1,11 @@
 // Draft — Windows push-to-talk speech-to-text.
 //
-// The dictation lifecycle lives in `session` as a pure command-returning core.
-// This file is the adapter: it translates winit/hotkey/tray events into
-// `Session` inputs, executes the `Command`s the core returns (open the mic,
-// drive the pill, spawn a worker), and feeds worker outcomes back by id.
+// The dictation lifecycle lives in `session` as a pure command-returning core,
+// and the pill's own life in `pill::core` as a second one beside it. This file
+// is the adapter: it translates winit/hotkey/tray events into `Session` inputs,
+// executes the `Command`s that core returns (open the mic, spawn a worker, and
+// report what the session is doing to the Pill core), performs the Pill core's
+// commands against a real window, and feeds worker outcomes back by id.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -33,7 +35,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::session::{Command, PillMode, Session, SessionKind};
+use crate::pill::core::{Pill, PillMode};
+use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -97,6 +100,7 @@ fn main() -> Result<()> {
         hotkey_handle: Some(hotkey_handle),
         hotkey_rx,
         session,
+        pill_core: Pill::new(),
         pill: PillAdapter::new(),
         transcriber,
         cfg,
@@ -145,9 +149,12 @@ struct App {
     hotkey_handle: Option<hotkey::HotkeyHandle>,
     hotkey_rx: crossbeam_channel::Receiver<hotkey::HotkeyEvent>,
     /// The pure dictation lifecycle. Owns both activation FSMs (dictate and
-    /// push-to-command), the capture handle, tail, session id, and session kind;
+    /// push-to-command), the capture handle, session id, and session kind;
     /// hands back `Command`s to perform.
     session: Session<audio::capture::Capture>,
+    /// The pure owner of the pill's life. `Session` is one of its drivers; the
+    /// residency toggle, the fullscreen watcher and the hover poller follow.
+    pill_core: Pill,
     pill: PillAdapter,
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
@@ -162,9 +169,10 @@ struct App {
 }
 
 impl App {
-    /// Execute the `Command`s the core returned. `StartCapture` is the one
-    /// effect that reports a result straight back into the core, whose follow-up
-    /// commands (show the pill, or nothing on failure) are executed in turn.
+    /// Execute the `Command`s the session core returned. `StartCapture` is the
+    /// one effect that reports a result straight back into the core, whose
+    /// follow-up commands (a Recording report, or nothing on failure) are
+    /// executed in turn.
     fn run_commands(&mut self, cmds: Vec<Command>, el: &ActiveEventLoop) {
         let mut queue: VecDeque<Command> = cmds.into_iter().collect();
         while let Some(cmd) = queue.pop_front() {
@@ -192,13 +200,29 @@ impl App {
                     };
                     queue.extend(more);
                 }
-                Command::SetPill(mode) => self.pill.set_mode(mode, el),
-                Command::DismissPill => self.pill.dismiss(),
+                Command::ReportActivity(activity) => {
+                    let cmds = self.pill_core.on_session(activity, Instant::now());
+                    self.run_pill_commands(cmds, el);
+                }
                 Command::SpawnTranscription {
                     samples,
                     session_id,
                     session_kind,
                 } => self.spawn_worker(samples, session_id, session_kind),
+            }
+        }
+    }
+
+    /// Perform the Pill core's commands. Nothing here decides anything: the
+    /// core says create/show/hide/destroy and which mode, the adapter obeys.
+    fn run_pill_commands(&mut self, cmds: Vec<pill::core::Command>, el: &ActiveEventLoop) {
+        for cmd in cmds {
+            match cmd {
+                pill::core::Command::Create => self.pill.create(el),
+                pill::core::Command::SetMode(mode) => self.pill.set_mode(mode),
+                pill::core::Command::Show => self.pill.show(),
+                pill::core::Command::Hide => self.pill.hide(),
+                pill::core::Command::Destroy => self.pill.destroy(),
             }
         }
     }
@@ -407,10 +431,11 @@ impl ApplicationHandler for App {
             self.run_commands(cmds, el);
         }
 
-        // Workers report their outcome here; the core transitions the pill to
-        // its terminal flash (or dismisses it) and ignores stale ids.
+        // Workers report their outcome here; the session core ignores stale ids
+        // and reports its last activity, which the Pill core turns into a
+        // terminal flash (or into nothing, when there was nothing to say).
         while let Ok((id, outcome)) = self.outcome_rx.try_recv() {
-            let cmds = self.session.on_outcome(id, outcome, Instant::now());
+            let cmds = self.session.on_outcome(id, outcome);
             self.run_commands(cmds, el);
             // A finished dictation may have been the first transcript ever
             // recorded, which is what enables "Copy last transcription".
@@ -430,8 +455,8 @@ impl ApplicationHandler for App {
         }
 
         // Retire the pill once its terminal flash has run its course.
-        let cmds = self.session.tick(Instant::now());
-        self.run_commands(cmds, el);
+        let cmds = self.pill_core.tick(Instant::now());
+        self.run_pill_commands(cmds, el);
 
         // When the pill is up, drive frame redraws ourselves at ~30 Hz.
         // Otherwise idle wait so we don't spin.
@@ -552,10 +577,11 @@ impl App {
     }
 }
 
-/// The pill window and its animation, driven by a logical [`PillMode`] the core
-/// assigns. The core decides *what* mode and *when* to transition; the adapter
-/// derives every frame's bars, breathing pulse, and fade — including freezing
-/// the bars the moment the mode leaves `Recording`.
+/// The pill window and its animation, driven by the [`PillMode`] the Pill core
+/// derives. The core decides *what* mode, *when* to transition, and whether a
+/// window exists at all; the adapter derives every frame's bars, breathing
+/// pulse, and fade — including freezing the bars the moment the mode leaves
+/// `Recording`. It holds no lifecycle rules.
 struct PillAdapter {
     window: Option<pill::window::PillWindow>,
     bands: audio::level::BandMeter,
@@ -586,38 +612,54 @@ impl PillAdapter {
         self.window.is_some()
     }
 
-    /// Apply a mode set by the core. `Recording` starts a fresh session — a new
-    /// window, dropping any lingering flash pill; the rest just swap the mode,
-    /// so the next redraw freezes the bars (Processing/Done render `last_bars`
-    /// without touching the ring).
-    fn set_mode(&mut self, mode: PillMode, el: &ActiveEventLoop) {
-        if let PillMode::Recording = mode {
-            match pill::window::PillWindow::create(el) {
-                Ok(mut pw) => {
-                    self.bands.reset();
-                    // Paint one frame BEFORE showing so the initial reveal is
-                    // already the pill (not a transparent rectangle).
-                    let initial = vec![0.0; pill::BAR_COUNT];
-                    let _ = pw.render_recording(&initial);
-                    pw.show();
-                    self.window = Some(pw);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to create pill window");
-                    self.window = None;
-                }
+    /// Build the window, off screen. A failure leaves us without one; every
+    /// later command is a no-op until the core asks for another.
+    fn create(&mut self, el: &ActiveEventLoop) {
+        match pill::window::PillWindow::create(el) {
+            Ok(pw) => self.window = Some(pw),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create pill window");
+                self.window = None;
             }
         }
-        self.mode = Some(mode);
     }
 
-    /// Tear the pill down immediately (no flash).
-    fn dismiss(&mut self) {
+    /// Apply a mode the core derived. Entering `Recording` starts the meter from
+    /// silence and paints one frame immediately, so the reveal that follows is
+    /// already the pill (not a transparent rectangle); the rest just swap the
+    /// mode, so the next redraw freezes the bars (Processing/Done render
+    /// `last_bars` without touching the ring).
+    fn set_mode(&mut self, mode: PillMode) {
+        let entering_recording = matches!(mode, PillMode::Recording { .. })
+            && !matches!(self.mode, Some(PillMode::Recording { .. }));
+        self.mode = Some(mode);
+        if entering_recording {
+            self.bands.reset();
+            self.last_bars = vec![0.0; pill::BAR_COUNT];
+            if let Some(pw) = self.window.as_mut() {
+                let _ = pw.render_recording(&self.last_bars);
+            }
+        }
+    }
+
+    fn show(&self) {
+        if let Some(pw) = self.window.as_ref() {
+            pw.show();
+        }
+    }
+
+    fn hide(&self) {
+        if let Some(pw) = self.window.as_ref() {
+            pw.hide();
+        }
+    }
+
+    /// Tear the window down. The ring goes with it — it belongs to a capture
+    /// that is long over by the time the pill has no reason to exist.
+    fn destroy(&mut self) {
         self.mode = None;
         self.ring = None;
-        if let Some(pw) = self.window.take() {
-            drop(pw);
-        }
+        drop(self.window.take());
     }
 
     fn redraw(&mut self) {
@@ -628,7 +670,7 @@ impl PillAdapter {
             // Terminal flash: green (delivered) or red (failed) border over the
             // frozen bars, holding then fading over the final 30% of the linger.
             Some(PillMode::Done { ok, since }) => {
-                let total = session::linger(ok).as_secs_f32();
+                let total = pill::core::linger(ok).as_secs_f32();
                 let t = (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
                 let alpha = if t < 0.7 {
                     1.0
@@ -653,9 +695,13 @@ impl PillAdapter {
                     tracing::error!(error = %e, "pill processing render failed");
                 }
             }
-            // Live capture (or a just-created window): animate bars from the
-            // ring buffer and keep `last_bars` current for the freeze.
-            Some(PillMode::Recording) | None => {
+            // Nothing to paint. `Idle` and `Expanded` are unreachable while
+            // presence is pinned to `Off`; the nub they render lands with
+            // residency itself (#17, #27).
+            Some(PillMode::Hidden) | Some(PillMode::Idle) | Some(PillMode::Expanded) | None => {}
+            // Live capture: animate bars from the ring buffer and keep
+            // `last_bars` current for the freeze.
+            Some(PillMode::Recording { .. }) => {
                 let bars = if let Some(ring) = self.ring.as_ref() {
                     let raw = self.bands.tick(ring).to_vec();
                     audio::level::shape_bars(&raw)

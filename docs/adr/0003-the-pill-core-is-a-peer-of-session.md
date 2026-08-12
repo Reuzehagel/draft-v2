@@ -1,10 +1,10 @@
 ---
-status: accepted, not yet implemented (see #39)
+status: accepted
 ---
 
 # The Pill core is a peer of Session, not downstream of it
 
-Today `Session` authors the pill: it emits `SetPill` and `DismissPill`, and owns the terminal flash's linger in its own `Phase`. That works only while the pill's life *is* the session's life. The resident pill breaks that assumption — the pill will exist when no session does. So the pill gets its own pure core, peer to `Session`, holding **Presence** × **Activity** and deriving the **pill mode** itself; `Session` becomes one of its drivers rather than its author.
+`Session` used to author the pill: it emitted `SetPill` and `DismissPill`, and owned the terminal flash's linger in its own `Phase`. That works only while the pill's life *is* the session's life. The resident pill breaks that assumption — the pill will exist when no session does. So the pill gets its own pure core, peer to `Session`, holding **Presence** × **Activity** and deriving the **pill mode** itself; `Session` becomes one of its drivers rather than its author.
 
 ## Why not keep Session driving the pill
 
@@ -27,4 +27,4 @@ Rules in the adapter are unreachable by tests. Everything below this layer — `
 
 ## Status
 
-Specified in [#39](https://github.com/Reuzehagel/draft-v2/issues/39) and not yet built — `Session` still emits `SetPill` today. `CONTEXT.md` carries the vocabulary ahead of the code. The ticket ships the seam with presence pinned to `Off`, so behaviour on screen is unchanged until residency itself lands.
+Built in [#39](https://github.com/Reuzehagel/draft-v2/issues/39) as `src/pill/core.rs`. Presence is pinned to `Off` — nothing constructs `Suppressed` or `Resident` yet — so behaviour on screen is unchanged until residency itself lands (#19, #22, #23). The rules those drivers will hit are already asserted against the command list.
