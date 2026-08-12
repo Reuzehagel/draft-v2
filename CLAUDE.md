@@ -4,27 +4,20 @@ Windows push-to-talk speech-to-text: hold a global hotkey, speak, release, and t
 
 ## Commands
 
-```
-cargo build            # debug build
-cargo test             # unit tests (activation FSM, voice commands, replacements, WAV encoding)
-cargo clippy           # keep warning-free; dead-code warnings have been cleaned up deliberately
-cargo build --release  # LTO + stripped; the shipped binary
-```
-
-Windows-only — `cpal`, `global-hotkey`, and the `windows` crate make this non-portable. There is no CI; run tests and clippy locally before committing.
+`cargo test` covers the activation FSM, voice commands, replacements, and WAV encoding. There is no CI — run tests and `cargo clippy` locally before committing; clippy stays warning-free (dead-code warnings were cleaned up deliberately). Windows-only: `cpal`, `global-hotkey`, and the `windows` crate make this non-portable.
 
 ## Architecture
 
 Two processes from one binary:
 
-- **Main process** (`main.rs`): single-instance gate, tray icon, global hotkeys, winit event loop. Owns the dictation state machine.
+- **Main process** (`main.rs`): single-instance gate, tray icon, global hotkeys, winit event loop. It is the *adapter* — it performs the Commands that `session.rs` returns.
 - **Settings subprocess**: the same exe relaunched with `--settings`, running eframe/egui (`settings_ui/`). The main process polls for its exit and reloads `config.toml` afterward — settings never talk to the main process directly.
 
-Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/toggle/double-press-lock) → `audio/` (cpal capture, resample to 16 kHz mono) → worker thread → `transcribe/` → `postprocess/` (voice commands, then replacements) → `paste.rs` (clipboard+Ctrl+V or SendInput unicode). The pill overlay (`pill/`) renders mic bars during capture, a breathing border while the worker runs, then a green/red flash for the real outcome — workers report back over a channel with a session id so a stale worker can't repaint a newer pill.
-
-`transcribe/` providers: local Parakeet (onnx via `transcribe-rs`, lazily loaded, unloaded after 5 min idle), Mistral, Reson8, and OpenAI/Groq through `openai_compat.rs`. `FallbackTranscriber` wraps cloud providers with the local model when enabled. The `Xai` and `Elevenlabs` enum variants exist in config but are not implemented.
+Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/toggle/double-press-lock) → `session.rs` (pure core: events + `now` in, Commands out) → `audio/` (cpal capture, resample to 16 kHz mono) → worker thread → `transcribe/` → `postprocess/` (voice commands, then replacements) → `paste.rs` (clipboard+Ctrl+V or SendInput unicode). `pill/` is a peer core, not downstream of dictation.
 
 Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat model as an instruction and pastes the answer; it skips the postprocess pipeline.
+
+The `Xai` and `Elevenlabs` config variants are not implemented.
 
 ## Facts that bite
 
@@ -36,14 +29,6 @@ Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat
 
 ## Agent skills
 
-### Issue tracker
-
-Issues and PRDs live as GitHub issues (`Reuzehagel/draft-v2`), managed via the `gh` CLI. External PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Five canonical triage roles using default label names (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+- **Naming anything** — a type, a test, an issue title: `CONTEXT.md` is the glossary and binds the vocabulary. Read `docs/adr/` before working in an area it touches. Details: `docs/agents/domain.md`.
+- **Issues and PRDs** live as GitHub issues (`Reuzehagel/draft-v2`) via `gh`; external PRs are not a triage surface. Conventions: `docs/agents/issue-tracker.md`.
+- **Triage labels** are the default names (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
