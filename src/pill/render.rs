@@ -3,9 +3,9 @@
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
-// The pill's proportions, authored against the 86x42 recording pill and kept
-// as fractions of the render target so the same drawing code holds at any
-// size — a resized recording pill, or a much smaller idle one.
+// The pill's proportions, authored against an 86x42 draft and kept as fractions
+// of the render target so the same drawing code holds at any size — the 62x28
+// the session pill settled on, or a much smaller idle one.
 
 /// Corner radius as a fraction of the target's shorter side. Clamped to half
 /// the body height, so small targets round fully on their own.
@@ -94,6 +94,28 @@ const ERROR: (u8, u8, u8) = (214, 96, 96);
 // is still in flight.
 const PROCESSING: (u8, u8, u8) = (190, 192, 200);
 
+/// A stroke on the pill's edge: a colour and its own alpha, before the whole
+/// pill's fade is applied on top.
+#[derive(Clone, Copy)]
+struct Edge {
+    rgb: (u8, u8, u8),
+    a: u8,
+}
+
+// The edge the pill is *found* by, drawn on every mode under whatever accent
+// that mode adds. The body is near-black, so on a black desktop nothing but a
+// light edge separates it — and fill alpha is not the dial that fixes that: a
+// dark body on a dark background is invisible at any alpha.
+const HAIRLINE: Edge = Edge {
+    rgb: (220, 224, 232),
+    a: 120,
+};
+
+/// The bar row's opacity once the handoff is over and the row is only being
+/// held. Full opacity during the handoff itself, since the row is still the
+/// waveform the user was watching.
+const PROCESSING_BARS_ALPHA: f32 = 0.45;
+
 pub fn clear_transparent(pm: &mut Pixmap) {
     pm.fill(Color::TRANSPARENT);
 }
@@ -101,53 +123,83 @@ pub fn clear_transparent(pm: &mut Pixmap) {
 pub fn draw_recording(pm: &mut Pixmap, scale: f32, bar_heights: &[f32]) {
     let g = Geometry::of(pm, scale);
     clear_transparent(pm);
-    draw_pill_bg(pm, &g);
+    // Recording wears the bare hairline: the bars are what say "live".
+    draw_pill_shape(pm, &g, None, 1.0);
     draw_bars(pm, &g, bar_heights, 1.0);
 }
 
-/// Success state shown briefly after a capture ends: the hairline turns a soft
-/// green while the (frozen) waveform bars hold. `alpha` (0..1) multiplies the
-/// whole pill for the fade-out at the end.
+/// Success state shown briefly after a capture ends: a soft green over the
+/// hairline, above the flat bar row. `alpha` (0..1) multiplies the whole pill
+/// for the fade-out at the end.
 pub fn draw_success(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
     // Clamp so an easing overshoot/undershoot can't produce a negative alpha
     // (which `as u8` would turn into 0, blanking the whole pill for a frame).
     let alpha = alpha.clamp(0.0, 1.0);
     let g = Geometry::of(pm, scale);
     clear_transparent(pm);
-    draw_pill_shape(pm, &g, SUCCESS, 235, alpha);
+    draw_pill_shape(pm, &g, Some(Edge { rgb: SUCCESS, a: 235 }), alpha);
     draw_bars(pm, &g, bar_heights, alpha);
 }
 
-/// Failure state: same shape as success but a muted red border, telling the
-/// user the transcript never made it (transcription or paste error) so they
-/// can recover it from History. `alpha` drives the same end fade-out.
+/// Failure state: same shape as success but a muted red, telling the user the
+/// transcript never made it (transcription or paste error) so they can recover
+/// it from History. `alpha` drives the same end fade-out.
 pub fn draw_error(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], alpha: f32) {
     let alpha = alpha.clamp(0.0, 1.0);
     let g = Geometry::of(pm, scale);
     clear_transparent(pm);
-    draw_pill_shape(pm, &g, ERROR, 235, alpha);
+    draw_pill_shape(pm, &g, Some(Edge { rgb: ERROR, a: 235 }), alpha);
     draw_bars(pm, &g, bar_heights, alpha);
 }
 
-/// "Working" state shown while the worker transcribes and pastes. The frozen
-/// waveform bars hold, dimmed, behind a neutral border that breathes via
-/// `pulse` (0..1) so a multi-second cloud round-trip still reads as live.
-pub fn draw_processing(pm: &mut Pixmap, scale: f32, bar_heights: &[f32], pulse: f32) {
+/// "Working" state shown while the worker transcribes and pastes: a flat bar
+/// row under a neutral border that breathes via `pulse` (0..1), so a
+/// multi-second cloud round-trip still reads as live.
+///
+/// `handoff_progress` is how far past the Recording → Processing handoff this
+/// frame is — 0 at the mode change, 1 once the handoff is over. It drives
+/// everything this mode does *not* share with recording: the neutral border
+/// crossfades in over it, and the bar row dims to [`PROCESSING_BARS_ALPHA`] on
+/// the same ramp. At 0 this draws exactly what recording draws, which is the
+/// point — the handoff is 320 ms of animation, not a swap with animation either
+/// side of it.
+pub fn draw_processing(
+    pm: &mut Pixmap,
+    scale: f32,
+    bar_heights: &[f32],
+    pulse: f32,
+    handoff_progress: f32,
+) {
     let pulse = pulse.clamp(0.0, 1.0);
+    let progress = handoff_progress.clamp(0.0, 1.0);
     let g = Geometry::of(pm, scale);
     clear_transparent(pm);
-    // Border alpha breathes between a dim and a brighter grey.
-    let border_a = (110.0 + 110.0 * pulse) as u8;
-    draw_pill_shape(pm, &g, PROCESSING, border_a, 1.0);
-    draw_bars(pm, &g, bar_heights, 0.45);
+    // Border alpha breathes between a dim and a brighter grey, faded in by the
+    // handoff so the colour arrives with the bars' fall rather than ahead of it.
+    let border_a = ((110.0 + 110.0 * pulse) * progress) as u8;
+    draw_pill_shape(
+        pm,
+        &g,
+        Some(Edge {
+            rgb: PROCESSING,
+            a: border_a,
+        }),
+        1.0,
+    );
+    draw_bars(
+        pm,
+        &g,
+        bar_heights,
+        1.0 - (1.0 - PROCESSING_BARS_ALPHA) * progress,
+    );
 }
 
-fn draw_pill_bg(pm: &mut Pixmap, g: &Geometry) {
-    // Recording: faint soft-grey hairline, fully opaque.
-    draw_pill_shape(pm, g, (170, 172, 178), 64, 1.0);
-}
-
-fn draw_pill_shape(pm: &mut Pixmap, g: &Geometry, border_rgb: (u8, u8, u8), border_a: u8, alpha: f32) {
+/// The body, its hairline, and — for every mode but recording — an `accent`
+/// stroked over that hairline on the same 1px path. Over rather than instead:
+/// the accent is what the mode *says*, the hairline is how the pill is found at
+/// all, and a green that has breathed or faded down must not take the pill's
+/// edge with it.
+fn draw_pill_shape(pm: &mut Pixmap, g: &Geometry, accent: Option<Edge>, alpha: f32) {
     let mut pb = PathBuilder::new();
     rounded_rect(&mut pb, g.inset, g.inset, g.body_w, g.body_h, g.corner_r);
     let path = pb.finish().unwrap();
@@ -157,14 +209,20 @@ fn draw_pill_shape(pm: &mut Pixmap, g: &Geometry, border_rgb: (u8, u8, u8), bord
     fill.anti_alias = true;
     pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
-    let mut border = Paint::default();
-    border.set_color_rgba8(border_rgb.0, border_rgb.1, border_rgb.2, (border_a as f32 * alpha) as u8);
-    border.anti_alias = true;
     let stroke = Stroke {
         width: g.border_w,
         ..Default::default()
     };
-    pm.stroke_path(&path, &border, &stroke, Transform::identity(), None);
+    let mut edge = |e: Edge| {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(e.rgb.0, e.rgb.1, e.rgb.2, (e.a as f32 * alpha) as u8);
+        paint.anti_alias = true;
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    };
+    edge(HAIRLINE);
+    if let Some(accent) = accent {
+        edge(accent);
+    }
 }
 
 fn draw_bars(pm: &mut Pixmap, g: &Geometry, bar_heights: &[f32], alpha: f32) {
@@ -239,19 +297,46 @@ mod tests {
     use super::*;
     use crate::pill::BAR_COUNT;
 
-    // The geometry the pill shipped with at its 86x42 logical size. Deriving
-    // the values from the target must reproduce these exactly, or the shipped
-    // pill changes appearance.
+    use crate::pill::{PILL_H, PILL_W};
+    use tiny_skia::PremultipliedColorU8;
+
+    /// A flat row — what every state but recording actually draws.
+    const FLAT: [f32; BAR_COUNT] = [0.0; BAR_COUNT];
+
+    /// One pill mode, named and paired with a call that draws it.
+    type Mode = (&'static str, fn(&mut Pixmap));
+
+    // The ratios pinned at the size the session pill actually ships at, so a
+    // change to one of them shows up as a number here rather than only on
+    // screen. Judged by eye at 62x28 — see #41.
     #[test]
-    fn reference_size_reproduces_the_shipped_geometry() {
-        let g = Geometry::new(86.0, 42.0, 1.0);
+    fn the_shipped_size_derives_the_geometry_it_was_judged_at() {
+        let g = Geometry::new(PILL_W as f32, PILL_H as f32, 1.0);
         assert_eq!(g.border_w, 1.0);
         assert_eq!(g.inset, 1.5);
-        assert_eq!(g.corner_r, 18.0);
-        assert_eq!(g.bar_w, 2.5);
-        assert_eq!(g.bar_gap, 2.5);
-        assert_eq!(g.bar_min_h, 6.25);
-        assert_eq!(g.bar_max_h, 32.0);
+        // Half a pixel short of half the body height — the ratio's own slight
+        // flattening, held over from 86x42 and invisible at this size.
+        assert_eq!(g.corner_r, 12.0);
+        assert!(g.body_h / 2.0 - g.corner_r <= 0.5);
+        assert!((g.bar_w - 1.802).abs() < 0.001);
+        assert!((g.bar_gap - 1.802).abs() < 0.001);
+        assert!((g.bar_min_h - 4.506).abs() < 0.001);
+        assert!((g.bar_max_h - 21.333).abs() < 0.001);
+    }
+
+    // The bars have to stay a *visibly* variable row at the reduced height: if
+    // the resting floor eats most of the budget, quiet and loud speech stop
+    // being tellable apart and the pill reads as decoration.
+    #[test]
+    fn quiet_and_loud_stay_distinguishable_at_the_shipped_size() {
+        let g = Geometry::new(PILL_W as f32, PILL_H as f32, 1.0);
+        let at = |amp: f32| g.bar_min_h + amp * (g.bar_max_h - g.bar_min_h);
+        // The resting floor is a minority of the row's height...
+        assert!(g.bar_min_h < g.bar_max_h * 0.25);
+        // ...and a quiet passage already clears it by more than a device pixel,
+        // with room above for a loud one to go on growing.
+        assert!(at(0.3) - at(0.0) > 1.0);
+        assert!(at(1.0) - at(0.3) > 1.0);
     }
 
     // The pixmap is already in physical pixels, so a 2x target is the same
@@ -323,6 +408,79 @@ mod tests {
                 "{w}x{h}: corner is flatter than the shipped pill's"
             );
         }
+    }
+
+    /// Draw a mode at the shipped size and sample the row through its middle:
+    /// the most saturated pixel across the left edge's anti-aliased falloff, and
+    /// one inside the body clear of both that edge and the bar row.
+    fn edge_and_body(draw: fn(&mut Pixmap)) -> (PremultipliedColorU8, PremultipliedColorU8) {
+        let mut pm = Pixmap::new(PILL_W, PILL_H).unwrap();
+        draw(&mut pm);
+        let y = PILL_H / 2;
+        let edge = (0..4)
+            .map(|x| pm.pixel(x, y).unwrap())
+            .max_by_key(|p| brightest(*p))
+            .unwrap();
+        (edge, pm.pixel(8, y).unwrap())
+    }
+
+    fn brightest(p: PremultipliedColorU8) -> u8 {
+        p.red().max(p.green()).max(p.blue())
+    }
+
+    // The near-black body is invisible on a black desktop, and fill alpha is not
+    // the dial that fixes it — a light edge is. Every mode has to carry one,
+    // including the ones that draw an accent of their own over it.
+    #[test]
+    fn every_mode_draws_a_light_edge_around_a_dark_body() {
+        let modes: [Mode; 5] = [
+            ("recording", |pm| draw_recording(pm, 1.0, &FLAT)),
+            // The dimmest point of the breath, on a settled handoff: the mode's
+            // own border is at its faintest here, so this is where the hairline
+            // earns its keep.
+            ("processing", |pm| draw_processing(pm, 1.0, &FLAT, 0.0, 1.0)),
+            ("success", |pm| draw_success(pm, 1.0, &FLAT, 1.0)),
+            ("error", |pm| draw_error(pm, 1.0, &FLAT, 1.0)),
+            // Mid-fade, where the whole pill is half transparent.
+            ("success fading", |pm| draw_success(pm, 1.0, &FLAT, 0.5)),
+        ];
+        for (name, draw) in modes {
+            let (edge, body) = edge_and_body(draw);
+            let (edge, body) = (brightest(edge), brightest(body));
+            assert!(edge > 60, "{name}: edge too dark to separate ({edge})");
+            assert!(
+                edge > body * 3,
+                "{name}: edge ({edge}) barely differs from the body ({body})"
+            );
+        }
+    }
+
+    // The handoff is 320 ms of animation, not a swap with animation either side
+    // of it: at the mode change Processing has to draw what recording drew, or
+    // the border and the bar row both step on the frame the fall begins.
+    #[test]
+    fn processing_starts_the_handoff_looking_exactly_like_recording() {
+        let bars = [0.4, 0.8, 0.6, 1.0, 0.5, 0.7, 0.3];
+        let mut rec = Pixmap::new(PILL_W, PILL_H).unwrap();
+        draw_recording(&mut rec, 1.0, &bars);
+        let mut proc = Pixmap::new(PILL_W, PILL_H).unwrap();
+        // Any pulse: at zero progress the breath is faded out entirely.
+        draw_processing(&mut proc, 1.0, &bars, 1.0, 0.0);
+        assert_eq!(rec.data(), proc.data());
+    }
+
+    // The flash is the one thing the user reads at a glance, and it survives
+    // being a 1px hairline only because the two colours are unmistakable.
+    #[test]
+    fn the_green_and_red_flashes_stay_far_apart() {
+        let edge_rg = |draw: fn(&mut Pixmap)| {
+            let p = edge_and_body(draw).0;
+            (p.red(), p.green())
+        };
+        let (sr, sg) = edge_rg(|pm| draw_success(pm, 1.0, &FLAT, 1.0));
+        let (er, eg) = edge_rg(|pm| draw_error(pm, 1.0, &FLAT, 1.0));
+        assert!(sg > sr + 40, "success reads green: r{sr} g{sg}");
+        assert!(er > eg + 40, "error reads red: r{er} g{eg}");
     }
 
     // A fully-rounded corner has to be a real circular arc. The old quadratic

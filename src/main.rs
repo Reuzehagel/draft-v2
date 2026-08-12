@@ -603,7 +603,7 @@ impl App {
 /// The pill window and its animation, driven by the [`PillMode`] the Pill core
 /// derives. The core decides *what* mode, *when* to transition, and whether a
 /// window exists at all; the adapter derives every frame's bars, breathing
-/// pulse, and fade — including freezing the bars the moment the mode leaves
+/// pulse, and fade — including easing the bars flat once the mode leaves
 /// `Recording`. It holds no lifecycle rules.
 struct PillAdapter {
     window: Option<pill::window::PillWindow>,
@@ -611,10 +611,16 @@ struct PillAdapter {
     /// app loop.
     hook_tx: crossbeam_channel::Sender<HookEvent>,
     bands: audio::level::BandMeter,
-    /// Most recent waveform bars, frozen and reused once capture stops.
-    last_bars: Vec<f32>,
     /// The current logical mode; `None` when no pill is shown.
     mode: Option<PillMode>,
+    /// When the handoff started, i.e. when the mode last became `Processing`.
+    ///
+    /// Kept on the adapter rather than read off the mode because the handoff
+    /// can outlive `Processing`: a worker that resolves inside 320 ms puts the
+    /// pill in `Done` mid-fall, and `Done`'s own `since` is the flash's clock,
+    /// not the handoff's. Without this the bars would snap flat on that frame —
+    /// exactly the seam the handoff exists to remove.
+    handoff_since: Option<Instant>,
     /// Read-only clone of the active capture's ring buffer, for live bars.
     ring: Option<audio::ring::Buffer>,
 }
@@ -625,8 +631,8 @@ impl PillAdapter {
             window: None,
             hook_tx,
             bands: audio::level::BandMeter::new(pill::BAR_COUNT),
-            last_bars: vec![0.0; pill::BAR_COUNT],
             mode: None,
+            handoff_since: None,
             ring: None,
         }
     }
@@ -654,17 +660,27 @@ impl PillAdapter {
     /// Apply a mode the core derived. Entering `Recording` starts the meter from
     /// silence and paints one frame immediately, so the reveal that follows is
     /// already the pill (not a transparent rectangle); the rest just swap the
-    /// mode, so the next redraw freezes the bars (Processing/Done render
-    /// `last_bars` without touching the ring).
+    /// mode, and the next redraw picks the bars up from there.
+    ///
+    /// Note what is *not* reset on the way out of `Recording`: the meter keeps
+    /// its clock, so the waveform running under the handoff is the same one that
+    /// was running a frame earlier, with no sideways jump at the mode change.
     fn set_mode(&mut self, mode: PillMode) {
         let entering_recording = matches!(mode, PillMode::Recording { .. })
             && !matches!(self.mode, Some(PillMode::Recording { .. }));
+        // Stamp the handoff on the way *into* Processing only, so a `Done` that
+        // follows keeps counting from the mode change rather than restarting.
+        if let PillMode::Processing { since } = mode {
+            if !matches!(self.mode, Some(PillMode::Processing { .. })) {
+                self.handoff_since = Some(since);
+            }
+        }
         self.mode = Some(mode);
         if entering_recording {
+            self.handoff_since = None;
             self.bands.reset();
-            self.last_bars = vec![0.0; pill::BAR_COUNT];
             if let Some(pw) = self.window.as_mut() {
-                let _ = pw.render_recording(&self.last_bars);
+                let _ = pw.render_recording(&flat_bars());
             }
         }
     }
@@ -686,6 +702,7 @@ impl PillAdapter {
     fn destroy(&mut self) {
         self.mode = None;
         self.ring = None;
+        self.handoff_since = None;
         drop(self.window.take());
     }
 
@@ -695,7 +712,10 @@ impl PillAdapter {
         };
         match self.mode {
             // Terminal flash: green (delivered) or red (failed) border over the
-            // frozen bars, holding then fading over the final 30% of the linger.
+            // bar row, holding then fading over the final 30% of the linger.
+            // The row is normally already flat — the handoff took it there long
+            // before the worker came back — but a fast outcome can land
+            // mid-fall, so the fall goes on underneath rather than snapping.
             Some(PillMode::Done { ok, since }) => {
                 let total = pill::core::linger(ok).as_secs_f32();
                 let t = (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
@@ -704,21 +724,27 @@ impl PillAdapter {
                 } else {
                     ((1.0 - t) / 0.3).clamp(0.0, 1.0)
                 };
+                let bars = bars_for_frame(&mut self.bands, None, handoff_damping(self.handoff_since));
                 let res = if ok {
-                    pill.render_success(&self.last_bars, alpha)
+                    pill.render_success(&bars, alpha)
                 } else {
-                    pill.render_error(&self.last_bars, alpha)
+                    pill.render_error(&bars, alpha)
                 };
                 if let Err(e) = res {
                     tracing::error!(error = %e, "pill outcome render failed");
                 }
             }
-            // Worker still running: frozen bars under a neutral border that
-            // breathes (~0.8 Hz) so a slow round-trip reads as live, not hung.
+            // Worker still running: a neutral border breathing (~0.8 Hz) so a
+            // slow round-trip reads as live, not hung. The first `HANDOFF` of
+            // this mode is still the tail of the capture — the waveform keeps
+            // running underneath while the ease drains it to flat, and the
+            // border crossfades in over the same ramp.
             Some(PillMode::Processing { since }) => {
-                let e = since.elapsed().as_secs_f32();
-                let pulse = 0.5 - 0.5 * (e * std::f32::consts::TAU * 0.8).cos();
-                if let Err(e) = pill.render_processing(&self.last_bars, pulse) {
+                let pulse =
+                    0.5 - 0.5 * (since.elapsed().as_secs_f32() * std::f32::consts::TAU * 0.8).cos();
+                let damping = handoff_damping(self.handoff_since);
+                let bars = bars_for_frame(&mut self.bands, None, damping);
+                if let Err(e) = pill.render_processing(&bars, pulse, 1.0 - damping) {
                     tracing::error!(error = %e, "pill processing render failed");
                 }
             }
@@ -726,20 +752,57 @@ impl PillAdapter {
             // presence is pinned to `Off`; the nub they render lands with
             // residency itself (#17, #27).
             Some(PillMode::Hidden) | Some(PillMode::Idle) | Some(PillMode::Expanded) | None => {}
-            // Live capture: animate bars from the ring buffer and keep
-            // `last_bars` current for the freeze.
+            // Live capture: animate bars from the ring buffer, undamped.
             Some(PillMode::Recording { .. }) => {
-                let bars = if let Some(ring) = self.ring.as_ref() {
-                    let raw = self.bands.tick(ring).to_vec();
-                    audio::level::shape_bars(&raw)
-                } else {
-                    vec![0.0; pill::BAR_COUNT]
-                };
-                self.last_bars = bars.clone();
+                let bars = bars_for_frame(&mut self.bands, self.ring.as_ref(), 1.0);
                 if let Err(e) = pill.render_recording(&bars) {
                     tracing::error!(error = %e, "pill render failed");
                 }
             }
         }
     }
+}
+
+/// A flat row — every bar at its resting height. What "stopped listening" looks
+/// like, and all Processing and Done ever show once the handoff has run.
+fn flat_bars() -> Vec<f32> {
+    vec![0.0; pill::BAR_COUNT]
+}
+
+/// How much of the waveform is left, given when the handoff started. `None` —
+/// no handoff yet — is the recording case's full strength.
+fn handoff_damping(since: Option<Instant>) -> f32 {
+    since.map_or(1.0, |t| pill::core::handoff_damping(t.elapsed()))
+}
+
+/// This frame's bars, scaled by `damping`.
+///
+/// `ring` is `Some` only while capture is live. Past that the meter *holds*
+/// instead: the ring was drained into the worker the moment recording stopped,
+/// so ticking it would ease the bars toward the silence of an empty buffer and
+/// the handoff's own fall would have nothing left to take down. Either way the
+/// meter's clock keeps advancing, which is what makes the waveform continuous
+/// across the mode change rather than jumping sideways into the fall.
+///
+/// A free function over the fields it needs rather than a method: `redraw`
+/// holds a mutable borrow of the window across the whole match, and `&mut self`
+/// here would collide with it.
+fn bars_for_frame(
+    bands: &mut audio::level::BandMeter,
+    ring: Option<&audio::ring::Buffer>,
+    damping: f32,
+) -> Vec<f32> {
+    // Past the fall there is nothing left to shape — and nothing to gain from
+    // advancing a meter whose output is about to be multiplied by zero.
+    if damping <= 0.0 {
+        return flat_bars();
+    }
+    let raw = match ring {
+        Some(ring) => bands.tick(ring).to_vec(),
+        None => bands.hold().to_vec(),
+    };
+    audio::level::shape_bars(&raw)
+        .into_iter()
+        .map(|v| v * damping)
+        .collect()
 }
