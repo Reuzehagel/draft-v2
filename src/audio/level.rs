@@ -121,14 +121,43 @@ impl BandMeter {
             *cur += alpha * (target - *cur);
         }
 
-        // Blend in the idle wave: each bar gets a phase-shifted sine so the
-        // motion travels across the pill. max() means real speech always wins.
+        self.blend_idle();
+        &self.out
+    }
+
+    /// Advance the meter with no new audio, holding the band levels where the
+    /// last real audio left them.
+    ///
+    /// This is what the pill's handoff runs on. The capture's ring is drained
+    /// into the worker the instant recording stops, so `tick` from there on
+    /// would be easing toward the silence of an empty buffer — which collapses
+    /// the row to the idle floor inside a third of the handoff and leaves the
+    /// handoff's own ease nothing left to drain. Holding keeps the waveform the
+    /// user was just watching on screen, and lets that ease be the only thing
+    /// taking it down.
+    ///
+    /// The clock still advances, so the idle wave keeps travelling across the
+    /// bars and the row reads as losing energy rather than stopping dead.
+    pub fn hold(&mut self) -> &[f32] {
+        let now = std::time::Instant::now();
+        let dt_ms = self
+            .last_tick
+            .map(|t| now.duration_since(t).as_secs_f32() * 1000.0)
+            .unwrap_or(33.0);
+        self.last_tick = Some(now);
+        self.phase += dt_ms / 1000.0;
+        self.blend_idle();
+        &self.out
+    }
+
+    /// Blend the idle wave into `out`: each bar gets a phase-shifted sine so the
+    /// motion travels across the pill. max() means real speech always wins.
+    fn blend_idle(&mut self) {
         for (i, &cur) in self.bars.iter().enumerate() {
             let phase_i = self.phase * IDLE_SPEED + i as f32 * IDLE_BAR_OFFSET;
             let wobble = IDLE_BASE + IDLE_WOBBLE * (phase_i.sin() * 0.5 + 0.5);
             self.out[i] = cur.max(wobble).clamp(0.0, 1.0);
         }
-        &self.out
     }
 
     fn compute_band_targets(&mut self, buffer: &Buffer) -> Vec<f32> {

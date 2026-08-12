@@ -227,7 +227,8 @@ impl<C: CaptureHandle> Session<C> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Recording { kind, capture } => {
                 let samples = capture.take_samples();
-                // `capture` drops here — the stream stops and the bars freeze.
+                // `capture` drops here — the stream stops, and with the ring
+                // now drained the pill's meter holds for the handoff's fall.
                 let duration_ms = samples.len() as u64 * 1000 / crate::audio::TARGET_SR as u64;
                 let min = (crate::audio::TARGET_SR as u64 * MIN_CAPTURE_MS / 1000) as usize;
                 if samples.len() < min {

@@ -32,6 +32,21 @@ pub const SUCCESS_LINGER: Duration = Duration::from_millis(500);
 /// 500 ms deserves an extra beat to register as "that one didn't land".
 pub const ERROR_LINGER: Duration = Duration::from_millis(1200);
 
+/// How long the Recording → Processing handoff runs. The bars ease to flat over
+/// this long instead of freezing: flat is a state — "stopped listening" — where
+/// a frozen height is an accident of when the key happened to be released.
+pub const HANDOFF: Duration = Duration::from_millis(320);
+
+/// The live waveform's remaining share, `elapsed` into the handoff — 1 at the
+/// mode change, 0 once it is over.
+///
+/// Linear, not eased: energy draining at a steady rate reads as the pill losing
+/// interest, where an ease-out reads as the bars being dragged down by hand.
+pub fn handoff_damping(elapsed: Duration) -> f32 {
+    let t = elapsed.as_secs_f32() / HANDOFF.as_secs_f32();
+    (1.0 - t).clamp(0.0, 1.0)
+}
+
 /// How long the terminal flash holds before the pill leaves. Shared with the
 /// pill adapter, which uses it to time the fade; the core uses it in `tick` to
 /// decide when the flash retires.
@@ -108,7 +123,8 @@ pub enum PillMode {
     Expanded,
     /// Live capture: the adapter animates bars from the ring buffer.
     Recording { origin: Origin },
-    /// Worker running: frozen bars under a breathing border.
+    /// Worker running: the bars fall flat over the handoff, then hold there
+    /// under a breathing border.
     Processing { since: Instant },
     /// Terminal green/red flash.
     Done { ok: bool, since: Instant },
@@ -407,6 +423,35 @@ mod tests {
                 "presence {presence:?} x activity {activity:?}"
             );
         }
+    }
+
+    // Flat is a state — "stopped listening". A frozen height is an accident of
+    // when the key happened to be released, so the handoff has to actually
+    // reach zero, and reach it from a full-strength waveform.
+    #[test]
+    fn the_handoff_drains_the_waveform_to_flat() {
+        assert_eq!(handoff_damping(Duration::ZERO), 1.0);
+        assert_eq!(handoff_damping(HANDOFF), 0.0);
+        assert_eq!(handoff_damping(HANDOFF * 3), 0.0);
+    }
+
+    // Linear, not eased: an ease-out lingers near full and then drops, which
+    // reads as the bars being dragged down rather than losing energy.
+    #[test]
+    fn the_handoff_drains_at_a_steady_rate() {
+        for step in 0..=4 {
+            let t = step as f32 / 4.0;
+            let d = handoff_damping(HANDOFF.mul_f32(t));
+            assert!((d - (1.0 - t)).abs() < 1e-5, "at {t}: {d}");
+        }
+    }
+
+    // The handoff is longer than the flash's own fade is quick, and long enough
+    // at the ~30 Hz redraw to be an animation rather than a couple of frames.
+    #[test]
+    fn the_handoff_is_long_enough_to_read_as_motion() {
+        assert!(HANDOFF >= Duration::from_millis(250));
+        assert!(HANDOFF < SUCCESS_LINGER);
     }
 
     #[test]
