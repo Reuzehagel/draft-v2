@@ -510,9 +510,12 @@ impl SettingsApp {
         });
     }
 
-    /// The pill pane. The fullscreen behaviour (#45) is the row still to join
-    /// it, which is why this is a pane of its own rather than a row on
-    /// Recording.
+    /// The pill pane. The body-style toggle is the row still to join it, which
+    /// is why this is a pane of its own rather than a row on Recording.
+    ///
+    /// Fullscreen suppression (#45) deliberately has no row: getting out of the
+    /// way of a game is not a preference, and a pill kept over one would be
+    /// paying compositor watts for a setting nobody wants.
     fn tab_pill(&mut self, ui: &mut egui::Ui) {
         group(ui, |ui| {
             toggle_row(

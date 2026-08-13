@@ -1,4 +1,5 @@
 pub mod core;
+pub mod fullscreen;
 pub mod geom;
 pub mod hook;
 pub mod icons;

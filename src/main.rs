@@ -116,6 +116,12 @@ fn main() -> Result<()> {
         session,
         pill_core: Pill::new(),
         pill: PillAdapter::new(hook_tx),
+        fullscreen: pill::fullscreen::Watcher::new(),
+        // Installed in `resumed`, if residency wants it: the hook has to be
+        // registered on the thread with the message loop, and that thread is
+        // only running from there on.
+        foreground_hook: None,
+        hovered: false,
         home: Home::new(monitor_policy, pinned_path),
         // Enumerated for real in `resumed`, on the same path a display change
         // takes. Nothing can be placed before there is an event loop anyway.
@@ -155,19 +161,6 @@ fn tray_status(
     }
 }
 
-/// The pill's presence, per the config's residency toggle.
-///
-/// This is the only place the toggle is read. `Suppressed` is the fullscreen
-/// watcher's to set (#45) and `expanded` is [`App::poll_hover`]'s; neither is a
-/// config question, so neither appears here.
-fn presence_from_config(cfg: &config::Config) -> pill::core::Presence {
-    if cfg.pill.resident {
-        pill::core::Presence::Resident { expanded: false }
-    } else {
-        pill::core::Presence::Off
-    }
-}
-
 /// The home-monitor policy and its pinned path, per config.
 ///
 /// Read at launch and on every config reload — and by the *session-only* pill
@@ -203,11 +196,22 @@ struct App {
     /// push-to-command), the capture handle, session id, and session kind;
     /// hands back `Command`s to perform.
     session: Session<audio::capture::Capture>,
-    /// The pure owner of the pill's life. `Session` is one of its drivers, the
-    /// residency toggle and the hover poll are two more; the fullscreen watcher
-    /// (#45) follows.
+    /// The pure owner of the pill's life. `Session` is one of its drivers; the
+    /// residency toggle, the hover poll and the fullscreen watcher are the rest.
     pill_core: Pill,
     pill: PillAdapter,
+    /// Whether a fullscreen app is on the pill's home monitor. Pure: it is fed
+    /// a probe and says when the answer moved.
+    fullscreen: pill::fullscreen::Watcher,
+    /// The `EVENT_SYSTEM_FOREGROUND` hook, alive exactly while the pill is
+    /// resident — with residency off there is no hook, no probe, and no idle
+    /// work at all. `None` also when installing it failed, which costs reaction
+    /// speed and nothing else.
+    foreground_hook: Option<pill::fullscreen::ForegroundHook>,
+    /// Whether the cursor is on the pill, as [`App::poll_hover`] last saw it.
+    /// Held here rather than pushed straight at the core because presence is
+    /// decided by three facts at once — see [`App::presence`].
+    hovered: bool,
     /// Which monitor the pill lives on, and the policy deriving it. Pure: it is
     /// fed the display snapshot below plus the cheap per-poll signals, and says
     /// when the answer moved.
@@ -218,8 +222,8 @@ struct App {
     /// exactly the idle cost residency exists to avoid.
     displays: Displays,
     /// The messages winit doesn't surface, posted by the pill window's wndproc
-    /// subclass. The home monitor consumes the display ones; the fullscreen
-    /// watcher (#45) and the wakeup ladder (#49) are the remaining consumers.
+    /// subclass. The home monitor consumes the display ones; the wakeup ladder
+    /// (#49) is the remaining consumer.
     hook_rx: crossbeam_channel::Receiver<HookEvent>,
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
@@ -501,7 +505,9 @@ impl ApplicationHandler for App {
         // Before the presence, not after: `apply_presence` is what creates the
         // window, and a window has to be created *somewhere*.
         self.rederive_home();
-        self.apply_presence(el);
+        // This is also the first moment the foreground hook can be registered:
+        // the docs require the registering thread to have a message loop.
+        self.apply_residency(el);
         // Whether there is anything to copy is read here rather than at build
         // time: the tray was built before the event loop, and the bar's Copy
         // button needs the same answer.
@@ -605,9 +611,8 @@ impl ApplicationHandler for App {
         // in a repaint loop by another name.
         //
         // Draining is not optional either way; an unread channel would grow for
-        // the life of the process. The home monitor (#43), the fullscreen
-        // watcher (#45) and the wakeup ladder (#49) hang further behaviour off
-        // these in turn.
+        // the life of the process. The home monitor (#43) hangs further
+        // behaviour off these, and the wakeup ladder (#49) will in turn.
         while let Ok(ev) = self.hook_rx.try_recv() {
             let repush = match ev {
                 // The one event that overrides the home monitor's idle-only
@@ -671,6 +676,10 @@ impl ApplicationHandler for App {
         let cmds = self.pill_core.tick(now);
         self.run_pill_commands(cmds, el);
 
+        // Is a fullscreen app in the way? Before the hover poll, which skips
+        // its cursor read entirely while the answer is yes.
+        self.poll_fullscreen(el, now);
+
         // Is the cursor over the pill? Before the home poll, which latches
         // while the pill is expanded — so the answer this produces is the one
         // that latch reads.
@@ -721,15 +730,93 @@ impl App {
         }
     }
 
-    /// Hand the current residency setting to the Pill core and perform whatever
-    /// it decides that means. Note what this does *not* do: create or destroy a
+    /// The pill's presence, from the three facts that decide it. **One
+    /// function, one writer**: three drivers each pushing their own fact would
+    /// be three chances to overwrite the other two — the hover poll runs every
+    /// loop, and saying `Resident` there would take the pill straight back out
+    /// over the fullscreen app the watcher just hid it from.
+    ///
+    /// The order is the priority. Residency off means the pill does not exist
+    /// to suppress; suppression outranks hover, which is why the hover poll can
+    /// skip its cursor read entirely while a game is up.
+    fn presence(&self) -> pill::core::Presence {
+        if !self.cfg.pill.resident {
+            pill::core::Presence::Off
+        } else if self.fullscreen.suppressed() {
+            pill::core::Presence::Suppressed
+        } else {
+            pill::core::Presence::Resident {
+                expanded: self.hovered,
+            }
+        }
+    }
+
+    /// Hand the current presence to the Pill core and perform whatever it
+    /// decides that means. Note what this does *not* do: create or destroy a
     /// window. Presence is a fact about what the user asked for; whether a
     /// window exists is the core's conclusion from presence *and* activity, and
     /// mid-session those disagree — which is exactly the case that must not
     /// snatch the pill away.
     fn apply_presence(&mut self, el: &ActiveEventLoop) {
-        let cmds = self.pill_core.set_presence(presence_from_config(&self.cfg));
+        let cmds = self.pill_core.set_presence(self.presence());
         self.run_pill_commands(cmds, el);
+    }
+
+    /// Put the pill where residency now says it should be: match the watcher to
+    /// the toggle, look once, and apply the presence that falls out.
+    ///
+    /// The order is the whole of it, which is why it is one function rather
+    /// than three calls at each of the two sites that need them — launch and a
+    /// config reload. Probing *before* the presence is what stops a Draft that
+    /// starts (or has residency switched back on) while a game is up from
+    /// putting a nub over it for a loop.
+    fn apply_residency(&mut self, el: &ActiveEventLoop) {
+        self.apply_watcher();
+        self.poll_fullscreen(el, Instant::now());
+        self.apply_presence(el);
+    }
+
+    /// Install or drop the foreground hook to match residency, and make the
+    /// watcher look again either way.
+    ///
+    /// With residency off the watcher does **no work at all**: no hook, so no
+    /// callbacks; and [`Self::poll_fullscreen`] returns before it can probe. So
+    /// whatever it last decided is stale by the time residency comes back —
+    /// hence the rearm on both edges.
+    fn apply_watcher(&mut self) {
+        if self.cfg.pill.resident == self.foreground_hook.is_some() {
+            return;
+        }
+        self.foreground_hook = self
+            .cfg
+            .pill
+            .resident
+            .then(pill::fullscreen::ForegroundHook::install)
+            .flatten();
+        self.fullscreen.rearm();
+    }
+
+    /// Is a fullscreen app on the pill's monitor? The watcher decides whether
+    /// this loop is one that should look at all; all this does is hand it the
+    /// home monitor and the means to take a probe.
+    ///
+    /// Skipped outright with residency off — see [`Self::apply_watcher`].
+    /// Deliberately *not* skipped during a session: the pill is visible either
+    /// way, because activity outranks presence, and the fullscreen state has to
+    /// be current for the moment the flash retires.
+    fn poll_fullscreen(&mut self, el: &ActiveEventLoop, now: Instant) {
+        if !self.cfg.pill.resident {
+            return;
+        }
+        let home = self.home.current().map(|h| h.id);
+        let changed = pill::fullscreen::foreground_changed();
+        if let Some(suppressed) = self
+            .fullscreen
+            .poll(now, changed, home, pill::fullscreen::probe)
+        {
+            tracing::debug!(suppressed, "fullscreen app on the pill's monitor");
+            self.apply_presence(el);
+        }
     }
 
     /// Hand the home-monitor core this moment's signals and move the pill if it
@@ -785,24 +872,21 @@ impl App {
     /// that, so this hands over the cursor's answer unconditionally and lets it
     /// decide.
     fn poll_hover(&mut self, el: &ActiveEventLoop) {
-        // Presence is the residency toggle's to own; expansion only rides
-        // along. With residency off there is nothing to expand, and saying so
-        // here would overwrite `Off` with `Resident` — as it will overwrite
-        // `Suppressed` when the fullscreen watcher lands (#45), which is why
-        // that ticket has to gate this the way the toggle already does.
-        if !self.pill.has_window() || !self.cfg.pill.resident {
+        // Expansion only rides along on presence — it is meaningless when the
+        // pill is off or suppressed, and there is nothing on screen to be over
+        // in either case. So the cursor is not even read: this is the one loop
+        // whose cost residency-off and a fullscreen game both have to escape.
+        if !self.pill.has_window() || !self.cfg.pill.resident || self.fullscreen.suppressed() {
+            self.hovered = false;
             return;
         }
         let Some(cursor) = pill::monitor::cursor_pos() else {
             return;
         };
-        let expanded = self
+        self.hovered = self
             .pill
             .cursor_over(cursor, self.pill_core.showing_buttons());
-        let cmds = self
-            .pill_core
-            .set_presence(pill::core::Presence::Resident { expanded });
-        self.run_pill_commands(cmds, el);
+        self.apply_presence(el);
     }
 
     /// The ordinary per-loop sample. The core decides whether the latch applies
@@ -915,7 +999,7 @@ impl App {
         // the Pill core and let it decide. Toggled off mid-session it changes
         // nothing on screen until the flash retires, because activity outranks
         // presence — the pill is never snatched away mid-dictation.
-        self.apply_presence(el);
+        self.apply_residency(el);
         // The tooltip names the hotkey and provider, and settings can clear
         // the history — so the tray follows a settings change without a restart.
         self.refresh_status();
