@@ -23,10 +23,13 @@
 // with its own clock — a flash outlives the hover under it — so it arrives as a
 // `Fade`.
 
-use crate::pill::core::{island_centre, slab, Button, BUTTONS, BUTTON_COUNT, CENTRE, GLYPH_BOX};
+use crate::pill::core::{
+    check_centre, island_centre, slab, Action, Button, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTON,
+    CHECK_BUTTONS, CHECK_CLAIM, CHECK_GLYPH_BOX, GLYPH_BOX,
+};
 use crate::pill::geom::{
-    label_centre_y, pill_centre_y, Geom, Slot, BODY, HAIRLINE, HAIRLINE_A, LABEL_H, LABEL_PAD_X,
-    LABEL_PX, LABEL_TEXT, LABEL_TEXT_A, PILL_FILL_A,
+    label_centre_y, pill_centre_y, Geom, Rgb, Slot, BODY, HAIRLINE, HAIRLINE_A, LABEL_H,
+    LABEL_PAD_X, LABEL_PX, LABEL_TEXT, LABEL_TEXT_A, PILL_FILL_A,
 };
 use crate::pill::icons;
 use crate::pill::label::Fade;
@@ -81,6 +84,27 @@ impl Bars {
     /// Total width of a row of `count` bars, gaps included.
     fn span(&self, count: usize) -> f32 {
         count as f32 * self.bar_w + count.saturating_sub(1) as f32 * self.bar_gap
+    }
+
+    /// The same row squeezed into `span`, if it does not already fit.
+    ///
+    /// The click-started pill is the one body that does not give the whole of
+    /// its width to the waveform — cancel and confirm take an end each — so
+    /// the proportions of the body would otherwise put a 42px row inside a
+    /// 34px gap. Scaled uniformly rather than clipped or re-gapped: what makes
+    /// the row read as a waveform at every size the morph passes through is
+    /// that its bars and gaps keep their ratio to each other.
+    fn fitted(self, span: f32, count: usize) -> Self {
+        let have = self.span(count);
+        if have <= span || have <= 0.0 {
+            return self;
+        }
+        let k = (span / have).max(0.0);
+        Self {
+            bar_w: self.bar_w * k,
+            bar_gap: self.bar_gap * k,
+            ..self
+        }
     }
 }
 
@@ -193,8 +217,13 @@ pub fn draw(
     );
 
     if geom.bars > 0.0 {
-        draw_bars(pm, cy, &Bars::new(body_w, body_h), bar_heights, geom.bars);
+        let bars = Bars::new(body_w, body_h).fitted(row_span(geom, scale), bar_heights.len());
+        draw_bars(pm, cy, &bars, bar_heights, geom.bars);
     }
+
+    // On top of the body and beside the row — a click-started session's two
+    // buttons, which are not the bar and share none of its machinery.
+    draw_check(pm, geom, scale, cy);
 
     // On top of every island, its own and the body's alike — the indicator sits
     // inside the shape and the glyph on top of that.
@@ -203,6 +232,101 @@ pub fn draw(
             draw_indicator(pm, island, scale, slots[i].hover * geom.buttons);
             draw_glyph(pm, &BUTTONS[i], island, scale, geom.buttons, slots[i]);
         }
+    }
+}
+
+/// Confirm's disc: white at 94%.
+///
+/// **This is the one piece of chrome that changes meaning rather than looks.**
+/// A filled disc with the glyph knocked out of it is a default action, which
+/// is exactly what a click-started session needs and what the hover bar
+/// deliberately lacks — there, three equal islands say "pick one".
+const CONFIRM_DISC_A: f32 = 0.94 * 255.0;
+
+/// Cancel's disc: 10% white. Present enough to read as a target on the pill's
+/// near-black body, and nowhere near enough to compete with the default.
+const CANCEL_DISC_A: f32 = 0.10 * 255.0;
+
+/// Where a check button is *this frame*, as a device-pixel offset from the
+/// pill's centre.
+///
+/// [`check_centre`] against the body the morph currently has, rather than the
+/// settled one: measured inward from whatever edge the body has, the pair sit
+/// under the bar's centre island at the start of the fold, which is what lets
+/// the glyphs crossfade in place rather than fly out from it.
+fn check_x(geom: &Geom, i: usize, scale: f32) -> f32 {
+    check_centre(geom.w, i) * scale
+}
+
+/// The waveform's span this frame, in device pixels: the body, less what the
+/// check has claimed at either end.
+///
+/// A pure function of the Geom, `check` and all — so the row widens back out
+/// over the handoff as the buttons leave, rather than jumping at the mode
+/// change. With no check it is the whole body, which never binds: the row's
+/// own proportions are already well inside it.
+fn row_span(geom: &Geom, scale: f32) -> f32 {
+    let claimed = CHECK_CLAIM * geom.check.clamp(0.0, 1.0);
+    ((geom.w - 2.0 * claimed) * scale).max(0.0)
+}
+
+/// Cancel and confirm, inside the body they belong to.
+///
+/// Not hover-gated and not hover-lit: they are up for the **whole** session,
+/// because a cursor drift must not hide the only way to stop it — and a pair
+/// that is always there does not need a hover state to say it is there. Which
+/// is also why neither is drawn at the bar's dimmed idle emphasis.
+fn draw_check(pm: &mut Pixmap, geom: &Geom, scale: f32, cy: f32) {
+    let opacity = geom.check.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
+    let (cx, _) = centre(pm, scale);
+    let r = CHECK_BUTTON / 2.0 * scale;
+    for (i, button) in CHECK_BUTTONS.iter().enumerate() {
+        let x = cx + check_x(geom, i, scale);
+        let default = button.action == Action::Confirm;
+        let mut pb = PathBuilder::new();
+        rounded_rect(&mut pb, x - r, cy - r, 2.0 * r, 2.0 * r, r);
+        let Some(disc) = pb.finish() else { continue };
+        let mut fill = Paint::default();
+        let disc_a = if default {
+            CONFIRM_DISC_A
+        } else {
+            CANCEL_DISC_A
+        };
+        fill.set_color_rgba8(255, 255, 255, alpha_u8(disc_a * opacity));
+        fill.anti_alias = true;
+        pm.fill_path(&disc, &fill, FillRule::Winding, Transform::identity(), None);
+
+        let box_px = CHECK_GLYPH_BOX * scale;
+        let Some(path) = icons::glyph(button.icon, box_px) else {
+            continue;
+        };
+        // The default's glyph is knocked out of its disc in the body's own
+        // colour; cancel's is drawn on the body in white, as every other glyph
+        // in the pill is. Two readings of one rule — the mark is whatever the
+        // surface behind it is not.
+        let ink = if default {
+            geom.fill
+        } else {
+            Rgb(255, 255, 255)
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(ink.0, ink.1, ink.2, alpha_u8(GLYPH_A * opacity));
+        paint.anti_alias = true;
+        pm.stroke_path(
+            &path,
+            &paint,
+            &Stroke {
+                width: icons::stroke_width(box_px),
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Default::default()
+            },
+            Transform::from_translate(x, cy),
+            None,
+        );
     }
 }
 
@@ -610,7 +734,7 @@ pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pill::core::{Origin, PillMode};
+    use crate::pill::core::{Origin, PillMode, CLICK_W};
     use crate::pill::geom::{ENVELOPE_H, ENVELOPE_W};
     use crate::pill::BAR_COUNT;
     use tiny_skia::PremultipliedColorU8;
@@ -1180,6 +1304,135 @@ mod tests {
         let wide = span(&showing("Copy last transcript"));
         let mid = span(&fade);
         assert!(narrow < mid && mid < wide, "{narrow} {mid} {wide}");
+    }
+
+    const CLICK_REC: PillMode = PillMode::Recording {
+        origin: Origin::Click,
+    };
+
+    /// The click-started pill is **one body**, 112 wide — not the bar's three
+    /// islands, and not the 62 the hotkey pill is. Measured off the drawn
+    /// pixels, so a renderer that kept the islands would fail here.
+    #[test]
+    fn the_click_started_pill_draws_one_body_at_its_settled_width() {
+        let pm = frame(CLICK_REC, &FLAT);
+        let body = runs(&pm, cy(&pm, 1.0));
+        assert_eq!(body.len(), 1, "{body:?}");
+        let width = body[0].1 - body[0].0 + 1;
+        assert!(width.abs_diff(112) <= 2, "body width {width}");
+        // And the hotkey pill is untouched beside it.
+        let bare = runs(&frame(REC, &FLAT), cy(&pm, 1.0));
+        assert_eq!(bare.len(), 1);
+        assert!((bare[0].1 - bare[0].0 + 1).abs_diff(62) <= 2);
+    }
+
+    /// Confirm is a filled disc and cancel is not — the one piece of chrome
+    /// that changes meaning rather than looks. Read off the pixels either side
+    /// of the body's centre, clear of both glyphs' strokes.
+    #[test]
+    fn confirm_is_a_filled_disc_and_cancel_is_barely_one() {
+        let pm = frame(CLICK_REC, &FLAT);
+        let cy = cy(&pm, 1.0);
+        let cx = ENVELOPE_W as f32 / 2.0;
+        // The brightest and darkest pixel inside each disc, over a box that
+        // holds the whole 20px circle and nothing outside it.
+        let box_at = |i: usize| -> (u8, u8) {
+            let dx = cx + check_centre(CLICK_W, i);
+            let px: Vec<u8> = (-7i32..=7)
+                .flat_map(|x| (-7i32..=7).map(move |y| (x, y)))
+                .map(|(x, y)| {
+                    brightest(
+                        pm.pixel((dx as i32 + x) as u32, (cy as i32 + y) as u32)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            (*px.iter().min().unwrap(), *px.iter().max().unwrap())
+        };
+        let (cancel_lo, cancel_hi) = box_at(0);
+        let (confirm_lo, confirm_hi) = box_at(1);
+        // Confirm is filled: even its darkest pixel is only dark because the
+        // glyph is knocked out of it.
+        assert!(
+            confirm_hi > 200,
+            "confirm is not a filled disc ({confirm_hi})"
+        );
+        assert!(
+            confirm_lo < confirm_hi / 3,
+            "the check is not knocked out ({confirm_lo} in {confirm_hi})"
+        );
+        // Cancel is a 10% wash with a white mark on it — nowhere near a
+        // default, and still visibly a target.
+        assert!(cancel_hi > 150, "cancel has no glyph on it ({cancel_hi})");
+        assert!(
+            cancel_lo < 60 && cancel_lo < confirm_hi / 3,
+            "cancel's disc reads as filled ({cancel_lo})"
+        );
+    }
+
+    /// The buttons are *inside* the body, with the waveform between them —
+    /// the layout the ticket states, measured off where they were drawn.
+    #[test]
+    fn the_check_sits_inside_the_body_with_the_row_between() {
+        let g = Geom::of(CLICK_REC);
+        // The mode's Geom is the body the layout was stated against, so the
+        // per-frame placement lands exactly on the core's settled numbers.
+        for i in 0..2 {
+            assert_eq!(check_x(&g, i, 1.0), check_centre(CLICK_W, i));
+        }
+        assert_eq!(
+            (check_centre(CLICK_W, 0), check_centre(CLICK_W, 1)),
+            (-39.0, 39.0)
+        );
+        // The row is the 34 the layout leaves it, and it clears both discs.
+        assert_eq!(row_span(&g, 1.0), 34.0);
+        let pm = frame(CLICK_REC, &[1.0; BAR_COUNT]);
+        let cy = cy(&pm, 1.0);
+        let cx = ENVELOPE_W as f32 / 2.0;
+        // Halfway between a disc and the row is body, not a bar and not a disc.
+        for dx in [-27.0f32, 27.0] {
+            let p = brightest(pm.pixel((cx + dx) as u32, cy).unwrap());
+            assert!(p < 60, "the row or a disc reached {dx} ({p})");
+        }
+    }
+
+    /// The waveform is squeezed into the gap the check leaves it, rather than
+    /// running under the buttons — the body's own proportions would put a 42px
+    /// row inside a 34px gap.
+    ///
+    /// The claim is against the *settled* shape. Mid-morph the pair pass
+    /// through each other as the buttons separate out of the centre, which is
+    /// the bar's own fold-out read from the other side: what makes it one
+    /// gesture is that both are derived from the same lerp, not that they
+    /// never overlap.
+    #[test]
+    fn the_row_is_fitted_between_the_two_buttons() {
+        let settled = Geom::of(CLICK_REC);
+        let (_, body_w, body_h) = body_of(&settled, 1.0);
+        let natural = Bars::new(body_w, body_h).span(BAR_COUNT);
+        assert!(natural > 34.0, "the fit had nothing to do ({natural})");
+        let row = Bars::new(body_w, body_h)
+            .fitted(row_span(&settled, 1.0), BAR_COUNT)
+            .span(BAR_COUNT);
+        let inner = check_x(&settled, 1, 1.0) - CHECK_BUTTON / 2.0;
+        assert!(row / 2.0 <= inner, "the row reached the check");
+        // And that is what is drawn: 34, not the 42 the body would have given.
+        let mut pm = envelope();
+        draw(
+            &mut pm,
+            1.0,
+            &settled,
+            &[1.0; BAR_COUNT],
+            &NO_SLOTS,
+            &NO_LABEL,
+        );
+        let cy = cy(&pm, 1.0);
+        let cx = ENVELOPE_W / 2;
+        let bright: Vec<u32> = (cx - 20..cx + 20)
+            .filter(|&x| brightest(pm.pixel(x, cy).unwrap()) > 150)
+            .collect();
+        let drawn = bright.last().unwrap() - bright[0] + 1;
+        assert!((30..=34).contains(&drawn), "the row spans {drawn}");
     }
 
     /// A fully-rounded corner has to be a real circular arc. The old quadratic

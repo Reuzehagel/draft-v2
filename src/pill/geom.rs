@@ -24,7 +24,7 @@
 // Pure: no winit, no Win32, no `Instant::now()`. `Motion::at` takes the `now`
 // it is asked about, exactly like the cores do.
 
-use crate::pill::core::PillMode;
+use crate::pill::core::{Origin, PillMode, CLICK_H, CLICK_W};
 use std::time::{Duration, Instant};
 
 /// The pill's resting silhouette — what `Idle` renders and what `Hidden` keeps
@@ -204,6 +204,18 @@ pub struct Geom {
     /// lerp with everything else rather than a second animation bolted beside
     /// it, and a stagger would need a clock the Geom cannot carry.
     pub buttons: f32,
+    /// The click-started session's cancel and confirm discs, 0..1 (#47).
+    ///
+    /// A second field rather than a reuse of `buttons`, because the two are
+    /// *opposite* through the one transition they both appear in: the bar's
+    /// three glyphs are on their way out over exactly the 170 ms these two are
+    /// coming in, which is what "crossfading in place" is. One number could
+    /// not say both.
+    ///
+    /// It is also how wide the waveform is: the row's span is the body less
+    /// what this has claimed at either end, so the bars widen back out as the
+    /// buttons leave on the handoff rather than jumping at the mode change.
+    pub check: f32,
 }
 
 impl Geom {
@@ -229,6 +241,7 @@ impl Geom {
                 border_w: 1.0,
                 bars: 0.0,
                 buttons: 0.0,
+                check: 0.0,
             },
             // The expanded pill is the *centre* island — the bar's other two
             // are drawn beside it by the renderer, sliding out from behind it
@@ -249,7 +262,22 @@ impl Geom {
             }
             // The bars are what say "live", so recording wears the bare
             // hairline and no accent.
-            PillMode::Recording { .. } => Geom::session(),
+            //
+            // Origin decides presentation and nothing else: a click-started
+            // session is a wider body carrying the two buttons the "release
+            // the key" gesture stood for, and is otherwise the same mode.
+            PillMode::Recording {
+                origin: Origin::Hotkey,
+            } => Geom::session(),
+            PillMode::Recording {
+                origin: Origin::Click,
+            } => Geom {
+                w: CLICK_W,
+                h: CLICK_H,
+                radius: shape_radius(CLICK_W, CLICK_H),
+                check: 1.0,
+                ..Geom::session()
+            },
             // The handoff's whole visual content: the neutral border arrives
             // and the row dims, over the 320 ms the bars are also falling flat.
             // The breath is layered on top of this by the adapter — it is a
@@ -288,6 +316,7 @@ impl Geom {
             border_w: 1.0,
             bars: 1.0,
             buttons: 0.0,
+            check: 0.0,
         }
     }
 
@@ -306,6 +335,7 @@ impl Geom {
             border_a: 0.0,
             bars: 0.0,
             buttons: 0.0,
+            check: 0.0,
             ..self
         }
     }
@@ -324,6 +354,7 @@ impl Geom {
             border_w: f(self.border_w, to.border_w),
             bars: f(self.bars, to.bars),
             buttons: f(self.buttons, to.buttons),
+            check: f(self.check, to.check),
         }
     }
 }
@@ -394,6 +425,23 @@ pub const HANDOFF: Tween = Tween {
     dur: crate::pill::core::HANDOFF,
     ease: Ease::Linear,
 };
+/// The bar becoming a click-started session's pill: three islands into one
+/// body, with the bar's glyphs going out over exactly the time cancel and
+/// confirm come in.
+///
+/// Slower than [`TO_RECORDING`], which is the pill answering a key the user is
+/// holding down *right now*. This one is answering a click that has already
+/// landed, and it is a morph between two shapes the user is looking at rather
+/// than an appearance — it can afford to be read.
+pub const MORPH: Tween = Tween::out_cubic(170);
+/// A cancelled session collapsing back to the nub.
+///
+/// The bar's own opening gesture, at its own length: cancelling takes the pill
+/// back to where it was opened from, so it covers that distance in the time
+/// opening it took. There is deliberately no reverse edge to `Expanded` — a
+/// cancelled session returns to the nub, which makes the handover
+/// forward-only by construction.
+pub const CANCELLED: Tween = Tween::out_cubic(110);
 /// Back to the nub after the flash retires.
 pub const TO_IDLE: Tween = Tween::out_cubic(160);
 /// Hover in and out: the nub growing into the bar, and collapsing back.
@@ -508,6 +556,24 @@ impl Hover {
 pub fn transition(from: PillMode, to: PillMode) -> Tween {
     use PillMode::*;
     match (from, to) {
+        // The bar handing itself over to a session the user started from it.
+        // Ahead of the `Hidden` rows below because there is no way to reach it
+        // from nothing: the button that starts it only exists on the bar.
+        (
+            Expanded,
+            Recording {
+                origin: Origin::Click,
+            },
+        ) => MORPH,
+        // ...and back, when that session is cancelled. Not to `Expanded`:
+        // there is no reverse edge, so this is the only way out of a
+        // click-started session that did not finish.
+        (
+            Recording {
+                origin: Origin::Click,
+            },
+            Idle,
+        ) => CANCELLED,
         // Arriving from nothing. A chord press is exempt: with residency off
         // that is the pill's entire existence beginning, and it appears at once
         // — the same instant appearance the session pill has always had.
@@ -628,10 +694,13 @@ impl Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pill::core::Origin;
 
     const REC: PillMode = PillMode::Recording {
         origin: Origin::Hotkey,
+    };
+
+    const CLICK_REC: PillMode = PillMode::Recording {
+        origin: Origin::Click,
     };
 
     fn t(ms: u64) -> Instant {
@@ -651,7 +720,7 @@ mod tests {
     /// including the bar row, which is drawn at its own opacity and so can
     /// outlive the body it sits in.
     fn is_blank(g: &Geom) -> bool {
-        g.fill_a < 0.5 && g.border_a < 0.5 && g.bars <= 0.0 && g.buttons <= 0.0
+        g.fill_a < 0.5 && g.border_a < 0.5 && g.bars <= 0.0 && g.buttons <= 0.0 && g.check <= 0.0
     }
 
     /// The nub's numbers, as settled. Pinned here rather than only on screen,
@@ -695,6 +764,7 @@ mod tests {
             PillMode::Idle,
             PillMode::Expanded,
             REC,
+            CLICK_REC,
             proc(),
             done(true),
         ] {
@@ -785,6 +855,97 @@ mod tests {
         assert!(g.fill_a > Geom::of(PillMode::Idle).fill_a);
     }
 
+    /// The click-started pill's numbers, and the one thing that makes it *not*
+    /// the bar: it is a single body, so nothing about the three islands is on.
+    #[test]
+    fn the_click_started_geom_is_one_body_carrying_a_check() {
+        let g = Geom::of(CLICK_REC);
+        assert_eq!((g.w, g.h), (112.0, 32.0));
+        assert_eq!(g.check, 1.0);
+        assert_eq!(g.buttons, 0.0, "it is one body, not three islands");
+        // Otherwise it is the recording pill: bare hairline, no accent, live
+        // bars. Origin decides presentation, and presentation is size.
+        let session = Geom::of(REC);
+        assert_eq!(
+            (g.fill, g.fill_a, g.border, g.border_a, g.bars),
+            (
+                session.fill,
+                session.fill_a,
+                session.border,
+                session.border_a,
+                session.bars
+            )
+        );
+    }
+
+    /// The morph, as one crossfade: the bar's glyphs on their way out over
+    /// exactly the time the check comes in, with the body growing under both.
+    /// Two fields rather than one, because they move in opposite directions.
+    #[test]
+    fn the_bar_hands_over_to_the_check_in_one_lerp() {
+        let m = Motion::start(Geom::of(PillMode::Expanded), CLICK_REC, MORPH, t(0));
+        assert_eq!((m.at(t(0)).buttons, m.at(t(0)).check), (1.0, 0.0));
+        assert_eq!((m.at(t(170)).buttons, m.at(t(170)).check), (0.0, 1.0));
+        assert!(!m.is_running(t(170)));
+        let mut prev = m.at(t(0));
+        for ms in 1..=170 {
+            let g = m.at(t(ms));
+            // One going out, the other coming in, monotonically — and the body
+            // growing under them the whole way.
+            assert!(g.buttons <= prev.buttons, "the bar came back at {ms}ms");
+            assert!(g.check >= prev.check, "the check receded at {ms}ms");
+            assert!(g.w >= prev.w, "the body shrank at {ms}ms");
+            prev = g;
+        }
+    }
+
+    /// The handoff takes the check with it: by the time the worker is running,
+    /// Processing looks the same whichever way the session was started.
+    #[test]
+    fn the_handoff_leaves_the_check_behind() {
+        let m = Motion::start(Geom::of(CLICK_REC), proc(), HANDOFF, t(0));
+        assert_eq!(m.at(t(0)).check, 1.0);
+        assert_eq!(m.at(t(320)), Geom::of(proc()));
+        assert_eq!(Geom::of(proc()).check, 0.0);
+        // And Done, which follows it, is a still image of the same shape.
+        assert_eq!(Geom::of(done(true)).check, 0.0);
+    }
+
+    /// The click-started pill has exactly two exits, and the third the table
+    /// could have had is the one that must not exist.
+    ///
+    /// `Idle` on a cancel and `Processing` on a confirm. Not `Expanded`: there
+    /// is no reverse edge, so a cancelled session cannot hand itself back to
+    /// the bar it came from. Nothing in the table says so — what says so is
+    /// that the hover poll sizes its reach off the *bar*, so a cursor on a
+    /// button 39px out has not been keeping one open (see `App::poll_hover`).
+    /// This pins the consequence: reaching `Expanded` from here would be a
+    /// snap, which is what an unintended edge looks like.
+    #[test]
+    fn a_click_started_session_has_no_way_back_to_the_bar() {
+        assert_eq!(transition(CLICK_REC, PillMode::Expanded), Tween::SNAP);
+        // The one exit that is neither: residency switched off, or a
+        // fullscreen app taking the screen, mid-session. There is no nub to
+        // return to, so it leaves the way every mode leaves — a conceal, in
+        // place, at the size it was.
+        assert_eq!(transition(CLICK_REC, PillMode::Hidden), CONCEAL);
+    }
+
+    /// A cancelled session goes straight back to the nub — 112x32 down to
+    /// 36x10 with everything drawn inside it going out on the way, and no stop
+    /// at the bar it came from.
+    #[test]
+    fn a_cancelled_session_collapses_to_the_nub() {
+        let m = Motion::start(Geom::of(CLICK_REC), PillMode::Idle, CANCELLED, t(0));
+        for ms in 0..=110 {
+            let g = m.at(t(ms));
+            assert!(g.buttons <= 0.0, "the bar reappeared at {ms}ms");
+        }
+        let end = m.at(t(110));
+        assert_eq!(end, Geom::of(PillMode::Idle));
+        assert_eq!((end.check, end.bars), (0.0, 0.0));
+    }
+
     /// The flankers' offset is a pure function of the growth progress, and
     /// `buttons` is that progress — which is what keeps the fold-out inside the
     /// derived-frame model instead of being a second animation beside it.
@@ -855,11 +1016,18 @@ mod tests {
             (done(true), PillMode::Idle, TO_IDLE),
             (PillMode::Idle, PillMode::Expanded, HOVER_IN),
             (PillMode::Expanded, PillMode::Idle, HOVER_OUT),
+            // The click-started session's two edges, and no third: it is
+            // reached from the bar and left for the nub or the handoff.
+            (PillMode::Expanded, CLICK_REC, MORPH),
+            (CLICK_REC, PillMode::Idle, CANCELLED),
+            (CLICK_REC, proc(), HANDOFF),
         ];
         for (from, to, expected) in cases {
             assert_eq!(transition(from, to), expected, "{from:?} -> {to:?}");
         }
         assert_eq!(REVEAL.dur, Duration::from_millis(140));
+        assert_eq!(MORPH.dur, Duration::from_millis(170));
+        assert_eq!(CANCELLED.dur, Duration::from_millis(110));
         assert_eq!(CONCEAL.dur, Duration::from_millis(120));
         assert_eq!(TO_RECORDING.dur, Duration::from_millis(90));
         assert_eq!(TO_IDLE.dur, Duration::from_millis(160));

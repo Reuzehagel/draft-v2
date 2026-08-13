@@ -84,9 +84,13 @@ enum Phase<C> {
     /// Nothing happening.
     Idle,
     /// `StartCapture` emitted, awaiting the handle from the adapter.
-    Starting { kind: SessionKind },
+    Starting { kind: SessionKind, origin: Origin },
     /// Capturing; the pill shows live bars.
-    Recording { kind: SessionKind, capture: C },
+    Recording {
+        kind: SessionKind,
+        origin: Origin,
+        capture: C,
+    },
     /// Worker running under `session_id`; only its matching outcome reacts.
     /// (The pill's own Processing-since instant rides in the reported activity,
     /// stamped by `end`; the core needs only the id here.)
@@ -141,9 +145,63 @@ impl<C: CaptureHandle> Session<C> {
     /// capture stops (while a worker runs a fresh chord may take over).
     pub fn capturing_kind(&self) -> Option<SessionKind> {
         match self.phase {
-            Phase::Starting { kind } | Phase::Recording { kind, .. } => Some(kind),
+            Phase::Starting { kind, .. } | Phase::Recording { kind, .. } => Some(kind),
             _ => None,
         }
+    }
+
+    /// Whether the capture currently starting or running was begun with the
+    /// mouse. What makes the keyboard a *finish* rather than a start — see
+    /// [`Self::drive_fsm`].
+    fn click_started(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Starting {
+                origin: Origin::Click,
+                ..
+            } | Phase::Recording {
+                origin: Origin::Click,
+                ..
+            }
+        )
+    }
+
+    /// Start a session from the pill's own Dictate button.
+    ///
+    /// The *same* lifecycle a chord takes — same capture, same transcription,
+    /// same paste — differing only in the [`Origin`] it carries, which decides
+    /// presentation and nothing else. There is deliberately no second path
+    /// here: a click-started session that took a shortcut would be a second
+    /// dictation flow to keep in step with the first.
+    pub fn start_from_click(&mut self) -> Vec<Command> {
+        self.begin(SessionKind::Dictate, Origin::Click)
+    }
+
+    /// Finish a click-started session — **identical to releasing the hotkey**,
+    /// down to being the same call.
+    pub fn confirm(&mut self, now: Instant) -> Vec<Command> {
+        self.end(now)
+    }
+
+    /// Throw a click-started session's audio away.
+    ///
+    /// No transcription, no paste, **no history entry and no flash**: nothing
+    /// is spawned and the reported activity is `None`, so there is no outcome
+    /// for the pill to report — a flash reports an outcome, and cancelling
+    /// isn't one.
+    ///
+    /// **Recording-only.** A cancel that arrives after the handoff has begun
+    /// — the button was under the cursor a frame ago — does nothing at all,
+    /// rather than trying to recall a capture that is already at a worker.
+    pub fn cancel(&mut self) -> Vec<Command> {
+        if !matches!(self.phase, Phase::Recording { .. }) {
+            return Vec::new();
+        }
+        // The capture handle drops with the phase, which is what stops the
+        // stream; the samples are simply never drained.
+        self.phase = Phase::Idle;
+        tracing::info!("session: CANCEL (audio discarded)");
+        vec![Command::ReportActivity(SessionActivity::None)]
     }
 
     /// Drive the dictation chord's FSM with a raw press/release event.
@@ -163,12 +221,34 @@ impl<C: CaptureHandle> Session<C> {
         let now = match &ev {
             InEvent::Pressed(t) | InEvent::Released(t) => *t,
         };
+        // Origin decides presentation, never control: the keyboard is always
+        // available, and a user who has forgotten how they started must still
+        // be able to stop. So over a click-started session the *dictation*
+        // chord's press finishes it, exactly as confirm does.
+        //
+        // The dictation chord and no other. Push-to-command is a different
+        // pipeline, not a second stop button — ending a dictation with it
+        // would paste a transcript where the user asked for an answer, and
+        // starting one alongside would be two chords on one microphone. It is
+        // ignored for the session's duration, which is the same rule the
+        // adapter applies to the *other* chord during any capture.
+        //
+        // The FSM is not stepped on the way past, either way. It never saw
+        // this session start, and stepping it here would leave it believing it
+        // is recording — so the release that follows a beat later would read
+        // as a stop for a session that is already at a worker.
+        if self.click_started() {
+            return match (kind, ev) {
+                (SessionKind::Dictate, InEvent::Pressed(_)) => self.end(now),
+                _ => Vec::new(),
+            };
+        }
         let fsm = match kind {
             SessionKind::Dictate => &mut self.dictate_fsm,
             SessionKind::Command => &mut self.command_fsm,
         };
         match fsm.step(ev) {
-            OutEvent::Start => self.begin(kind),
+            OutEvent::Start => self.begin(kind, Origin::Hotkey),
             OutEvent::Stop => self.end(now),
             OutEvent::Ignore => Vec::new(),
         }
@@ -177,8 +257,8 @@ impl<C: CaptureHandle> Session<C> {
     /// Begin a capture session. Replacing the phase drops any live capture
     /// handle (no overlap) and supersedes any in-flight tail — the superseded
     /// worker's outcome is later ignored by its session id.
-    fn begin(&mut self, kind: SessionKind) -> Vec<Command> {
-        self.phase = Phase::Starting { kind };
+    fn begin(&mut self, kind: SessionKind, origin: Origin) -> Vec<Command> {
+        self.phase = Phase::Starting { kind, origin };
         vec![Command::StartCapture]
     }
 
@@ -189,13 +269,18 @@ impl<C: CaptureHandle> Session<C> {
     /// so there is nothing to take back.
     pub fn capture_started(&mut self, capture: Option<C>) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Starting { kind } => match capture {
+            Phase::Starting { kind, origin } => match capture {
                 Some(capture) => {
-                    self.phase = Phase::Recording { kind, capture };
-                    // Every session this core starts is a chord press; the click
-                    // path (#29) starts one from the pill itself.
+                    self.phase = Phase::Recording {
+                        kind,
+                        origin,
+                        capture,
+                    };
+                    // The origin the session was begun with, carried through
+                    // untouched — it is the pill's to interpret, not this
+                    // core's, which treats the two identically from here on.
                     vec![Command::ReportActivity(SessionActivity::Recording {
-                        origin: Origin::Hotkey,
+                        origin,
                     })]
                 }
                 None => {
@@ -225,7 +310,7 @@ impl<C: CaptureHandle> Session<C> {
     /// worker; otherwise the pill just disappears.
     fn end(&mut self, now: Instant) -> Vec<Command> {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Recording { kind, capture } => {
+            Phase::Recording { kind, capture, .. } => {
                 let samples = capture.take_samples();
                 // `capture` drops here — the stream stops, and with the ring
                 // now drained the pill's meter holds for the handoff's fall.
@@ -360,7 +445,10 @@ mod tests {
 
     /// Drive a session all the way into Processing, returning the live id.
     fn into_processing(s: &mut Session<FakeCapture>) -> u64 {
-        assert_eq!(s.begin(SessionKind::Dictate), vec![Command::StartCapture]);
+        assert_eq!(
+            s.begin(SessionKind::Dictate, Origin::Hotkey),
+            vec![Command::StartCapture]
+        );
         assert_eq!(s.capture_started(Some(long_capture())), vec![recording()]);
         let cmds = s.end(t(1000));
         match &cmds[..] {
@@ -405,7 +493,10 @@ mod tests {
         let mut s = ready_session();
         let first = into_processing(&mut s);
         // A fresh press while the worker still runs supersedes it.
-        assert_eq!(s.begin(SessionKind::Dictate), vec![Command::StartCapture]);
+        assert_eq!(
+            s.begin(SessionKind::Dictate, Origin::Hotkey),
+            vec![Command::StartCapture]
+        );
         assert_eq!(s.capture_started(Some(long_capture())), vec![recording()]);
         assert!(s.is_recording());
         // Stopping the new capture mints a *new* id (no id reuse, no overlap).
@@ -428,7 +519,10 @@ mod tests {
     #[test]
     fn capture_start_failure_leaves_consistent_non_recording_state() {
         let mut s = ready_session();
-        assert_eq!(s.begin(SessionKind::Dictate), vec![Command::StartCapture]);
+        assert_eq!(
+            s.begin(SessionKind::Dictate, Origin::Hotkey),
+            vec![Command::StartCapture]
+        );
         // The open failed: no pill, no recording, and the FSM is rebuilt so a
         // later press starts cleanly rather than being read as a "stop".
         let cmds = s.capture_started(None);
@@ -446,7 +540,7 @@ mod tests {
     #[test]
     fn too_short_capture_reports_no_activity_without_transcribing() {
         let mut s = ready_session();
-        s.begin(SessionKind::Dictate);
+        s.begin(SessionKind::Dictate, Origin::Hotkey);
         s.capture_started(Some(FakeCapture {
             samples: vec![0.1; 10],
         }));
@@ -464,7 +558,7 @@ mod tests {
             double_press_lock: false,
         });
         // transcriber_available defaults to false.
-        s.begin(SessionKind::Dictate);
+        s.begin(SessionKind::Dictate, Origin::Hotkey);
         s.capture_started(Some(long_capture()));
         assert_eq!(
             s.end(t(1000)),
@@ -590,11 +684,153 @@ mod tests {
         );
     }
 
+    /// A click-started session, recording. The rig every test below shares.
+    fn click_recording() -> Session<FakeCapture> {
+        let mut s = ready_session();
+        assert_eq!(s.start_from_click(), vec![Command::StartCapture]);
+        assert_eq!(
+            s.capture_started(Some(long_capture())),
+            vec![Command::ReportActivity(SessionActivity::Recording {
+                origin: Origin::Click
+            })]
+        );
+        s
+    }
+
+    /// The click path is the chord path with a different origin on it: same
+    /// capture, same commit, same worker, routed to the same pipeline.
+    #[test]
+    fn a_click_started_session_runs_the_same_lifecycle_as_a_chord() {
+        let mut s = click_recording();
+        assert!(s.is_recording());
+        assert_eq!(s.capturing_kind(), Some(SessionKind::Dictate));
+        match &s.confirm(t(1000))[..] {
+            [Command::ReportActivity(SessionActivity::Processing { .. }), Command::SpawnTranscription { session_kind, .. }] =>
+            {
+                assert_eq!(*session_kind, SessionKind::Dictate)
+            }
+            other => panic!("expected Processing + Spawn, got {other:?}"),
+        }
+        assert!(s.is_processing());
+    }
+
+    /// Confirm is releasing the hotkey — not merely equivalent to it, the same
+    /// call. Asserted as the same command list off two identical sessions.
+    #[test]
+    fn confirm_is_identical_to_releasing_the_hotkey() {
+        let by_click = click_recording().confirm(t(1000));
+        let mut by_chord = ready_session();
+        by_chord.on_dictate_input(InEvent::Pressed(t(0)));
+        by_chord.capture_started(Some(long_capture()));
+        let by_chord = by_chord.on_dictate_input(InEvent::Released(t(1000)));
+        // Same shape, same commit. The ids differ only because they are two
+        // sessions; everything the adapter acts on is the same.
+        assert_eq!(by_click.len(), by_chord.len());
+        assert_eq!(by_click[0], by_chord[0]);
+        assert!(matches!(
+            (&by_click[1], &by_chord[1]),
+            (
+                Command::SpawnTranscription {
+                    session_kind: SessionKind::Dictate,
+                    ..
+                },
+                Command::SpawnTranscription {
+                    session_kind: SessionKind::Dictate,
+                    ..
+                }
+            )
+        ));
+    }
+
+    /// The keyboard is always available: a chord press over a click-started
+    /// session finishes it exactly as confirm would, and the release that
+    /// follows it a beat later does nothing.
+    #[test]
+    fn a_hotkey_press_finishes_a_click_started_session() {
+        let mut s = click_recording();
+        let by_press = s.on_dictate_input(InEvent::Pressed(t(1000)));
+        let by_confirm = click_recording().confirm(t(1000));
+        assert_eq!(
+            by_press[0], by_confirm[0],
+            "a press did not finish it the way confirm does"
+        );
+        assert!(matches!(
+            (&by_press[1], &by_confirm[1]),
+            (
+                Command::SpawnTranscription { .. },
+                Command::SpawnTranscription { .. }
+            )
+        ));
+        assert!(s.is_processing());
+        // The FSM never saw this session start, so its release must not read
+        // as a stop for one that is already at a worker.
+        assert!(s.on_dictate_input(InEvent::Released(t(1100))).is_empty());
+        assert!(s.is_processing());
+        // And the next chord press starts a fresh session cleanly, which is
+        // what proves the FSM was left alone rather than half-driven.
+        assert_eq!(
+            s.on_dictate_input(InEvent::Pressed(t(2000))),
+            vec![Command::StartCapture]
+        );
+    }
+
+    /// The *dictation* chord finishes it, and no other. Push-to-command is a
+    /// different pipeline, not a second stop button: ending a dictation with it
+    /// would paste a transcript where the user asked for an answer.
+    #[test]
+    fn the_command_chord_does_not_finish_a_click_started_session() {
+        let mut s = click_recording();
+        assert!(s.on_command_input(InEvent::Pressed(t(1000))).is_empty());
+        assert!(s.is_recording(), "the command chord ended a dictation");
+        assert!(s.on_command_input(InEvent::Released(t(1100))).is_empty());
+        assert!(s.is_recording());
+        // The dictation chord still finishes it, and the command chord is
+        // untouched — a press after the session is over starts its own.
+        assert!(!s.on_dictate_input(InEvent::Pressed(t(1200))).is_empty());
+        assert!(s.is_processing());
+        assert_eq!(
+            s.on_command_input(InEvent::Pressed(t(1300))),
+            vec![Command::StartCapture]
+        );
+    }
+
+    /// Cancel discards: no transcription, no history, no flash. The whole of
+    /// it is one `None` — the absences are structural, since nothing is
+    /// spawned and only an outcome can produce a flash.
+    #[test]
+    fn cancel_discards_the_audio_without_reporting_an_outcome() {
+        let mut s = click_recording();
+        assert_eq!(
+            s.cancel(),
+            vec![Command::ReportActivity(SessionActivity::None)]
+        );
+        assert!(s.is_idle());
+        // Nothing to resolve, so nothing can flash: there is no session id a
+        // worker could report against.
+        assert!(s.on_outcome(1, Outcome::Delivered).is_empty());
+        assert!(s.on_outcome(0, Outcome::Failed).is_empty());
+    }
+
+    /// Cancel is Recording-only. Once the handoff has begun the capture is at
+    /// a worker, and a click that was live a frame ago must not try to recall
+    /// it — nor take the pill out from under the Processing it is showing.
+    #[test]
+    fn a_cancel_after_the_handoff_is_ignored() {
+        let mut s = click_recording();
+        s.confirm(t(1000));
+        assert!(s.is_processing());
+        assert!(s.cancel().is_empty(), "a late cancel reached the pill");
+        assert!(s.is_processing());
+        // Idle too: the button cannot be up, but neither may a stray reach it.
+        let mut idle = ready_session();
+        assert!(idle.cancel().is_empty());
+    }
+
     #[test]
     fn capturing_kind_tracks_the_active_chord() {
         let mut s = ready_session();
         assert_eq!(s.capturing_kind(), None);
-        s.begin(SessionKind::Command);
+        s.begin(SessionKind::Command, Origin::Hotkey);
         assert_eq!(s.capturing_kind(), Some(SessionKind::Command));
         s.capture_started(Some(long_capture()));
         assert_eq!(s.capturing_kind(), Some(SessionKind::Command));

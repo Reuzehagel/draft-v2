@@ -459,8 +459,9 @@ impl App {
     }
 
     /// Perform a button press. The core decided *which* button — including
-    /// whether it was live at all — so there is nothing to check here.
-    fn run_button(&mut self, action: pill::core::Action) {
+    /// whether it was live at all, and which of the two button sets is up —
+    /// so there is nothing to check here.
+    fn run_button(&mut self, action: pill::core::Action, el: &ActiveEventLoop) {
         match action {
             // The label is what makes this button visibly do anything. Draft
             // pastes via clipboard + Ctrl+V, so the transcript being copied is
@@ -476,8 +477,25 @@ impl App {
             // The settings window takes focus; the pill still does not. It is a
             // subprocess, so nothing about this window changes.
             pill::core::Action::Settings => self.open_settings(),
+            // Through the same `Session` core a chord press goes through, so
+            // there is one dictation lifecycle rather than two.
             pill::core::Action::Dictate => {
-                tracing::info!("pill: dictate button clicked (wired up in #30)")
+                let cmds = self.session.start_from_click();
+                self.run_commands(cmds, el);
+            }
+            pill::core::Action::Confirm => {
+                let cmds = self.session.confirm(Instant::now());
+                self.run_commands(cmds, el);
+            }
+            // Cancel is the one button that hands the pill straight back to
+            // presence — and it lands on the nub rather than on the bar it
+            // came from without anything here arranging that. See
+            // [`Self::poll_hover`]: the stay-open reach follows the bar, so
+            // for the whole of a click-started session it has been the nub's,
+            // and a cursor on a disc 39px out is not in it.
+            pill::core::Action::Cancel => {
+                let cmds = self.session.cancel();
+                self.run_commands(cmds, el);
             }
         }
     }
@@ -546,7 +564,7 @@ impl ApplicationHandler for App {
     /// `WS_EX_TRANSPARENT` is off and the pill is a real mouse target, so
     /// per-button hover is `CursorMoved` rather than another poll (#20).
     /// Everything else winit offers is ignored.
-    fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.pill.window_id() != Some(id) {
             return;
         }
@@ -573,7 +591,7 @@ impl ApplicationHandler for App {
                     .cursor
                     .and_then(|(x, y)| self.pill_core.action_at(x, y))
                 {
-                    self.run_button(action);
+                    self.run_button(action, el);
                 }
             }
             _ => {}
@@ -908,6 +926,15 @@ impl App {
     /// work. Hover cannot expand a recording pill — the Pill core enforces
     /// that, so this hands over the cursor's answer unconditionally and lets it
     /// decide.
+    ///
+    /// The stay-open region follows the **bar**, not everything clickable. That
+    /// distinction is what makes a click-started session forward-only: while
+    /// one runs the reach is the nub's, and the cursor is on a 20px disc 39px
+    /// from the pill's centre, so this has already answered `false` long before
+    /// cancel is pressed. The pill therefore returns to the nub rather than
+    /// springing back open into the bar it came from — and it does so because
+    /// the cursor is genuinely nowhere near the nub, not because anything
+    /// forced the flag.
     fn poll_hover(&mut self, el: &ActiveEventLoop) {
         // Expansion only rides along on presence — it is meaningless when the
         // pill is off or suppressed, and there is nothing on screen to be over
@@ -920,9 +947,7 @@ impl App {
         let Some(cursor) = pill::monitor::cursor_pos() else {
             return;
         };
-        self.hovered = self
-            .pill
-            .cursor_over(cursor, self.pill_core.showing_buttons());
+        self.hovered = self.pill.cursor_over(cursor, self.pill_core.showing_bar());
         self.apply_presence(el);
     }
 
@@ -1172,6 +1197,16 @@ impl PillAdapter {
         self.owe(lit || named);
     }
 
+    /// Put the hover indicator and the label out, leaving the cursor's own
+    /// position alone. What the bar collapsing means — for a click-started
+    /// session it collapses into a pill that is still a mouse target, so the
+    /// position a click is tested against has to survive it.
+    fn clear_hover(&mut self, now: Instant) {
+        let lit = self.hover.set(None, now);
+        let named = self.label.set_hover(None, now);
+        self.owe(lit || named);
+    }
+
     /// Say something over the pill for a beat — a landed copy, which the pill
     /// otherwise has no way to distinguish from a click that did nothing.
     fn flash_label(&mut self, text: &'static str, now: Instant) {
@@ -1392,33 +1427,42 @@ impl PillAdapter {
             self.handoff_since = None;
             self.bands.reset();
         }
-        // Click-through is off exactly while the bar is up, and the flip
-        // happens with the mode rather than on a timer: the window becomes a
-        // mouse target at the instant it has something to click.
+        // Click-through is off exactly while the pill has something to press —
+        // the bar, or a click-started session's cancel and confirm — and the
+        // flip happens with the mode rather than on a timer: the window becomes
+        // a mouse target at the instant it has something to click. A hotkey
+        // session shows neither, so a click passes straight through it.
         //
-        // Note it goes *back on* at the start of the collapse, not the end. The
+        // Note it goes *back on* at the start of a collapse, not the end. The
         // pill is on its way out from under the cursor either way, and a window
-        // that swallowed clicks through a 90 ms fade would be swallowing them
-        // for the app underneath.
+        // that swallowed clicks through the fade would be swallowing them for
+        // the app underneath.
         let buttons = mode.shows_buttons();
         if buttons != self.mode.is_some_and(PillMode::shows_buttons) {
             if let Some(pw) = self.window.as_ref() {
                 pw.set_click_through(!buttons);
             }
-            if !buttons {
-                // Nothing to hover once the bar is gone, and a hover left
-                // standing would light a button on the next reveal.
-                self.set_cursor(None, None, now);
-                // The *name* goes with the button, but the acknowledgement does
-                // not: a copy is acknowledged for a second whether or not the
-                // cursor stays, and moving away the instant you click is the
-                // commonest thing to do. What does take it is a session — a
-                // "Copied" over a recording pill would be saying nothing about
-                // what the pill is now doing.
-                if mode != PillMode::Idle {
-                    let dismissed = self.label.dismiss(now);
-                    self.owe(dismissed);
-                }
+        }
+        // The hover indicator and the label follow the *bar* rather than the
+        // click-through flag, and since #47 those are two different questions:
+        // a click-started session is a mouse target without being the bar, and
+        // leaving "Dictate" lit and named over a pill that is now recording
+        // would be the bar's chrome outliving the bar.
+        if !mode.shows_bar() && self.mode.is_some_and(PillMode::shows_bar) {
+            // Nothing to hover once the bar is gone, and a hover left standing
+            // would light a button on the next reveal. The cursor's *position*
+            // is left alone: it is what a click is tested against, and the
+            // buttons a click-started session carries are still under it.
+            self.clear_hover(now);
+            // The *name* goes with the button, but the acknowledgement does
+            // not: a copy is acknowledged for a second whether or not the
+            // cursor stays, and moving away the instant you click is the
+            // commonest thing to do. What does take it is a session — a
+            // "Copied" over a recording pill would be saying nothing about
+            // what the pill is now doing.
+            if mode != PillMode::Idle {
+                let dismissed = self.label.dismiss(now);
+                self.owe(dismissed);
             }
         }
         let tween = pill::geom::transition(self.mode.unwrap_or(PillMode::Hidden), mode);

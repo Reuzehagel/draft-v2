@@ -57,6 +57,12 @@ fn source(icon: Icon) -> &'static str {
             "M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3\
              M14 2v4M8 10v4M16 18v4"
         }
+        // `x`: two strokes through the centre. Cancel.
+        Icon::X => "M18 6 6 18M6 6l12 12",
+        // `check`: the tick. Confirm — and the one glyph drawn *out* of a
+        // filled disc rather than on top of a body, so its strokes carry the
+        // shape of the button as much as the disc does.
+        Icon::Check => "M20 6 9 17l-5-5",
     }
 }
 
@@ -286,36 +292,47 @@ fn arc_to(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pill::core::{BUTTONS, GLYPH_BOX};
+    use crate::pill::core::{BUTTONS, CHECK_BUTTONS, CHECK_GLYPH_BOX, GLYPH_BOX};
 
-    /// Every glyph the button list names parses, and lands inside its box.
+    /// Every glyph either button list names parses, and lands inside its box.
     /// A path that silently failed would be a button with no icon on it.
+    ///
+    /// The share of the box each list has to fill differs, and that is a fact
+    /// about Lucide rather than a slackened assertion: `copy`, `mic` and
+    /// `sliders` are drawn edge to edge on the 24-grid, while `x` and `check`
+    /// are marks in the middle of it. Scaling the latter pair up to match
+    /// would draw them heavier than every other icon in the app.
     #[test]
     fn every_button_glyph_parses_and_fits_its_box() {
-        for b in &BUTTONS {
-            let path = glyph(b.icon, GLYPH_BOX).unwrap_or_else(|| panic!("{:?}", b.icon));
-            let r = path.bounds();
-            let half = GLYPH_BOX / 2.0;
-            // Centred on the origin: the renderer translates it to the button.
-            assert!(
-                r.left() >= -half && r.right() <= half,
-                "{:?} is wider than its box: {r:?}",
-                b.icon
-            );
-            assert!(
-                r.top() >= -half && r.bottom() <= half,
-                "{:?} is taller than its box: {r:?}",
-                b.icon
-            );
-            // And it actually fills it — a glyph shrunk to a dot would pass the
-            // bounds check above. Only on its longer side: a mic is a tall
-            // icon and does not fill the box across.
-            assert!(
-                r.width().max(r.height()) > GLYPH_BOX * 0.5,
-                "{:?} does not fill its box: {r:?}",
-                b.icon
-            );
-            assert!(r.width() > 1.0 && r.height() > 1.0, "{:?}: {r:?}", b.icon);
+        for (buttons, box_px, fills) in [
+            (&BUTTONS[..], GLYPH_BOX, 0.5),
+            (&CHECK_BUTTONS[..], CHECK_GLYPH_BOX, 0.3),
+        ] {
+            for b in buttons {
+                let path = glyph(b.icon, box_px).unwrap_or_else(|| panic!("{:?}", b.icon));
+                let r = path.bounds();
+                let half = box_px / 2.0;
+                // Centred on the origin: the renderer translates it to the button.
+                assert!(
+                    r.left() >= -half && r.right() <= half,
+                    "{:?} is wider than its box: {r:?}",
+                    b.icon
+                );
+                assert!(
+                    r.top() >= -half && r.bottom() <= half,
+                    "{:?} is taller than its box: {r:?}",
+                    b.icon
+                );
+                // And it actually fills its share — a glyph shrunk to a dot
+                // would pass the bounds check above. Only on its longer side: a
+                // mic is a tall icon and does not fill the box across.
+                assert!(
+                    r.width().max(r.height()) > box_px * fills,
+                    "{:?} does not fill its box: {r:?}",
+                    b.icon
+                );
+                assert!(r.width() > 1.0 && r.height() > 1.0, "{:?}: {r:?}", b.icon);
+            }
         }
     }
 
