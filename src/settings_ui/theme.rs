@@ -7,6 +7,8 @@
 // - Borders are solid opaque greys: a translucent 1px stroke feathers into
 //   a broken, "pixely" line.
 // - All inputs share CONTROL_W x CONTROL_H so they line up column-perfect.
+// - The window is dark whatever Windows is set to: the theme preference is
+//   pinned and both of egui's style slots carry this theme (`install_style`).
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2};
 // shadcn "neutral + lime" DARK theme, oklch → sRGB.
@@ -55,8 +57,30 @@ pub(super) const CONTROL_H: f32 = 32.0;
 pub(super) const RADIUS: f32 = 10.0; // shadcn --radius (0.625rem) — controls, buttons, popovers
 pub(super) const RADIUS_SM: f32 = 8.0; // nav items, row hover
 
+/// Install the theme.
+///
+/// This window is dark-only, so it must not follow the system theme. egui keeps
+/// a style *per* theme (`dark_style` / `light_style`) and picks between them
+/// every frame from the system theme; `install_style` runs in eframe's creation
+/// closure, before the first frame has reported one, so a plain `set_style`
+/// would land in the fallback (Dark) slot alone and a light-mode Windows would
+/// then flip to an unwritten `light_style` — combos and text edits reverting to
+/// egui's default light look against the dark panels.
+///
+/// So: pin the preference to Dark, *and* write the same style into both slots,
+/// so a flip we didn't ask for still cannot reveal an unstyled one.
 pub(super) fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let style = dark_style();
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
+/// The settings window's style, built on egui's *dark* defaults — everything
+/// this theme doesn't override (extreme/faint fills, error and warning colours)
+/// has to come from there, or the parts we don't name go light.
+fn dark_style() -> egui::Style {
+    let mut style = egui::Theme::Dark.default_style();
     // egui makes labels selectable by default, which shows the text-select
     // I-beam over our row/label text and makes controls feel un-clickable.
     style.interaction.selectable_labels = false;
@@ -122,5 +146,56 @@ pub(super) fn install_style(ctx: &egui::Context) {
     v.widgets.open.weak_bg_fill = CONTROL_FILL;
     v.widgets.open.bg_stroke = Stroke::new(1.0, RING);
 
-    ctx.set_style(style);
+    style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Theme;
+
+    /// The window is dark whatever Windows is set to: the preference is pinned,
+    /// and both style slots carry the theme, so the per-frame dark/light pick
+    /// cannot land on an unstyled one.
+    #[test]
+    fn theme_survives_a_light_system() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+
+        for theme in [Theme::Dark, Theme::Light] {
+            let style = ctx.style_of(theme);
+            assert_eq!(style.visuals.panel_fill, BG, "{theme:?} panel");
+            assert_eq!(style.visuals.window_fill, SIDEBAR_BG, "{theme:?} popup");
+            assert_eq!(
+                style.visuals.override_text_color,
+                Some(FG),
+                "{theme:?} text"
+            );
+            // The two that actually broke: a ComboBox's closed button and a
+            // TextEdit both paint themselves from `widgets.inactive`.
+            assert_eq!(
+                style.visuals.widgets.inactive.bg_fill, CONTROL_FILL,
+                "{theme:?} control fill"
+            );
+            assert_eq!(
+                style.visuals.widgets.inactive.bg_stroke,
+                input_border(),
+                "{theme:?} control border"
+            );
+        }
+
+        let preference = ctx.options(|o| o.theme_preference);
+        assert_eq!(preference, egui::ThemePreference::Dark);
+        // …and once a frame reports a light Windows — the moment the bug used
+        // to appear — the active style is still ours.
+        let _ = ctx.run(
+            egui::RawInput {
+                system_theme: Some(Theme::Light),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert_eq!(ctx.theme(), Theme::Dark);
+        assert_eq!(ctx.style().visuals.panel_fill, BG);
+    }
 }
