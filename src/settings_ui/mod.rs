@@ -96,6 +96,7 @@ const ALL_PROVIDERS: &[Provider] = &[
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Recording,
+    Pill,
     Transcription,
     Replacements,
     Output,
@@ -104,8 +105,11 @@ enum Tab {
 }
 
 impl Tab {
+    /// Rail order, which is the order the panes are read in: what Draft
+    /// listens with, what it shows you while it does, then where the words go.
     const ALL: &'static [Tab] = &[
         Tab::Recording,
+        Tab::Pill,
         Tab::Transcription,
         Tab::Replacements,
         Tab::Output,
@@ -116,6 +120,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Recording => "Recording",
+            Tab::Pill => "Pill",
             Tab::Transcription => "Transcription",
             Tab::Replacements => "Replacements",
             Tab::Output => "Output",
@@ -127,6 +132,7 @@ impl Tab {
     fn subtitle(self) -> &'static str {
         match self {
             Tab::Recording => "How Draft listens for your voice.",
+            Tab::Pill => "The overlay that shows what Draft is doing.",
             Tab::Transcription => "Where your speech becomes text.",
             Tab::Replacements => "Fix misheard words and expand shorthand before pasting.",
             Tab::Output => "How the transcript reaches your cursor.",
@@ -340,6 +346,7 @@ impl eframe::App for SettingsApp {
                     )
                     .show(ui, |ui| match self.tab {
                         Tab::Recording => self.tab_recording(ui),
+                        Tab::Pill => self.tab_pill(ui),
                         Tab::Transcription => self.tab_transcription(ui, ctx),
                         Tab::Replacements => self.tab_replacements(ui),
                         Tab::Output => self.tab_output(ui),
@@ -439,6 +446,23 @@ impl SettingsApp {
                     text_input(ui, &mut self.cfg.command_hotkey, "Ctrl+Shift+Backslash", CONTROL_W);
                 });
             }
+        });
+    }
+
+    /// The pill pane. One toggle today; the home-monitor policy (#43) and the
+    /// fullscreen behaviour (#45) are the rows that join it, which is why this
+    /// is a pane of its own rather than a row on Recording.
+    fn tab_pill(&mut self, ui: &mut egui::Ui) {
+        group(ui, |ui| {
+            toggle_row(
+                ui,
+                &mut self.cfg.pill.resident,
+                "Keep the pill on screen",
+                "A small marker sits at the bottom of your screen whenever Draft \
+                 is running, so you can tell at a glance that it's alive. Turn \
+                 this off and the pill only appears while you're dictating — the \
+                 hotkey works exactly the same either way.",
+            );
         });
     }
 
