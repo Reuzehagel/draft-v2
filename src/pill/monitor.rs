@@ -4,7 +4,7 @@
 // There is exactly one home monitor and exactly one pill. Not one per monitor:
 // N layered windows each pay the idle cost residency exists to avoid, the
 // expanded pill becomes ambiguous, and the home-monitor concept — which the
-// fullscreen hide check (#45) and the hover hit test (#19) both read — dissolves.
+// fullscreen hide check (#45) and the hover hit test (#20) both read — dissolves.
 //
 // Two halves, split the way `pill::core` is:
 //
@@ -42,7 +42,11 @@ pub const CURSOR_DWELL: Duration = Duration::from_millis(300);
 /// so the whole of [`Home`] is testable off Windows and off a desktop.
 pub type MonitorId = isize;
 
-/// A screen rect in physical pixels — always `rcWork` here, never `rcMonitor`.
+/// A rect in physical pixels. Everything *this* module measures is `rcWork` —
+/// never `rcMonitor` — because the pill is placed against the work area. The
+/// fullscreen check borrows the type for the other two rects it needs: a window
+/// rect and `rcMonitor`, which is the whole difference between "maximized" and
+/// "fullscreen".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Rect {
     pub left: i32,
@@ -247,13 +251,11 @@ impl Home {
 
     /// The home monitor, or `None` before the first derivation.
     ///
-    /// This is the readable state the rest of the pill is meant to consult:
-    /// the fullscreen hide check (#45) has to require the fullscreen window to
-    /// share it. That check doesn't exist yet, which is the only reason nothing
-    /// outside the tests calls this — the rule is here, and asserted, ahead of
-    /// it. (The hover hit test reads the same monitor's placement through the
-    /// pill window, which is handed one of these at every move.)
-    #[allow(dead_code)]
+    /// This is the readable state the rest of the pill consults: the fullscreen
+    /// hide check requires the fullscreen window to share it, or a game on one
+    /// screen would take the pill off another. (The hover hit test reads the
+    /// same monitor's placement through the pill window, which is handed one of
+    /// these at every move.)
     pub fn current(&self) -> Option<HomeMonitor> {
         self.current
     }

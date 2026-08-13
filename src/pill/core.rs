@@ -63,11 +63,11 @@ pub fn linger(ok: bool) -> Duration {
 /// `expanded` is a flag inside `Resident` rather than a third axis, because
 /// expansion is meaningless when the pill is off or suppressed.
 ///
-/// The residency toggle sets `Off` and `Resident`, and the hover poll sets
-/// `expanded` on the latter (#44). `Suppressed` is the fullscreen watcher's
-/// (#45) — the rules are here, and tested, ahead of it.
+/// The residency toggle sets `Off` and `Resident`, the hover poll sets
+/// `expanded` on the latter (#44), and the fullscreen watcher sets `Suppressed`
+/// (#45). All three are composed into one value by the adapter, which is what
+/// keeps the three drivers from overwriting each other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub enum Presence {
     /// Residency toggled off — the pill exists only for the length of a session.
     Off,
@@ -414,9 +414,10 @@ impl Pill {
         self.settle()
     }
 
-    /// Set the presence axis. Called by the residency toggle at launch and on
-    /// every config reload, and by the hover poll every loop; the fullscreen
-    /// watcher (#45) becomes its other caller in turn.
+    /// Set the presence axis. Called with the one value the adapter composes
+    /// from the residency toggle, the fullscreen watcher and the hover poll —
+    /// at launch, on every config reload, and on every loop that moves one of
+    /// the three.
     pub fn set_presence(&mut self, presence: Presence) -> Vec<Command> {
         self.presence = presence;
         self.settle()
@@ -691,6 +692,26 @@ mod tests {
                 }),
                 Command::Show
             ]
+        );
+        // The whole session shows through: bars, the breathing border, and the
+        // flash the user is actually waiting on.
+        assert_eq!(
+            p.on_session(SessionActivity::Processing { since: t(500) }, t(500)),
+            vec![Command::SetMode(PillMode::Processing { since: t(500) })]
+        );
+        assert_eq!(
+            p.on_session(SessionActivity::Finished { ok: true }, t(900)),
+            vec![Command::SetMode(PillMode::Done {
+                ok: true,
+                since: t(900)
+            })]
+        );
+        // And when the flash retires the pill goes back where suppression left
+        // it — off the game, window kept, because the state after a session is
+        // derived from presence rather than remembered.
+        assert_eq!(
+            p.tick(t(900) + SUCCESS_LINGER),
+            vec![Command::SetMode(PillMode::Hidden), Command::Hide]
         );
     }
 
