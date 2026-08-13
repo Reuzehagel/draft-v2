@@ -208,14 +208,21 @@ impl Geom {
         }
     }
 
-    /// This shape with the lights off: same silhouette, nothing drawn.
+    /// This shape with the lights off: same silhouette, *nothing* drawn.
     ///
-    /// What a conceal aims at. Note `Geom::of(Hidden).blanked()` is itself —
-    /// the nub is already blank — so concealing a resident pill is unchanged.
+    /// What a conceal aims at. Every opacity goes, not just the body's — the
+    /// bar row is drawn at its own opacity and would otherwise outlive the pill
+    /// it sits in, leaving a row of white marks on the desktop after the body
+    /// has faded out from under them.
+    ///
+    /// Note `Geom::of(Hidden).blanked()` is itself — the nub is already blank —
+    /// so concealing a resident pill is unchanged.
     fn blanked(self) -> Self {
         Geom {
             fill_a: 0.0,
             border_a: 0.0,
+            bars: 0.0,
+            buttons: 0.0,
             ..self
         }
     }
@@ -458,10 +465,11 @@ mod tests {
         PillMode::Done { ok, since: t(0) }
     }
 
-    /// Whether a geometry puts anything at all on screen. A conceal that has
-    /// run to completion has not.
+    /// Whether a geometry puts anything at all on screen — *anything*,
+    /// including the bar row, which is drawn at its own opacity and so can
+    /// outlive the body it sits in.
     fn is_blank(g: &Geom) -> bool {
-        g.fill_a < 0.5 && g.border_a < 0.5
+        g.fill_a < 0.5 && g.border_a < 0.5 && g.bars <= 0.0 && g.buttons <= 0.0
     }
 
     /// The nub's numbers, as settled. Pinned here rather than only on screen,
@@ -675,6 +683,31 @@ mod tests {
             let g = m.at(t(ms));
             assert_eq!((g.w, g.h), (full.w, full.h), "the pill resized at {ms}ms");
         }
+    }
+
+    /// The bar row fades *with* the pill, not after it. It is drawn at its own
+    /// opacity, so a conceal that only took the body's alphas down left a row
+    /// of white marks sitting on the desktop with nothing around them.
+    #[test]
+    fn a_conceal_takes_the_bar_row_with_it() {
+        let m = Motion::start(Geom::of(done(false)), PillMode::Hidden, CONCEAL, t(0));
+        // The row is on the way out the whole time, and gone at the end.
+        let start = m.at(t(0)).bars;
+        assert!(start > 0.0, "the flash draws a bar row to begin with");
+        for ms in 0..=120 {
+            let g = m.at(t(ms));
+            assert!(
+                g.bars <= start,
+                "at {ms}ms the row was brighter than the flash's own: {}",
+                g.bars
+            );
+            // It never outlives the body it sits in.
+            assert!(
+                g.bars <= 0.0 || g.fill_a > 0.0 || g.border_a > 0.0,
+                "at {ms}ms the bars outlived the pill"
+            );
+        }
+        assert_eq!(m.at(t(120)).bars, 0.0);
     }
 
     /// The same rule read the other way: a resident pill's conceal *is* the nub
