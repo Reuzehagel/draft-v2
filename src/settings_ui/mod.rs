@@ -21,7 +21,7 @@ mod theme;
 mod widgets;
 
 use crate::autostart;
-use crate::config::{Activation, Config, PasteMode, Provider};
+use crate::config::{Activation, Config, MonitorPolicy, PasteMode, Provider};
 use crate::secrets;
 use crate::transcribe::parakeet_download::{self, Progress as DlProgress};
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
@@ -59,6 +59,7 @@ pub fn run() -> anyhow::Result<()> {
         history_filter: String::new(),
         confirm_clear_history: false,
         input_devices: crate::audio::capture::input_device_names(),
+        displays: pinnable_displays(),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -82,6 +83,38 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
 }
+
+/// The displays the pill can be pinned to, as (device path, label).
+///
+/// A monitor whose EDID device path could not be read is left out rather than
+/// listed unpinnable: there is nothing to store for it. It is still a perfectly
+/// good home monitor under the other three policies.
+fn pinnable_displays() -> Vec<(String, String)> {
+    crate::pill::monitor::enumerate()
+        .all()
+        .iter()
+        .filter_map(|m| {
+            let path = m.device_path.clone()?;
+            let label = m.friendly_name.clone().unwrap_or_else(|| {
+                if m.primary {
+                    "Primary display".to_string()
+                } else {
+                    "Unnamed display".to_string()
+                }
+            });
+            Some((path, label))
+        })
+        .collect()
+}
+
+/// Picker order, which is also the order they get more specific in: follow me,
+/// follow my mouse, always here, always *that* one.
+const ALL_MONITOR_POLICIES: &[MonitorPolicy] = &[
+    MonitorPolicy::Focused,
+    MonitorPolicy::Cursor,
+    MonitorPolicy::Primary,
+    MonitorPolicy::Pinned,
+];
 
 const ALL_PROVIDERS: &[Provider] = &[
     Provider::LocalParakeet,
@@ -223,6 +256,10 @@ struct SettingsApp {
     confirm_clear_history: bool,
     /// Input device names enumerated at window open, for the microphone picker.
     input_devices: Vec<String>,
+    /// Connected displays as (device path, label), enumerated at window open,
+    /// for the pinned-display picker. The path is what gets stored; the label
+    /// is only ever shown.
+    displays: Vec<(String, String)>,
 }
 
 struct DownloadState {
@@ -449,9 +486,9 @@ impl SettingsApp {
         });
     }
 
-    /// The pill pane. One toggle today; the home-monitor policy (#43) and the
-    /// fullscreen behaviour (#45) are the rows that join it, which is why this
-    /// is a pane of its own rather than a row on Recording.
+    /// The pill pane. The fullscreen behaviour (#45) is the row still to join
+    /// it, which is why this is a pane of its own rather than a row on
+    /// Recording.
     fn tab_pill(&mut self, ui: &mut egui::Ui) {
         group(ui, |ui| {
             toggle_row(
@@ -462,6 +499,58 @@ impl SettingsApp {
                  is running, so you can tell at a glance that it's alive. Turn \
                  this off and the pill only appears while you're dictating — the \
                  hotkey works exactly the same either way.",
+            );
+            // Deliberately *not* gated on residency: the same policy places the
+            // session-only pill, so hiding this row when the pill is off would
+            // hide a setting that is still in force.
+            divider(ui);
+            row(ui, "Show it on", "Which display the pill appears on.", |ui| {
+                let sel = self.cfg.pill.monitor.label();
+                let options: Vec<(MonitorPolicy, &str)> = ALL_MONITOR_POLICIES
+                    .iter()
+                    .map(|&p| (p, p.label()))
+                    .collect();
+                combo(ui, "pill_monitor", &mut self.cfg.pill.monitor, sel, &options);
+            });
+            // Progressive reveal, as with the double-press lock: the picker
+            // means nothing under the other three policies.
+            if self.cfg.pill.monitor == MonitorPolicy::Pinned {
+                divider(ui);
+                self.pinned_display_row(ui);
+            }
+        });
+    }
+
+    /// The display picker, shown only when the policy is "a specific display".
+    ///
+    /// Values are EDID-derived device paths, never `\\.\DISPLAY1` — a GDI
+    /// adapter slot is reassigned on replug, so a pin stored that way rots
+    /// silently. The trade is that the label goes stale visibly instead: a
+    /// pinned display that isn't connected right now says so, and the pill
+    /// falls back to the primary until it comes back.
+    fn pinned_display_row(&mut self, ui: &mut egui::Ui) {
+        let pinned = self.cfg.pill.monitor_pinned_path.clone();
+        let connected = self
+            .displays
+            .iter()
+            .find(|(path, _)| Some(path.as_str()) == pinned.as_deref());
+        let selected = match (&pinned, connected) {
+            (_, Some((_, label))) => label.clone(),
+            (Some(_), None) => "Not connected".to_string(),
+            (None, None) => "Choose a display…".to_string(),
+        };
+        row(ui, "Display", "Pinned by the monitor itself, not by its slot — reordering your displays won't move the pill.", |ui| {
+            let options: Vec<(Option<String>, &str)> = self
+                .displays
+                .iter()
+                .map(|(path, label)| (Some(path.clone()), label.as_str()))
+                .collect();
+            combo(
+                ui,
+                "pill_monitor_pinned",
+                &mut self.cfg.pill.monitor_pinned_path,
+                &selected,
+                &options,
             );
         });
     }

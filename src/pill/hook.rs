@@ -24,8 +24,9 @@
 // whichever one is not on top. Everything this hook does not claim is forwarded
 // to the original wndproc unchanged.
 //
-// Nothing consumes the events yet — this is a prefactor. The fullscreen
-// watcher, the home monitor, and the wakeup ladder each hang off it in turn.
+// The home monitor consumes the two display messages (#43): both re-derive it,
+// and WM_DISPLAYCHANGE breaks its idle-only latch to do so. The fullscreen
+// watcher and the wakeup ladder hang off the rest in turn.
 //
 // The hook lives and dies with the pill window, so today — where the window
 // only exists for the length of a session — no event is surfaced between
