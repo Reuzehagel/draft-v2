@@ -4,7 +4,7 @@ Windows push-to-talk speech-to-text: hold a global hotkey, speak, release, and t
 
 ## Commands
 
-`cargo test` covers the activation FSM, voice commands, replacements, WAV encoding, and the pill's core, motion model and rendering. There is no CI — run tests and `cargo clippy` locally before committing; clippy stays warning-free (dead-code warnings were cleaned up deliberately). Windows-only: `cpal`, `global-hotkey`, and the `windows` crate make this non-portable.
+`cargo test` covers the activation FSM, voice commands, replacements, WAV encoding, and the pill's core, motion model and rendering. There is no CI — run `cargo test`, `cargo clippy` and `cargo fmt --check` locally before committing; clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch. Windows-only: `cpal`, `global-hotkey`, and the `windows` crate make this non-portable.
 
 To *look* at the pill without launching anything:
 

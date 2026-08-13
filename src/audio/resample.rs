@@ -4,7 +4,9 @@
 // resampler that tolerates arbitrary input lengths.
 
 use anyhow::Result;
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 const CHUNK_IN: usize = 1024;
 

@@ -35,7 +35,7 @@ impl Buffer {
         let new_len = buf.len() + samples.len();
         if new_len > self.cap {
             let overflow = new_len - self.cap; // < buf.len() given the guard above
-            // Faster than drain(..n) for big shifts: copy tail to front, truncate.
+                                               // Faster than drain(..n) for big shifts: copy tail to front, truncate.
             buf.copy_within(overflow.., 0);
             let kept = buf.len() - overflow;
             buf.truncate(kept);

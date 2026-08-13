@@ -1,7 +1,7 @@
 pub mod capture;
 pub mod level;
-pub mod ring;
 pub mod resample;
+pub mod ring;
 
 pub const TARGET_SR: u32 = 16_000;
 pub const MAX_SECONDS: usize = 10 * 60;

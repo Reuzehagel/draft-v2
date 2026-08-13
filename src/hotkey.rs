@@ -87,35 +87,63 @@ fn parse_code(s: &str) -> Result<Code> {
         "RIGHT" => Code::ArrowRight,
         "UP" => Code::ArrowUp,
         "DOWN" => Code::ArrowDown,
-        s if s.len() == 1 && s.chars().next().unwrap().is_ascii_alphabetic() => {
-            match s {
-                "A" => Code::KeyA, "B" => Code::KeyB, "C" => Code::KeyC, "D" => Code::KeyD,
-                "E" => Code::KeyE, "F" => Code::KeyF, "G" => Code::KeyG, "H" => Code::KeyH,
-                "I" => Code::KeyI, "J" => Code::KeyJ, "K" => Code::KeyK, "L" => Code::KeyL,
-                "M" => Code::KeyM, "N" => Code::KeyN, "O" => Code::KeyO, "P" => Code::KeyP,
-                "Q" => Code::KeyQ, "R" => Code::KeyR, "S" => Code::KeyS, "T" => Code::KeyT,
-                "U" => Code::KeyU, "V" => Code::KeyV, "W" => Code::KeyW, "X" => Code::KeyX,
-                "Y" => Code::KeyY, "Z" => Code::KeyZ,
-                _ => unreachable!(),
-            }
-        }
-        s if s.len() == 1 && s.chars().next().unwrap().is_ascii_digit() => {
-            match s {
-                "0" => Code::Digit0, "1" => Code::Digit1, "2" => Code::Digit2,
-                "3" => Code::Digit3, "4" => Code::Digit4, "5" => Code::Digit5,
-                "6" => Code::Digit6, "7" => Code::Digit7, "8" => Code::Digit8,
-                "9" => Code::Digit9,
-                _ => unreachable!(),
-            }
-        }
-        s if s.starts_with('F') && s[1..].chars().all(|c| c.is_ascii_digit()) => {
-            match s {
-                "F1" => Code::F1, "F2" => Code::F2, "F3" => Code::F3, "F4" => Code::F4,
-                "F5" => Code::F5, "F6" => Code::F6, "F7" => Code::F7, "F8" => Code::F8,
-                "F9" => Code::F9, "F10" => Code::F10, "F11" => Code::F11, "F12" => Code::F12,
-                _ => return Err(anyhow!("unsupported function key: {s}")),
-            }
-        }
+        s if s.len() == 1 && s.chars().next().unwrap().is_ascii_alphabetic() => match s {
+            "A" => Code::KeyA,
+            "B" => Code::KeyB,
+            "C" => Code::KeyC,
+            "D" => Code::KeyD,
+            "E" => Code::KeyE,
+            "F" => Code::KeyF,
+            "G" => Code::KeyG,
+            "H" => Code::KeyH,
+            "I" => Code::KeyI,
+            "J" => Code::KeyJ,
+            "K" => Code::KeyK,
+            "L" => Code::KeyL,
+            "M" => Code::KeyM,
+            "N" => Code::KeyN,
+            "O" => Code::KeyO,
+            "P" => Code::KeyP,
+            "Q" => Code::KeyQ,
+            "R" => Code::KeyR,
+            "S" => Code::KeyS,
+            "T" => Code::KeyT,
+            "U" => Code::KeyU,
+            "V" => Code::KeyV,
+            "W" => Code::KeyW,
+            "X" => Code::KeyX,
+            "Y" => Code::KeyY,
+            "Z" => Code::KeyZ,
+            _ => unreachable!(),
+        },
+        s if s.len() == 1 && s.chars().next().unwrap().is_ascii_digit() => match s {
+            "0" => Code::Digit0,
+            "1" => Code::Digit1,
+            "2" => Code::Digit2,
+            "3" => Code::Digit3,
+            "4" => Code::Digit4,
+            "5" => Code::Digit5,
+            "6" => Code::Digit6,
+            "7" => Code::Digit7,
+            "8" => Code::Digit8,
+            "9" => Code::Digit9,
+            _ => unreachable!(),
+        },
+        s if s.starts_with('F') && s[1..].chars().all(|c| c.is_ascii_digit()) => match s {
+            "F1" => Code::F1,
+            "F2" => Code::F2,
+            "F3" => Code::F3,
+            "F4" => Code::F4,
+            "F5" => Code::F5,
+            "F6" => Code::F6,
+            "F7" => Code::F7,
+            "F8" => Code::F8,
+            "F9" => Code::F9,
+            "F10" => Code::F10,
+            "F11" => Code::F11,
+            "F12" => Code::F12,
+            _ => return Err(anyhow!("unsupported function key: {s}")),
+        },
         _ => return Err(anyhow!("unknown key name: {s}")),
     };
     Ok(code)
@@ -182,8 +210,8 @@ pub fn register(
     command_spec: Option<&str>,
 ) -> Result<(HotkeyHandle, crossbeam_channel::Receiver<HotkeyEvent>)> {
     let dictate = parse(dictate_spec)?;
-    let manager = GlobalHotKeyManager::new()
-        .map_err(|e| anyhow!("global-hotkey init failed: {e}"))?;
+    let manager =
+        GlobalHotKeyManager::new().map_err(|e| anyhow!("global-hotkey init failed: {e}"))?;
     manager.register(dictate).map_err(|e| {
         anyhow!("RegisterHotKey failed for '{dictate_spec}': {e}. Another app may own this combo.")
     })?;

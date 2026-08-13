@@ -288,7 +288,8 @@ impl Home {
             match self.dwell {
                 // Still the same candidate — has it been there long enough?
                 Some((id, since))
-                    if id == candidate.id && now.saturating_duration_since(since) >= CURSOR_DWELL => {}
+                    if id == candidate.id
+                        && now.saturating_duration_since(since) >= CURSOR_DWELL => {}
                 Some((id, _)) if id == candidate.id => return None,
                 // A new candidate (or the first): start its clock.
                 _ => {
@@ -355,7 +356,10 @@ pub use win::{cursor_monitor, enumerate, foreground_monitor};
 /// cost nothing per poll, which is most of what makes the poll affordable.
 pub fn sample(policy: Policy) -> Signals {
     Signals {
-        focused: policy.samples_foreground().then(foreground_monitor).flatten(),
+        focused: policy
+            .samples_foreground()
+            .then(foreground_monitor)
+            .flatten(),
         cursor: policy.samples_cursor().then(cursor_monitor).flatten(),
     }
 }
@@ -762,7 +766,10 @@ mod tests {
         home.update(Trigger::Rederive, &desk, on(LAPTOP), t(0));
         assert_eq!(home.update(idle(), &desk, on(EXTERNAL), t(1_000)), None);
         let just_short = 1_000 + CURSOR_DWELL.as_millis() as u64 - 1;
-        assert_eq!(home.update(idle(), &desk, on(EXTERNAL), t(just_short)), None);
+        assert_eq!(
+            home.update(idle(), &desk, on(EXTERNAL), t(just_short)),
+            None
+        );
         let settled = 1_000 + CURSOR_DWELL.as_millis() as u64;
         assert_eq!(
             home.update(idle(), &desk, on(EXTERNAL), t(settled))
@@ -812,8 +819,13 @@ mod tests {
         // The first idle poll after it restarts the clock rather than firing.
         assert_eq!(home.update(idle(), &desk, on(EXTERNAL), t(2_001)), None);
         assert_eq!(
-            home.update(idle(), &desk, on(EXTERNAL), t(2_001 + CURSOR_DWELL.as_millis() as u64))
-                .map(|h| h.id),
+            home.update(
+                idle(),
+                &desk,
+                on(EXTERNAL),
+                t(2_001 + CURSOR_DWELL.as_millis() as u64)
+            )
+            .map(|h| h.id),
             Some(EXTERNAL)
         );
     }
@@ -919,7 +931,12 @@ mod tests {
         let mut home = Home::new(Policy::Primary, None);
         home.update(Trigger::Rederive, &desk(), Signals::default(), t(0));
         assert_eq!(
-            home.update(Trigger::Rederive, &Displays::default(), Signals::default(), t(1)),
+            home.update(
+                Trigger::Rederive,
+                &Displays::default(),
+                Signals::default(),
+                t(1)
+            ),
             None
         );
         assert_eq!(home.current().map(|h| h.id), Some(LAPTOP));
@@ -939,7 +956,9 @@ mod tests {
         all[0].dpi = 192;
         all[0].work.bottom = 1140;
         let rescaled = Displays::new(all);
-        let after = home.refresh(&rescaled).expect("a rescaled monitor re-places");
+        let after = home
+            .refresh(&rescaled)
+            .expect("a rescaled monitor re-places");
         assert_eq!(after.id, LAPTOP);
         assert_eq!(after.dpi, 192);
         assert_eq!(after.scale(), 2.0);
@@ -1043,7 +1062,12 @@ mod tests {
             let p = home.placement();
             let expected_w = (crate::pill::geom::ENVELOPE_W as f32 * home.scale()).round() as i32;
             let expected_h = (crate::pill::geom::ENVELOPE_H as f32 * home.scale()).round() as i32;
-            assert_eq!((p.width(), p.height()), (expected_w, expected_h), "{}", m.id);
+            assert_eq!(
+                (p.width(), p.height()),
+                (expected_w, expected_h),
+                "{}",
+                m.id
+            );
         }
     }
 

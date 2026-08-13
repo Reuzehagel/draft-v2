@@ -249,9 +249,8 @@ pub fn parse_text_response(provider: &str, resp: reqwest::blocking::Response) ->
             clip_body(&body, 500)
         ));
     }
-    let parsed: TextResponse = serde_json::from_str(&body).with_context(|| {
-        format!("parse {provider} response: {}", clip_body(&body, 200))
-    })?;
+    let parsed: TextResponse = serde_json::from_str(&body)
+        .with_context(|| format!("parse {provider} response: {}", clip_body(&body, 200)))?;
     Ok(parsed.text)
 }
 
@@ -317,7 +316,10 @@ mod tests {
     fn fallback_uses_primary_on_success() {
         let primary = Arc::new(StubTranscriber::new("primary", vec![Ok("hello".into())]));
         // Fallback would return different text; it must not be consulted.
-        let fallback = Arc::new(StubTranscriber::new("fallback", vec![Ok("degraded".into())]));
+        let fallback = Arc::new(StubTranscriber::new(
+            "fallback",
+            vec![Ok("degraded".into())],
+        ));
         let t = FallbackTranscriber::new(primary, fallback);
         let (text, provider) = t.transcribe_attributed(&[]).unwrap();
         assert_eq!(text, "hello");
@@ -330,7 +332,10 @@ mod tests {
             "primary",
             vec![Err(anyhow!("network down"))],
         ));
-        let fallback = Arc::new(StubTranscriber::new("fallback", vec![Ok("local text".into())]));
+        let fallback = Arc::new(StubTranscriber::new(
+            "fallback",
+            vec![Ok("local text".into())],
+        ));
         let t = FallbackTranscriber::new(primary, fallback);
         let (text, provider) = t.transcribe_attributed(&[]).unwrap();
         assert_eq!(text, "local text");

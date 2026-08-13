@@ -24,7 +24,8 @@ pub fn apply_replacement(text: &str, rule: &Replacement) -> String {
         if i + needle.len() > hay.len() {
             return false;
         }
-        let chars_match = (0..needle.len()).all(|k| char_eq(hay[i + k], needle[k], rule.case_sensitive));
+        let chars_match =
+            (0..needle.len()).all(|k| char_eq(hay[i + k], needle[k], rule.case_sensitive));
         if !chars_match {
             return false;
         }
@@ -87,20 +88,29 @@ mod tests {
     #[test]
     fn case_insensitive_matches_but_inserts_verbatim() {
         let r = rule("github", "GitHub", false, false);
-        assert_eq!(apply_replacement("i use Github daily", &r), "i use GitHub daily");
+        assert_eq!(
+            apply_replacement("i use Github daily", &r),
+            "i use GitHub daily"
+        );
     }
 
     #[test]
     fn case_sensitive_respects_case() {
         let r = rule("api", "API", true, true);
         // "API" already cased shouldn't be touched; "api" should.
-        assert_eq!(apply_replacement("the api and the API", &r), "the API and the API");
+        assert_eq!(
+            apply_replacement("the api and the API", &r),
+            "the API and the API"
+        );
     }
 
     #[test]
     fn whole_word_does_not_fire_mid_word() {
         let r = rule("a row", "arrow", true, false);
-        assert_eq!(apply_replacement("draw a row of arrows", &r), "draw arrow of arrows");
+        assert_eq!(
+            apply_replacement("draw a row of arrows", &r),
+            "draw arrow of arrows"
+        );
     }
 
     #[test]
@@ -141,6 +151,9 @@ mod tests {
     #[test]
     fn unicode_haystack_is_safe() {
         let r = rule("cafe", "café", false, false);
-        assert_eq!(apply_replacement("a cafe in Zürich", &r), "a café in Zürich");
+        assert_eq!(
+            apply_replacement("a cafe in Zürich", &r),
+            "a café in Zürich"
+        );
     }
 }

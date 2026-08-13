@@ -18,9 +18,9 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL,
-    VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT, VK_V,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RETURN,
+    VK_RWIN, VK_SHIFT, VK_V,
 };
 
 /// How long the target app gets to consume the Ctrl+V before the original
@@ -103,9 +103,7 @@ fn paste_via_clipboard(text: &str, restore: bool, on_sent: impl FnOnce()) -> Res
         // transcript — if anything else wrote in the meantime (another
         // dictation, a user copy), stomping it would lose data.
         if let Ok(mut cb2) = arboard::Clipboard::new() {
-            if cb2.get_text().ok().as_deref() == Some(text)
-                && cb2.set_text(prev).is_ok()
-            {
+            if cb2.get_text().ok().as_deref() == Some(text) && cb2.set_text(prev).is_ok() {
                 *last_pasted = None;
             }
         }
@@ -188,7 +186,11 @@ fn send_ctrl_v() -> Result<()> {
 }
 
 fn key_event(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
-    let flags = if key_up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+    let flags = if key_up {
+        KEYEVENTF_KEYUP
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    };
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {

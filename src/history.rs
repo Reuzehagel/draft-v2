@@ -76,7 +76,9 @@ pub fn is_empty() -> bool {
     let Ok(path) = history_path() else {
         return true;
     };
-    std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true)
+    std::fs::metadata(&path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true)
 }
 
 /// Wipe the history file. Best-effort — a missing file is already "clear".

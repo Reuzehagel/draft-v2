@@ -13,8 +13,8 @@
 
 use crate::audio::ring::Buffer;
 use crate::audio::TARGET_SR;
-use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
+use realfft::RealFftPlanner;
 use std::sync::Arc;
 
 const FFT_SIZE: usize = 1024;
@@ -117,7 +117,11 @@ impl BandMeter {
         let attack_alpha = 1.0 - (-dt_ms / ATTACK_MS).exp();
         let release_alpha = 1.0 - (-dt_ms / RELEASE_MS).exp();
         for (cur, &target) in self.bars.iter_mut().zip(targets.iter()) {
-            let alpha = if target > *cur { attack_alpha } else { release_alpha };
+            let alpha = if target > *cur {
+                attack_alpha
+            } else {
+                release_alpha
+            };
             *cur += alpha * (target - *cur);
         }
 
@@ -173,7 +177,8 @@ impl BandMeter {
         for (i, &s) in samples.iter().enumerate() {
             self.input_scratch[pad + i] = s * self.window[pad + i];
         }
-        if self.fft
+        if self
+            .fft
             .process(&mut self.input_scratch, &mut self.output_scratch)
             .is_err()
         {

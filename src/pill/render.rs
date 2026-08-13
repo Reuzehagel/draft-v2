@@ -112,12 +112,7 @@ pub fn draw(pm: &mut Pixmap, scale: f32, geom: &Geom, bar_heights: &[f32]) {
     };
 
     let mut fill = Paint::default();
-    fill.set_color_rgba8(
-        geom.fill.0,
-        geom.fill.1,
-        geom.fill.2,
-        alpha_u8(geom.fill_a),
-    );
+    fill.set_color_rgba8(geom.fill.0, geom.fill.1, geom.fill.2, alpha_u8(geom.fill_a));
     fill.anti_alias = true;
     pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
 
@@ -174,7 +169,13 @@ fn draw_bars(pm: &mut Pixmap, g: &Bars, bar_heights: &[f32], opacity: f32) {
         rounded_rect(&mut pb, x, y, g.bar_w, bh, r);
     }
     if let Some(path) = pb.finish() {
-        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -268,11 +269,18 @@ mod tests {
         // 36 wide, centred in a 62-wide envelope: the body starts at x=13.
         let left = (ENVELOPE_W - 36) / 2;
         // Outside the nub is untouched — the envelope is not the pill.
-        assert_eq!(pm.pixel(1, cy).unwrap().alpha(), 0, "the envelope is padding");
+        assert_eq!(
+            pm.pixel(1, cy).unwrap().alpha(),
+            0,
+            "the envelope is padding"
+        );
         assert_eq!(pm.pixel(1, 1).unwrap().alpha(), 0);
         let (edge, body) = edge_and_body(&pm, left, cy);
         assert!(edge > 60, "nub edge too dark to separate ({edge})");
-        assert!(edge > body * 3, "nub edge ({edge}) barely differs from its body ({body})");
+        assert!(
+            edge > body * 3,
+            "nub edge ({edge}) barely differs from its body ({body})"
+        );
         // No bars: the centre column is body, not the white of a bar.
         let centre = pm.pixel(ENVELOPE_W / 2, cy).unwrap();
         assert!(brightest(centre) < 40, "the nub drew a bar row: {centre:?}");
@@ -359,7 +367,10 @@ mod tests {
             .filter(|&x| pm.pixel(x, cy).unwrap().alpha() > 8)
             .count();
         assert!((36..=62).contains(&width), "mid-morph width {width}");
-        assert!(width > 40 && width < 58, "mid-morph is at an endpoint: {width}");
+        assert!(
+            width > 40 && width < 58,
+            "mid-morph is at an endpoint: {width}"
+        );
     }
 
     /// The bar row has to stay a *visibly* variable row at the shipped size: if
@@ -393,7 +404,10 @@ mod tests {
             let g = Bars::new(w, h);
             let side = (w - g.span(BAR_COUNT)) / 2.0;
             assert!(side >= 0.0, "{w}x{h}: bars overflow the body horizontally");
-            assert!(g.bar_max_h <= h, "{w}x{h}: bars overflow the body vertically");
+            assert!(
+                g.bar_max_h <= h,
+                "{w}x{h}: bars overflow the body vertically"
+            );
             assert!(
                 g.bar_w > 0.0 && g.bar_min_h <= g.bar_max_h,
                 "{w}x{h}: bar heights invert"
@@ -435,7 +449,13 @@ mod tests {
         let mut paint = Paint::default();
         paint.set_color_rgba8(255, 255, 255, 255);
         paint.anti_alias = true;
-        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
 
         // 45-degree ray from the centre: inside the circle stays filled,
         // beyond it must be empty (a quadratic corner reaches ~21.2 here).

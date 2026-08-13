@@ -129,14 +129,18 @@ mod tests {
 
     #[test]
     fn hold_mode_starts_on_press_stops_on_release() {
-        let mut f = Fsm::new(Mode::Hold { double_press_lock: false });
+        let mut f = Fsm::new(Mode::Hold {
+            double_press_lock: false,
+        });
         assert_eq!(f.step(InEvent::Pressed(t(0))), OutEvent::Start);
         assert_eq!(f.step(InEvent::Released(t(200))), OutEvent::Stop);
     }
 
     #[test]
     fn hold_with_lock_double_press_holds_through_release() {
-        let mut f = Fsm::new(Mode::Hold { double_press_lock: true });
+        let mut f = Fsm::new(Mode::Hold {
+            double_press_lock: true,
+        });
         // First press: start recording (will release immediately to set up double-tap).
         assert_eq!(f.step(InEvent::Pressed(t(0))), OutEvent::Start);
         assert_eq!(f.step(InEvent::Released(t(50))), OutEvent::Stop);

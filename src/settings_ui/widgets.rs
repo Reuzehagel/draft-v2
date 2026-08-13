@@ -53,7 +53,11 @@ pub(super) fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
         );
     }
 
-    let color = if selected || resp.hovered() { FG } else { MUTED_FG };
+    let color = if selected || resp.hovered() {
+        FG
+    } else {
+        MUTED_FG
+    };
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_string(), egui::FontId::proportional(13.5), color);
@@ -96,7 +100,8 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.hovered() {
-        ui.painter().rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
+        ui.painter()
+            .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
     }
     let galley =
         ui.painter()
@@ -127,7 +132,11 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(CONTROL_W, CONTROL_H), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let fill = if resp.hovered() { CONTROL_HOVER } else { CONTROL_FILL };
+    let fill = if resp.hovered() {
+        CONTROL_HOVER
+    } else {
+        CONTROL_FILL
+    };
     ui.painter().rect_filled(rect, Rounding::same(RADIUS), fill);
     ui.painter()
         .rect_stroke(rect, Rounding::same(RADIUS), input_border());
@@ -143,11 +152,12 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
     } else {
         ("Not set", MUTED_FG)
     };
-    let g = ui
-        .painter()
-        .layout_no_wrap(status.to_string(), egui::FontId::proportional(13.0), scolor);
+    let g =
+        ui.painter()
+            .layout_no_wrap(status.to_string(), egui::FontId::proportional(13.0), scolor);
     let gy = rect.center().y - g.size().y / 2.0;
-    ui.painter().galley(egui::pos2(x, gy), g, Color32::PLACEHOLDER);
+    ui.painter()
+        .galley(egui::pos2(x, gy), g, Color32::PLACEHOLDER);
 
     let action = if configured { "Change" } else { "Set" };
     let ga = ui.painter().layout_no_wrap(
@@ -156,8 +166,11 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
         MUTED_FG,
     );
     let ax = rect.right() - 12.0 - ga.size().x;
-    ui.painter()
-        .galley(egui::pos2(ax, rect.center().y - ga.size().y / 2.0), ga, Color32::PLACEHOLDER);
+    ui.painter().galley(
+        egui::pos2(ax, rect.center().y - ga.size().y / 2.0),
+        ga,
+        Color32::PLACEHOLDER,
+    );
 
     resp.clicked()
 }
@@ -177,7 +190,12 @@ pub(super) fn text_input(ui: &mut egui::Ui, text: &mut String, placeholder: &str
 
 /// One label/value row. Label column is capped so long captions can't slide
 /// under the control on the right.
-pub(super) fn row(ui: &mut egui::Ui, label: &str, caption: &str, control: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    caption: &str,
+    control: impl FnOnce(&mut egui::Ui),
+) {
     split_row(
         ui,
         |ui| {
@@ -214,7 +232,11 @@ pub(super) fn split_row(
 
 /// One editable find/replace rule: an enable switch, the from/to fields, the
 /// two match flags, and a remove button. Returns true when removal is asked.
-pub(super) fn replacement_editor(ui: &mut egui::Ui, idx: usize, rule: &mut crate::config::Replacement) -> bool {
+pub(super) fn replacement_editor(
+    ui: &mut egui::Ui,
+    idx: usize,
+    rule: &mut crate::config::Replacement,
+) -> bool {
     let mut remove = false;
     let field_w = 140.0;
     ui.horizontal(|ui| {
@@ -286,9 +308,19 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
 
     // Measure first, then allocate exactly that.
     let label_galley = egui::WidgetText::from(RichText::new(label).size(13.5).color(FG))
-        .into_galley(ui, Some(egui::TextWrapMode::Wrap), text_w, egui::TextStyle::Body);
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            text_w,
+            egui::TextStyle::Body,
+        );
     let caption_galley = egui::WidgetText::from(RichText::new(caption).size(11.5).color(MUTED_FG))
-        .into_galley(ui, Some(egui::TextWrapMode::Wrap), text_w, egui::TextStyle::Body);
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            text_w,
+            egui::TextStyle::Body,
+        );
     let line_gap = 4.0;
     let text_h = label_galley.size().y + line_gap + caption_galley.size().y;
     let row_h = text_h.max(toggle_size.y) + 6.0;
@@ -311,8 +343,11 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
 
     let text_top = rect.top() + 3.0;
     let label_h = label_galley.size().y;
-    ui.painter()
-        .galley(egui::pos2(rect.left(), text_top), label_galley, Color32::PLACEHOLDER);
+    ui.painter().galley(
+        egui::pos2(rect.left(), text_top),
+        label_galley,
+        Color32::PLACEHOLDER,
+    );
     ui.painter().galley(
         egui::pos2(rect.left(), text_top + label_h + line_gap),
         caption_galley,
@@ -329,7 +364,13 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
     paint_toggle(ui, toggle_rect, *value, id, resp.hovered());
 }
 
-pub(super) fn paint_toggle(ui: &mut egui::Ui, rect: egui::Rect, on: bool, id: egui::Id, hovered: bool) {
+pub(super) fn paint_toggle(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    on: bool,
+    id: egui::Id,
+    hovered: bool,
+) {
     let how_on = ui.ctx().animate_bool_with_time(id, on, 0.15);
     let bg = lerp_color(TOGGLE_OFF, PRIMARY, how_on);
     let bg = if hovered { lighten(bg, 0.05) } else { bg };
@@ -338,7 +379,10 @@ pub(super) fn paint_toggle(ui: &mut egui::Ui, rect: egui::Rect, on: bool, id: eg
 
     let pad = 2.5;
     let knob_r = rect.height() / 2.0 - pad;
-    let knob_x = egui::lerp((rect.left() + pad + knob_r)..=(rect.right() - pad - knob_r), how_on);
+    let knob_x = egui::lerp(
+        (rect.left() + pad + knob_r)..=(rect.right() - pad - knob_r),
+        how_on,
+    );
     let knob_pos = egui::pos2(knob_x, rect.center().y);
     painter.circle_filled(
         knob_pos + Vec2::new(0.0, 0.6),
@@ -391,7 +435,8 @@ pub(super) fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '
         } else {
             PRIMARY
         };
-        ui.painter().rect_filled(draw_rect, Rounding::same(RADIUS), fill);
+        ui.painter()
+            .rect_filled(draw_rect, Rounding::same(RADIUS), fill);
         let ink = if enabled { PRIMARY_FG } else { MUTED_FG };
         let galley =
             ui.painter()
@@ -425,7 +470,8 @@ pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
         } else {
             DESTRUCTIVE
         };
-        ui.painter().rect_filled(draw_rect, Rounding::same(RADIUS), fill);
+        ui.painter()
+            .rect_filled(draw_rect, Rounding::same(RADIUS), fill);
         let galley =
             ui.painter()
                 .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.5), FG);
@@ -473,11 +519,7 @@ pub(super) fn divider(ui: &mut egui::Ui) {
 /// one centred 360px card above that, in the house dialog frame. Returns
 /// true when the scrim was clicked — callers treat that as cancel. Both
 /// dialogs (and any future one) share this so the chrome can't drift apart.
-pub(super) fn modal_card(
-    ctx: &egui::Context,
-    id: &str,
-    body: impl FnOnce(&mut egui::Ui),
-) -> bool {
+pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let mut scrim_clicked = false;
     let screen = ctx.screen_rect();
     egui::Area::new(egui::Id::new((id, "scrim")))
@@ -518,4 +560,3 @@ pub(super) fn modal_card(
         });
     scrim_clicked
 }
-

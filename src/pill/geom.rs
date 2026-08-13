@@ -100,7 +100,11 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
     fn lerp(self, to: Rgb, t: f32) -> Rgb {
-        let c = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8;
+        let c = |a: u8, b: u8| {
+            (a as f32 + (b as f32 - a as f32) * t)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
         Rgb(c(self.0, to.0), c(self.1, to.1), c(self.2, to.2))
     }
 }
@@ -243,7 +247,6 @@ impl Geom {
             buttons: f(self.buttons, to.buttons),
         }
     }
-
 }
 
 /// The session pill's corner radius, as the shape ratio #25 settled derives it:
@@ -493,7 +496,10 @@ mod tests {
     fn hidden_is_the_nub_at_zero_alpha() {
         let hidden = Geom::of(PillMode::Hidden);
         let idle = Geom::of(PillMode::Idle);
-        assert_eq!((hidden.w, hidden.h, hidden.radius), (idle.w, idle.h, idle.radius));
+        assert_eq!(
+            (hidden.w, hidden.h, hidden.radius),
+            (idle.w, idle.h, idle.radius)
+        );
         assert_eq!(hidden.fill_a, 0.0);
         assert_eq!(hidden.border_a, 0.0);
         assert!(is_blank(&hidden));
@@ -513,8 +519,14 @@ mod tests {
             done(true),
         ] {
             let g = Geom::of(mode);
-            assert!(g.w <= ENVELOPE_W as f32, "{mode:?} is wider than the window");
-            assert!(g.h <= ENVELOPE_H as f32, "{mode:?} is taller than the window");
+            assert!(
+                g.w <= ENVELOPE_W as f32,
+                "{mode:?} is wider than the window"
+            );
+            assert!(
+                g.h <= ENVELOPE_H as f32,
+                "{mode:?} is taller than the window"
+            );
         }
     }
 
@@ -656,7 +668,10 @@ mod tests {
         let m = Motion::start(Geom::of(done(true)), PillMode::Idle, TO_IDLE, t(0));
         let end = m.at(t(160));
         assert_eq!(end, Geom::of(PillMode::Idle));
-        assert!(!is_blank(&end), "the pill is still on screen after a session");
+        assert!(
+            !is_blank(&end),
+            "the pill is still on screen after a session"
+        );
         // Halfway, it is genuinely between the two — a morph, not a cut.
         let mid = m.at(t(80));
         assert!(mid.w > Geom::of(PillMode::Idle).w && mid.w < Geom::of(done(true)).w);
@@ -778,6 +793,12 @@ mod tests {
     fn the_breath_changes_nothing_but_the_edge() {
         let g = Geom::of(proc());
         let b = breathe(g, Duration::from_millis(400));
-        assert_eq!(Geom { border_a: g.border_a, ..b }, g);
+        assert_eq!(
+            Geom {
+                border_a: g.border_a,
+                ..b
+            },
+            g
+        );
     }
 }

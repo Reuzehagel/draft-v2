@@ -117,8 +117,8 @@ impl PillWindow {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
-        let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
-            .ok_or_else(|| anyhow!("hires pixmap"))?;
+        let hires =
+            Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE).ok_or_else(|| anyhow!("hires pixmap"))?;
         let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
 
         #[cfg(windows)]
@@ -445,7 +445,11 @@ const PILL_EX_STYLE: u32 = {
     use windows::Win32::UI::WindowsAndMessaging::{
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
-    WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0
+    WS_EX_LAYERED.0
+        | WS_EX_TRANSPARENT.0
+        | WS_EX_NOACTIVATE.0
+        | WS_EX_TOOLWINDOW.0
+        | WS_EX_TOPMOST.0
 };
 
 /// The pill's bits ORed onto whatever GWL_EXSTYLE currently holds — never an
