@@ -124,5 +124,3 @@ pub(super) fn install_style(ctx: &egui::Context) {
 
     ctx.set_style(style);
 }
-
-

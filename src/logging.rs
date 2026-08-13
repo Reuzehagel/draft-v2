@@ -7,8 +7,8 @@ pub fn init() -> Result<WorkerGuard> {
     let appender = tracing_appender::rolling::daily(&dir, "app.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,draft=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,draft=debug"));
 
     let file_layer = fmt::layer()
         .with_writer(writer)

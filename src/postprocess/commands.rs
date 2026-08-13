@@ -157,8 +157,8 @@ fn match_command(toks: &[Tok], i: usize) -> Option<(Cmd, usize)> {
         }
         // Every token but the last must be exactly its core (modulo case):
         // punctuation between the words means they weren't spoken as one phrase.
-        let inner_bare = (0..words.len() - 1)
-            .all(|k| toks[i + k].raw.len() == toks[i + k].core.len());
+        let inner_bare =
+            (0..words.len() - 1).all(|k| toks[i + k].raw.len() == toks[i + k].core.len());
         if inner_bare {
             return Some((*cmd, words.len()));
         }
@@ -225,17 +225,26 @@ mod tests {
 
     #[test]
     fn all_caps_uppercases_next_word() {
-        assert_eq!(apply_commands("ship the all caps draft today"), "ship the DRAFT today");
+        assert_eq!(
+            apply_commands("ship the all caps draft today"),
+            "ship the DRAFT today"
+        );
     }
 
     #[test]
     fn all_caps_keeps_punctuation() {
-        assert_eq!(apply_commands("it is urgent, all caps urgent."), "it is urgent, URGENT.");
+        assert_eq!(
+            apply_commands("it is urgent, all caps urgent."),
+            "it is urgent, URGENT."
+        );
     }
 
     #[test]
     fn all_caps_at_end_is_dropped() {
-        assert_eq!(apply_commands("nothing follows all caps"), "nothing follows");
+        assert_eq!(
+            apply_commands("nothing follows all caps"),
+            "nothing follows"
+        );
     }
 
     #[test]

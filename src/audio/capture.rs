@@ -6,7 +6,7 @@
 // allocations are small and amortized, and audio glitches under transient
 // load are tolerable in a PTT app since transcription is post-hoc.
 
-use crate::audio::{ring::Buffer, resample::StreamingResampler, MAX_SAMPLES, TARGET_SR};
+use crate::audio::{resample::StreamingResampler, ring::Buffer, MAX_SAMPLES, TARGET_SR};
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -89,10 +89,7 @@ impl Capture {
                 move |data: &[i16], _: &_| {
                     // Divide by 32768 (not i16::MAX = 32767) so the most-negative
                     // sample i16::MIN maps to exactly -1.0 and stays in [-1, 1].
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|&s| s as f32 / 32768.0)
-                        .collect();
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = downmix(&f, channels);
                     let out = resampler.process(&mono);
                     buffer_cb.extend(out);

@@ -175,7 +175,6 @@ impl Tab {
     }
 }
 
-
 #[derive(Default, Clone, PartialEq, Eq)]
 struct ProviderKeys {
     mistral: String,
@@ -428,17 +427,32 @@ impl SettingsApp {
                 text_input(ui, &mut self.cfg.hotkey, "Ctrl+Backslash", CONTROL_W);
             });
             divider(ui);
-            row(ui, "Microphone", "Which input device Draft records from.", |ui| {
-                let selected = self
-                    .cfg
-                    .input_device
-                    .clone()
-                    .unwrap_or_else(|| "System default".into());
-                // "System default" (None) plus one option per enumerated device.
-                let mut options: Vec<(Option<String>, &str)> = vec![(None, "System default")];
-                options.extend(self.input_devices.iter().map(|n| (Some(n.clone()), n.as_str())));
-                combo(ui, "input_device", &mut self.cfg.input_device, &selected, &options);
-            });
+            row(
+                ui,
+                "Microphone",
+                "Which input device Draft records from.",
+                |ui| {
+                    let selected = self
+                        .cfg
+                        .input_device
+                        .clone()
+                        .unwrap_or_else(|| "System default".into());
+                    // "System default" (None) plus one option per enumerated device.
+                    let mut options: Vec<(Option<String>, &str)> = vec![(None, "System default")];
+                    options.extend(
+                        self.input_devices
+                            .iter()
+                            .map(|n| (Some(n.clone()), n.as_str())),
+                    );
+                    combo(
+                        ui,
+                        "input_device",
+                        &mut self.cfg.input_device,
+                        &selected,
+                        &options,
+                    );
+                },
+            );
             divider(ui);
             row(ui, "Activation", "Hold the key, or tap to toggle.", |ui| {
                 let sel = match self.cfg.activation {
@@ -479,9 +493,19 @@ impl SettingsApp {
             );
             if self.cfg.push_to_command {
                 divider(ui);
-                row(ui, "Command hotkey", "Same syntax as the main hotkey.", |ui| {
-                    text_input(ui, &mut self.cfg.command_hotkey, "Ctrl+Shift+Backslash", CONTROL_W);
-                });
+                row(
+                    ui,
+                    "Command hotkey",
+                    "Same syntax as the main hotkey.",
+                    |ui| {
+                        text_input(
+                            ui,
+                            &mut self.cfg.command_hotkey,
+                            "Ctrl+Shift+Backslash",
+                            CONTROL_W,
+                        );
+                    },
+                );
             }
         });
     }
@@ -504,14 +528,25 @@ impl SettingsApp {
             // session-only pill, so hiding this row when the pill is off would
             // hide a setting that is still in force.
             divider(ui);
-            row(ui, "Show it on", "Which display the pill appears on.", |ui| {
-                let sel = self.cfg.pill.monitor.label();
-                let options: Vec<(MonitorPolicy, &str)> = ALL_MONITOR_POLICIES
-                    .iter()
-                    .map(|&p| (p, p.label()))
-                    .collect();
-                combo(ui, "pill_monitor", &mut self.cfg.pill.monitor, sel, &options);
-            });
+            row(
+                ui,
+                "Show it on",
+                "Which display the pill appears on.",
+                |ui| {
+                    let sel = self.cfg.pill.monitor.label();
+                    let options: Vec<(MonitorPolicy, &str)> = ALL_MONITOR_POLICIES
+                        .iter()
+                        .map(|&p| (p, p.label()))
+                        .collect();
+                    combo(
+                        ui,
+                        "pill_monitor",
+                        &mut self.cfg.pill.monitor,
+                        sel,
+                        &options,
+                    );
+                },
+            );
             // Progressive reveal, as with the double-press lock: the picker
             // means nothing under the other three policies.
             if self.cfg.pill.monitor == MonitorPolicy::Pinned {
@@ -568,18 +603,23 @@ impl SettingsApp {
                 divider(ui);
                 let configured = !self.keys.get(self.cfg.provider).trim().is_empty();
                 let provider = self.cfg.provider;
-                row(ui, "API key", "Stored in Windows Credential Manager.", |ui| {
-                    // One full-width control, so it lines up with the Provider
-                    // dropdown above. Opens the editor; the secret itself is
-                    // never shown back here.
-                    if key_opener(ui, configured) {
-                        self.key_dialog = Some(KeyDialog {
-                            provider,
-                            buffer: String::new(),
-                            reveal: false,
-                        });
-                    }
-                });
+                row(
+                    ui,
+                    "API key",
+                    "Stored in Windows Credential Manager.",
+                    |ui| {
+                        // One full-width control, so it lines up with the Provider
+                        // dropdown above. Opens the editor; the secret itself is
+                        // never shown back here.
+                        if key_opener(ui, configured) {
+                            self.key_dialog = Some(KeyDialog {
+                                provider,
+                                buffer: String::new(),
+                                reveal: false,
+                            });
+                        }
+                    },
+                );
             }
 
             if matches!(self.cfg.provider, Provider::LocalParakeet) {
@@ -637,7 +677,11 @@ impl SettingsApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
                 } else {
                     if ui
-                        .add(ghost_button("Download model (~670 MB)", CONTROL_W, CONTROL_H))
+                        .add(ghost_button(
+                            "Download model (~670 MB)",
+                            CONTROL_W,
+                            CONTROL_H,
+                        ))
                         .clicked()
                     {
                         state.running = true;
@@ -721,7 +765,9 @@ impl SettingsApp {
                 .add(ghost_button("Add replacement", 160.0, CONTROL_H))
                 .clicked()
             {
-                self.cfg.replacements.push(crate::config::Replacement::default());
+                self.cfg
+                    .replacements
+                    .push(crate::config::Replacement::default());
             }
         });
 
@@ -943,11 +989,8 @@ impl SettingsApp {
 
     fn footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Top hairline so the footer reads as a distinct bar.
-        ui.painter().hline(
-            ui.max_rect().x_range(),
-            ui.max_rect().top(),
-            border(),
-        );
+        ui.painter()
+            .hline(ui.max_rect().x_range(), ui.max_rect().top(), border());
         let dirty = self.is_dirty();
         let size = Vec2::new(ui.available_width(), ui.available_height());
         ui.allocate_ui_with_layout(
@@ -1186,5 +1229,3 @@ fn relative_time(now: i64, ts: i64) -> String {
         format!("{}d ago", secs / 86_400)
     }
 }
-
-

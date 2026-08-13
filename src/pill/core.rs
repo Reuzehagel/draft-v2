@@ -645,7 +645,10 @@ mod tests {
         );
         // Idempotent: a config reload that didn't change residency is not a
         // reason to touch the window.
-        assert_eq!(p.set_presence(Presence::Resident { expanded: false }), vec![]);
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![]
+        );
         // And nothing retires a nub — `tick` is the flash's clock alone.
         assert!(p.tick(t(60_000)).is_empty());
     }

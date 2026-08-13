@@ -42,7 +42,11 @@ pub fn load_key(provider: Provider) -> Option<String> {
     let slot = slot_name(provider)?;
     let entry = keyring::Entry::new(SERVICE, slot).ok()?;
     let v = entry.get_password().ok()?;
-    if v.trim().is_empty() { None } else { Some(v) }
+    if v.trim().is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 pub fn save_key(provider: Provider, value: &str) -> anyhow::Result<()> {

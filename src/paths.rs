@@ -36,8 +36,7 @@ pub fn models_dir() -> Result<PathBuf> {
 /// truncated/empty file in place.
 pub fn atomic_write(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())

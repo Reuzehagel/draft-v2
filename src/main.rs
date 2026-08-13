@@ -232,26 +232,26 @@ impl App {
         while let Some(cmd) = queue.pop_front() {
             match cmd {
                 Command::StartCapture => {
-                    let more = match audio::capture::Capture::start(self.cfg.input_device.as_deref())
-                    {
-                        Ok(cap) => {
-                            tracing::info!(
-                                device = %cap.device_name,
-                                input_sr = cap.input_sr,
-                                channels = cap.input_channels,
-                                "session: START"
-                            );
-                            // The pill animates live bars from a read-only clone
-                            // of the ring buffer; the core keeps the handle it
-                            // drains at stop.
-                            self.pill.set_ring(cap.buffer.clone());
-                            self.session.capture_started(Some(cap))
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to start capture");
-                            self.session.capture_started(None)
-                        }
-                    };
+                    let more =
+                        match audio::capture::Capture::start(self.cfg.input_device.as_deref()) {
+                            Ok(cap) => {
+                                tracing::info!(
+                                    device = %cap.device_name,
+                                    input_sr = cap.input_sr,
+                                    channels = cap.input_channels,
+                                    "session: START"
+                                );
+                                // The pill animates live bars from a read-only clone
+                                // of the ring buffer; the core keeps the handle it
+                                // drains at stop.
+                                self.pill.set_ring(cap.buffer.clone());
+                                self.session.capture_started(Some(cap))
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to start capture");
+                                self.session.capture_started(None)
+                            }
+                        };
                     queue.extend(more);
                 }
                 Command::ReportActivity(activity) => {
@@ -681,7 +681,11 @@ impl App {
     fn refresh_home(&mut self) {
         self.displays = pill::monitor::enumerate();
         if let Some(home) = self.home.refresh(&self.displays) {
-            tracing::debug!(monitor = home.id, dpi = home.dpi, "pill home monitor rescaled");
+            tracing::debug!(
+                monitor = home.id,
+                dpi = home.dpi,
+                "pill home monitor rescaled"
+            );
             self.pill.set_home(home);
         }
     }
@@ -744,7 +748,9 @@ impl App {
             // changed, re-registering the unchanged main hotkey would
             // otherwise collide with our own still-live registration.
             self.hotkey_handle = None;
-            let command_spec = new_cfg.push_to_command.then(|| new_cfg.command_hotkey.clone());
+            let command_spec = new_cfg
+                .push_to_command
+                .then(|| new_cfg.command_hotkey.clone());
             match hotkey::register(&new_cfg.hotkey, command_spec.as_deref()) {
                 Ok((handle, rx)) => {
                     self.hotkey_handle = Some(handle);
@@ -909,8 +915,10 @@ impl PillAdapter {
     /// the move is a hard cut — one without the other would tear the conceal or
     /// the reveal in half.
     fn is_idle(&self, now: Instant) -> bool {
-        matches!(self.mode, None | Some(PillMode::Hidden) | Some(PillMode::Idle))
-            && !self.motion.is_running(now)
+        matches!(
+            self.mode,
+            None | Some(PillMode::Hidden) | Some(PillMode::Idle)
+        ) && !self.motion.is_running(now)
     }
 
     /// Whether the pill has a frame to draw right now. False for a settled nub,

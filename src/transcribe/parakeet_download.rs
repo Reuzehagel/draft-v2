@@ -8,8 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-const BASE_URL: &str =
-    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main";
+const BASE_URL: &str = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main";
 
 pub const REQUIRED_FILES: &[&str] = &[
     "encoder-model.int8.onnx",
@@ -59,7 +58,10 @@ pub fn download(cb: impl Fn(Progress)) -> Result<()> {
         let url = format!("{}/{}", BASE_URL, name);
         let partial = dir.join(format!("{}.partial", name));
 
-        let mut resp = client.get(&url).send().with_context(|| format!("GET {url}"))?;
+        let mut resp = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
         if !resp.status().is_success() {
             return Err(anyhow!("download {url} failed: HTTP {}", resp.status()));
         }
@@ -98,9 +100,8 @@ pub fn download(cb: impl Fn(Progress)) -> Result<()> {
             }
         }
 
-        std::fs::rename(&partial, &final_path).with_context(|| {
-            format!("rename {} -> {}", partial.display(), final_path.display())
-        })?;
+        std::fs::rename(&partial, &final_path)
+            .with_context(|| format!("rename {} -> {}", partial.display(), final_path.display()))?;
         cb(progress(done, total.or(Some(done))));
     }
     Ok(())

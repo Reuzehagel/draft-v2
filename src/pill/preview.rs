@@ -180,8 +180,20 @@ fn preview_modes() {
         (PillMode::Idle, &FLAT),
         (recording(), &LIVE),
         (PillMode::Processing { since: now }, &FLAT),
-        (PillMode::Done { ok: true, since: now }, &FLAT),
-        (PillMode::Done { ok: false, since: now }, &FLAT),
+        (
+            PillMode::Done {
+                ok: true,
+                since: now,
+            },
+            &FLAT,
+        ),
+        (
+            PillMode::Done {
+                ok: false,
+                since: now,
+            },
+            &FLAT,
+        ),
     ];
     let cell = cell();
     let mut out = canvas(2, modes.len() as u32, cell, LIGHT_DESKTOP);
@@ -244,7 +256,12 @@ fn preview_conceals() {
         "pill-conceals.png",
         STRIP_BG,
         vec![
-            filmstrip(PillMode::Idle, PillMode::Hidden, crate::pill::geom::CONCEAL, &FLAT),
+            filmstrip(
+                PillMode::Idle,
+                PillMode::Hidden,
+                crate::pill::geom::CONCEAL,
+                &FLAT,
+            ),
             filmstrip(done, PillMode::Hidden, crate::pill::geom::CONCEAL, &FLAT),
         ],
     );
