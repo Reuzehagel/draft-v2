@@ -26,6 +26,8 @@ The `Xai` and `Elevenlabs` config variants are not implemented.
 - History (`history.rs`) records every transcript *before* the paste attempt — it is the recovery path for lost pastes. Don't reorder that.
 - The settings UI is screenshot-reviewed for polish. `settings_ui/widgets.rs` documents layout invariants at the top of the file — read them before touching any settings layout, and keep the two-pane sidebar structure.
 - Hotkey re-registration on config reload releases old bindings first (re-registering an unchanged chord collides with itself). See `reload_config` in `main.rs`.
+- The resident pill is on screen doing nothing most of the time, so it must cost nothing: a settled pill asks for no frames, and the system maintains the layered surface. Don't add a `RedrawRequested → redraw()` path or any per-frame push — `PillAdapter::wants_frame` is the one gate, and `PillWindow::repush` is only for the events that can invalidate the surface (display topology, DPI, lock/RDP/wake). Never `WM_DWMCOMPOSITIONCHANGED`.
+- The pill window is fixed at its envelope (`pill::geom::ENVELOPE_*`) and only its pixels animate. Resizing it per frame would reallocate three pixmaps and a DIB section; `ensure_size` exists for DPI changes, not for morphs.
 
 ## Agent skills
 

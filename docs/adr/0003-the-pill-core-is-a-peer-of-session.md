@@ -27,4 +27,10 @@ Rules in the adapter are unreachable by tests. Everything below this layer — `
 
 ## Status
 
-Built in [#39](https://github.com/Reuzehagel/draft-v2/issues/39) as `src/pill/core.rs`. Presence is pinned to `Off` — nothing constructs `Suppressed` or `Resident` yet — so behaviour on screen is unchanged until residency itself lands (#19, #22, #23). The rules those drivers will hit are already asserted against the command list.
+Built in [#39](https://github.com/Reuzehagel/draft-v2/issues/39) as `src/pill/core.rs`.
+
+[#42](https://github.com/Reuzehagel/draft-v2/issues/42) added the residency toggle as the core's second driver, so `Presence` is now genuinely two-valued in the shipped app: `Off` or `Resident { expanded: false }`, read from `[pill] resident` at launch and on every config reload. The fullscreen watcher (#45) and the hover poller (#19) are the remaining drivers; the rules they will hit — suppression losing to a chord press, hover unable to expand a recording pill — are already asserted against the command list.
+
+The decision has held under its first real test. Residency toggled off mid-session changes nothing on screen until the flash retires, and toggled on mid-session sends the flash home to the nub, with no transition bookkeeping in either direction — both fall out of *activity outranks presence* and of the return state being derived rather than remembered. Both are unit tests over a command list rather than something only reachable by holding a hotkey while saving settings.
+
+One consequence for the adapter is worth recording, because it looks like a lifecycle rule and is not. `Hide` and `Destroy` arrive in the same command list as the mode change that *is* the conceal, so the adapter defers them until that transition has drawn its last frame. It does not decide *whether* to hide — only that a hide it was told to perform happens after the pixels it was told to draw. The core remains the sole authority on what the pill's states are and when it leaves them.

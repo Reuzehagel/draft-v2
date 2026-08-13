@@ -35,6 +35,30 @@ pub struct Config {
     pub push_to_command: bool,
     /// The hotkey that triggers push-to-command. Same syntax as `hotkey`.
     pub command_hotkey: String,
+    /// The overlay's own settings. Last field on purpose: TOML puts every
+    /// scalar before the first table, and a nested struct serialised ahead of
+    /// one would emit a `[pill]` header with the remaining keys swallowed
+    /// underneath it.
+    #[serde(default)]
+    pub pill: PillConfig,
+}
+
+/// The pill's settings. Its own table (`[pill]`) rather than flat keys, so the
+/// residency toggle joins the home-monitor policy and the rest of the overlay's
+/// settings as they land, instead of scattering `pill_*` keys across the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PillConfig {
+    /// Keep the pill on screen with nothing happening — a nub that says Draft
+    /// is on and armed. Off restores the session-only pill: nothing on screen
+    /// between dictations, and no idle work at all.
+    pub resident: bool,
+}
+
+impl Default for PillConfig {
+    fn default() -> Self {
+        Self { resident: true }
+    }
 }
 
 /// A single find/replace rule. Rules run in order, each over the output of
@@ -130,6 +154,7 @@ impl Default for Config {
             fallback_to_local: true,
             push_to_command: false,
             command_hotkey: "Ctrl+Shift+Backslash".into(),
+            pill: PillConfig::default(),
         }
     }
 }
@@ -174,5 +199,61 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         // Atomic replace so a crash mid-write can't leave a truncated config.
         crate::paths::atomic_write(&path, text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every user upgrading into residency has a config.toml written before
+    /// `[pill]` existed. It has to parse, pick the defaults up, and survive a
+    /// save/load round trip unchanged — not be backed up as corrupt.
+    #[test]
+    fn a_config_written_before_the_pill_table_existed_still_parses() {
+        let old = "hotkey = \"Ctrl+Backslash\"\n\
+                   activation = \"hold\"\n\
+                   provider = \"groq\"\n";
+        let cfg: Config = toml::from_str(old).expect("old config parses");
+        assert_eq!(cfg.hotkey, "Ctrl+Backslash");
+        assert_eq!(cfg.provider, Provider::Groq);
+        // Residency is on by default — the nub is what this ticket is for.
+        assert!(cfg.pill.resident);
+        assert_eq!(cfg.pill, PillConfig::default());
+    }
+
+    /// The table itself is `#[serde(default)]` too, so a `[pill]` section that
+    /// exists but is empty (or gains a key this build doesn't know) is not a
+    /// parse error either.
+    #[test]
+    fn an_empty_pill_table_takes_the_defaults() {
+        let cfg: Config = toml::from_str("[pill]\n").expect("empty table parses");
+        assert_eq!(cfg.pill, PillConfig::default());
+    }
+
+    #[test]
+    fn the_config_round_trips_through_toml() {
+        for resident in [true, false] {
+            let mut cfg = Config::default();
+            cfg.pill.resident = resident;
+            let text = toml::to_string_pretty(&cfg).expect("serialise");
+            let back: Config = toml::from_str(&text).expect("deserialise");
+            assert_eq!(back, cfg, "{text}");
+        }
+    }
+
+    /// TOML has no way back once a table header is emitted: every scalar has to
+    /// come before `[pill]`. Serialising with the field anywhere but last emits
+    /// a file whose later keys land *inside* the table — which round-trips into
+    /// a parse error rather than silently wrong values, but is a landmine for
+    /// the next field added to `Config` all the same.
+    #[test]
+    fn the_pill_table_is_serialised_after_every_scalar() {
+        let text = toml::to_string_pretty(&Config::default()).expect("serialise");
+        let header = text.find("[pill]").expect("the table is written");
+        assert!(
+            !text[header..].contains("hotkey"),
+            "a scalar was emitted after the table header:\n{text}"
+        );
     }
 }

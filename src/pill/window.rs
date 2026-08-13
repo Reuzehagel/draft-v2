@@ -21,8 +21,9 @@
 // window's wndproc subclass closes by answering WM_MOUSEACTIVATE itself — see
 // `pill::hook`.
 
+use crate::pill::geom::{Geom, ENVELOPE_H, ENVELOPE_W};
 use crate::pill::hook::HookEvent;
-use crate::pill::{PILL_BOTTOM_MARGIN, PILL_H, PILL_W};
+use crate::pill::PILL_BOTTOM_MARGIN;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use tiny_skia::Pixmap;
@@ -52,6 +53,9 @@ pub struct PillWindow {
     hires: Pixmap,
     // Intermediate 2× buffer for the halving downscale chain.
     mid: Pixmap,
+    /// The last frame drawn, so it can be pushed again when the system drops
+    /// the layered surface. `None` before the first frame.
+    last: Option<(Geom, Vec<f32>)>,
     #[cfg(windows)]
     layered: LayeredSurface,
 }
@@ -69,15 +73,19 @@ impl PillWindow {
         let monitor_pos = primary.position();
         let monitor_size = primary.size();
 
-        let pill_phys_w = (PILL_W as f32 * scale) as i32;
-        let pill_phys_h = (PILL_H as f32 * scale) as i32;
+        // The window is the *envelope* — the largest mode's rect — and it never
+        // changes size again. Every mode is drawn centred inside it, so a morph
+        // from the nub to the recording pill moves no window and reallocates no
+        // buffer; only pixels change.
+        let pill_phys_w = (ENVELOPE_W as f32 * scale) as i32;
+        let pill_phys_h = (ENVELOPE_H as f32 * scale) as i32;
         let margin_phys = (PILL_BOTTOM_MARGIN as f32 * scale) as i32;
         let x = monitor_pos.x + (monitor_size.width as i32 - pill_phys_w) / 2;
         let y = monitor_pos.y + monitor_size.height as i32 - pill_phys_h - margin_phys;
 
         let attrs = WindowAttributes::default()
             .with_title("Draft Pill")
-            .with_inner_size(LogicalSize::new(PILL_W, PILL_H))
+            .with_inner_size(LogicalSize::new(ENVELOPE_W, ENVELOPE_H))
             .with_position(LogicalPosition::new(
                 x as f64 / scale as f64,
                 y as f64 / scale as f64,
@@ -113,6 +121,7 @@ impl PillWindow {
             pixmap,
             hires,
             mid,
+            last: None,
             #[cfg(windows)]
             layered,
         })
@@ -139,65 +148,58 @@ impl PillWindow {
         self.window.set_visible(false);
     }
 
-    pub fn render_recording(&mut self, bar_heights: &[f32]) -> Result<()> {
+    /// Draw one frame: whatever geometry the adapter's motion says the pill is
+    /// at right now, with `bar_heights` across it.
+    ///
+    /// This is the only way pixels reach the screen. Modes have no renderers of
+    /// their own — a frame mid-morph belongs to no mode, and the `Geom` is what
+    /// expresses that.
+    pub fn render(&mut self, geom: &Geom, bar_heights: &[f32]) -> Result<()> {
         self.ensure_size()?;
-        crate::pill::render::draw_recording(
+        crate::pill::render::draw(
             &mut self.hires,
             self.scale * SUPERSAMPLE as f32,
+            geom,
             bar_heights,
         );
+        self.last = Some((*geom, bar_heights.to_vec()));
         self.blit_and_present()
     }
 
-    /// Render the post-capture success frame: a soft-green border over the flat
-    /// bar row, with `alpha` fading the whole pill out at the end.
-    pub fn render_success(&mut self, bar_heights: &[f32], alpha: f32) -> Result<()> {
-        self.ensure_size()?;
-        crate::pill::render::draw_success(
-            &mut self.hires,
-            self.scale * SUPERSAMPLE as f32,
-            bar_heights,
-            alpha,
-        );
-        self.blit_and_present()
+    /// Whether anything has been drawn yet. The adapter asks before revealing:
+    /// a window shown with no frame in it is a blank rectangle.
+    pub fn has_frame(&self) -> bool {
+        self.last.is_some()
     }
 
-    /// Render the failure frame: a muted-red border over the flat bar row,
-    /// `alpha` fading it out at the end. Shown when the transcript couldn't be
-    /// delivered, cueing the user to recover it from History.
-    pub fn render_error(&mut self, bar_heights: &[f32], alpha: f32) -> Result<()> {
-        self.ensure_size()?;
-        crate::pill::render::draw_error(
-            &mut self.hires,
-            self.scale * SUPERSAMPLE as f32,
-            bar_heights,
-            alpha,
-        );
-        self.blit_and_present()
+    /// Push the surface the pill is already showing again, unchanged.
+    ///
+    /// The layered surface is normally maintained by the system: an idle nub is
+    /// one `UpdateLayeredWindow` and then nothing, forever. Three things can
+    /// invalidate it out from under us — the display topology changing, the DPI
+    /// changing, and the compositor being torn down and rebuilt around a lock,
+    /// an RDP reconnect or a wake. This is how the pill comes back from those,
+    /// and it is not called for any other reason: a re-push per frame is
+    /// exactly the idle cost residency exists to avoid.
+    ///
+    /// A no-op before the first frame — there is nothing to re-push yet.
+    pub fn repush(&mut self) -> Result<()> {
+        let Some((geom, bars)) = self.last.take() else {
+            return Ok(());
+        };
+        let res = self.render(&geom, &bars);
+        // `render` restores `last` on success; put it back if it didn't get
+        // that far, so a failed re-push doesn't cost us the next one.
+        if self.last.is_none() {
+            self.last = Some((geom, bars));
+        }
+        res
     }
 
-    /// Render a "working" frame while transcription/paste runs: bars easing to
-    /// flat and then held there, under a neutral border that breathes via
-    /// `pulse` (0..1). `handoff_progress` (0 at the mode change, 1 once
-    /// `pill::core::HANDOFF` has elapsed) crossfades the border in and dims the
-    /// bar row.
-    pub fn render_processing(
-        &mut self,
-        bar_heights: &[f32],
-        pulse: f32,
-        handoff_progress: f32,
-    ) -> Result<()> {
-        self.ensure_size()?;
-        crate::pill::render::draw_processing(
-            &mut self.hires,
-            self.scale * SUPERSAMPLE as f32,
-            bar_heights,
-            pulse,
-            handoff_progress,
-        );
-        self.blit_and_present()
-    }
-
+    /// Match the buffers to the window. The window is fixed at the envelope and
+    /// never resized to run an animation, so in practice this only ever fires
+    /// on a DPI change — a size-changing morph must not reallocate three
+    /// pixmaps and a DIB section per frame.
     fn ensure_size(&mut self) -> Result<()> {
         let size = self.window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));

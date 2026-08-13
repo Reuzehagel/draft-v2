@@ -54,6 +54,13 @@ pub enum HookEvent {
     DisplayPower { on: bool },
     /// The session was locked or unlocked.
     SessionLock { locked: bool },
+    /// The session was attached to a terminal again — an RDP client
+    /// reconnecting, or the session being handed back to the physical console.
+    ///
+    /// Its own event rather than an unlock: the session was never locked, and
+    /// what changed is which terminal is drawing it. A layered surface does not
+    /// reliably survive that, so the pill re-pushes.
+    SessionReconnected,
 }
 
 /// The hook itself is Win32 all the way down — off Windows the pill window
@@ -79,7 +86,8 @@ mod win {
         CallWindowProcW, DefWindowProcW, GetPropW, GetWindowLongPtrW, RemovePropW, SetPropW,
         SetWindowLongPtrW, DEVICE_NOTIFY_WINDOW_HANDLE, GWLP_WNDPROC, MA_NOACTIVATE,
         PBT_POWERSETTINGCHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCDESTROY,
-        WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDPROC, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+        WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDPROC, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT,
+        WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
     };
 
     /// The subclass is the classic `GWLP_WNDPROC` swap, not comctl32's
@@ -152,8 +160,15 @@ mod win {
             WM_WTSSESSION_CHANGE => match wparam as u32 {
                 WTS_SESSION_LOCK => Reaction::Watch(HookEvent::SessionLock { locked: true }),
                 WTS_SESSION_UNLOCK => Reaction::Watch(HookEvent::SessionLock { locked: false }),
-                // Console/remote connect and disconnect, logon, logoff: real
-                // messages, nothing here acts on them.
+                // The session arriving at a terminal: an RDP client
+                // reconnecting, or it being handed back to the physical
+                // console. Both rebuild what is drawing the desktop.
+                WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT => {
+                    Reaction::Watch(HookEvent::SessionReconnected)
+                }
+                // The matching disconnects, logon and logoff: real messages,
+                // but nothing is on screen to repair when the session *leaves*
+                // a terminal — the reconnect is where the work is.
                 _ => Reaction::Pass,
             },
             _ => Reaction::Pass,
@@ -391,8 +406,8 @@ mod win {
     mod tests {
         use super::*;
         use windows::Win32::UI::WindowsAndMessaging::{
-            WM_CLOSE, WM_MOUSEMOVE, WM_PAINT, WM_SETFOCUS, WM_SIZE, WTS_CONSOLE_CONNECT,
-            WTS_SESSION_LOGON,
+            WM_CLOSE, WM_MOUSEMOVE, WM_PAINT, WM_SETFOCUS, WM_SIZE, WTS_CONSOLE_DISCONNECT,
+            WTS_REMOTE_DISCONNECT, WTS_SESSION_LOGON,
         };
 
         /// The whole reason the pill can be clicked at all: the click is
@@ -483,11 +498,32 @@ mod win {
                 classify(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK as usize, None),
                 Reaction::Watch(HookEvent::SessionLock { locked: false })
             );
-            // The same message carries logon, connect and disconnect.
-            for code in [WTS_CONSOLE_CONNECT, WTS_SESSION_LOGON] {
+            // The same message carries logon and the disconnects, which
+            // nothing acts on.
+            for code in [
+                WTS_SESSION_LOGON,
+                WTS_CONSOLE_DISCONNECT,
+                WTS_REMOTE_DISCONNECT,
+            ] {
                 assert_eq!(
                     classify(WM_WTSSESSION_CHANGE, code as usize, None),
                     Reaction::Pass,
+                    "session code {code}"
+                );
+            }
+        }
+
+        /// An RDP client reconnecting, and the session going back to the
+        /// physical console, both rebuild what is drawing the desktop — and a
+        /// layered surface does not reliably survive that. The pill has to hear
+        /// about it or it comes back invisible, with no way to recover but to
+        /// start a dictation.
+        #[test]
+        fn reattaching_the_session_to_a_terminal_is_surfaced() {
+            for code in [WTS_REMOTE_CONNECT, WTS_CONSOLE_CONNECT] {
+                assert_eq!(
+                    classify(WM_WTSSESSION_CHANGE, code as usize, None),
+                    Reaction::Watch(HookEvent::SessionReconnected),
                     "session code {code}"
                 );
             }

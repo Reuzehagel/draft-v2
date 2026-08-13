@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::pill::core::{Pill, PillMode};
+use crate::pill::geom::Motion;
 use crate::pill::hook::HookEvent;
 use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
@@ -137,6 +138,19 @@ fn tray_status(cfg: &config::Config, update: Option<&update::UpdateInfo>) -> tra
     }
 }
 
+/// The pill's presence, per the config's residency toggle.
+///
+/// This is the only place the toggle is read. `Suppressed` is the fullscreen
+/// watcher's to set (#45) and `expanded` is the hover poller's (#19); neither
+/// is a config question, so neither appears here.
+fn presence_from_config(cfg: &config::Config) -> pill::core::Presence {
+    if cfg.pill.resident {
+        pill::core::Presence::Resident { expanded: false }
+    } else {
+        pill::core::Presence::Off
+    }
+}
+
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     match cfg.activation {
         config::Activation::Toggle => activation::Mode::Toggle,
@@ -225,13 +239,14 @@ impl App {
     /// Perform the Pill core's commands. Nothing here decides anything: the
     /// core says create/show/hide/destroy and which mode, the adapter obeys.
     fn run_pill_commands(&mut self, cmds: Vec<pill::core::Command>, el: &ActiveEventLoop) {
+        let now = Instant::now();
         for cmd in cmds {
             match cmd {
                 pill::core::Command::Create => self.pill.create(el),
-                pill::core::Command::SetMode(mode) => self.pill.set_mode(mode),
-                pill::core::Command::Show => self.pill.show(),
-                pill::core::Command::Hide => self.pill.hide(),
-                pill::core::Command::Destroy => self.pill.destroy(),
+                pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
+                pill::core::Command::Show => self.pill.show(now),
+                pill::core::Command::Hide => self.pill.hide(now),
+                pill::core::Command::Destroy => self.pill.destroy(now),
             }
         }
     }
@@ -395,16 +410,22 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, _el: &ActiveEventLoop) {}
-
-    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if matches!(event, WindowEvent::RedrawRequested) {
-            self.pill.redraw();
-        }
+    /// First point at which a window can be created, so this is where residency
+    /// takes effect: the nub is on screen from launch, not from the first
+    /// dictation.
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        self.apply_presence(el);
     }
 
+    /// Deliberately empty of painting. The pill drives its own frames from
+    /// `about_to_wait`, and *only* when it has one to draw — a
+    /// `RedrawRequested → redraw()` path would put the resident nub in a
+    /// `WM_PAINT` loop, re-pushing an unchanged surface forever. A layered
+    /// window's pixels are maintained by the system; there is nothing to repaint.
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, _event: WindowEvent) {}
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        self.poll_settings_child();
+        self.poll_settings_child(el);
         while let Ok(ev) = self.menu_rx.try_recv() {
             if ev.id == self.tray.menu_ids.quit {
                 tracing::info!("quit requested from tray");
@@ -452,16 +473,51 @@ impl ApplicationHandler for App {
         }
 
         // The messages winit doesn't surface, arriving from the pill window's
-        // wndproc subclass. Drained and logged rather than acted on: the hook
-        // is a prefactor, and its consumers land one ticket at a time. Draining
-        // is not optional — an unread channel would grow for the life of the
-        // process.
+        // wndproc subclass. What they all mean here is the same thing: the
+        // layered surface the system has been maintaining for us may not have
+        // survived, so push it again.
+        //
+        // This is the *only* thing that re-pushes an idle nub. Notably absent:
+        // WM_DWMCOMPOSITIONCHANGED, which fires often and means nothing for a
+        // per-pixel-alpha layered window — following it would put the pill back
+        // in a repaint loop by another name.
+        //
+        // Draining is not optional either way; an unread channel would grow for
+        // the life of the process. The home monitor (#43), the fullscreen
+        // watcher (#45) and the wakeup ladder (#49) hang further behaviour off
+        // these in turn.
         while let Ok(ev) = self.hook_rx.try_recv() {
-            match ev {
-                HookEvent::DisplayChanged => tracing::info!("display topology changed"),
-                HookEvent::DpiChanged { dpi } => tracing::info!(dpi, "pill monitor dpi changed"),
-                HookEvent::DisplayPower { on } => tracing::info!(on, "session display power"),
-                HookEvent::SessionLock { locked } => tracing::info!(locked, "session lock"),
+            let repush = match ev {
+                // The pill's coordinate space may no longer exist, and a DPI
+                // change means the surface is the wrong resolution.
+                HookEvent::DisplayChanged => {
+                    tracing::info!("display topology changed");
+                    true
+                }
+                HookEvent::DpiChanged { dpi } => {
+                    tracing::info!(dpi, "pill monitor dpi changed");
+                    true
+                }
+                // Defensive: the compositor is torn down and rebuilt around a
+                // lock, an RDP reconnect and a display wake, and a layered
+                // surface does not reliably survive that. Coming back is cheap;
+                // coming back to an invisible pill is not recoverable without
+                // a dictation.
+                HookEvent::DisplayPower { on } => {
+                    tracing::info!(on, "session display power");
+                    on
+                }
+                HookEvent::SessionLock { locked } => {
+                    tracing::info!(locked, "session lock");
+                    !locked
+                }
+                HookEvent::SessionReconnected => {
+                    tracing::info!("session reattached to a terminal");
+                    true
+                }
+            };
+            if repush {
+                self.pill.repush();
             }
         }
 
@@ -478,15 +534,18 @@ impl ApplicationHandler for App {
         }
 
         // Retire the pill once its terminal flash has run its course.
-        let cmds = self.pill_core.tick(Instant::now());
+        let now = Instant::now();
+        let cmds = self.pill_core.tick(now);
         self.run_pill_commands(cmds, el);
 
-        // When the pill is up, drive frame redraws ourselves at ~30 Hz.
-        // Otherwise idle wait so we don't spin.
-        if self.pill.is_active() {
-            self.pill.redraw();
+        // Frames are pushed only when there is one to push. A settled nub wants
+        // none at all — that is what makes residency free: one
+        // `UpdateLayeredWindow` when it arrives, and then the system owns the
+        // surface until something actually happens.
+        if self.pill.wants_frame(now) {
+            self.pill.redraw(now);
             el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(1000 / PILL_FRAME_RATE_HZ),
+                now + Duration::from_millis(1000 / PILL_FRAME_RATE_HZ),
             ));
         } else {
             el.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
@@ -519,7 +578,18 @@ impl App {
         }
     }
 
-    fn poll_settings_child(&mut self) {
+    /// Hand the current residency setting to the Pill core and perform whatever
+    /// it decides that means. Note what this does *not* do: create or destroy a
+    /// window. Presence is a fact about what the user asked for; whether a
+    /// window exists is the core's conclusion from presence *and* activity, and
+    /// mid-session those disagree — which is exactly the case that must not
+    /// snatch the pill away.
+    fn apply_presence(&mut self, el: &ActiveEventLoop) {
+        let cmds = self.pill_core.set_presence(presence_from_config(&self.cfg));
+        self.run_pill_commands(cmds, el);
+    }
+
+    fn poll_settings_child(&mut self, el: &ActiveEventLoop) {
         let Some(child) = self.settings_child.as_mut() else {
             return;
         };
@@ -527,7 +597,7 @@ impl App {
             Ok(Some(status)) => {
                 tracing::info!(?status, "settings subprocess exited; reloading config");
                 self.settings_child = None;
-                self.reload_config();
+                self.reload_config(el);
             }
             Ok(None) => {}
             Err(e) => {
@@ -537,7 +607,7 @@ impl App {
         }
     }
 
-    fn reload_config(&mut self) {
+    fn reload_config(&mut self, el: &ActiveEventLoop) {
         let new_cfg = match config::Config::load() {
             Ok(c) => c,
             Err(e) => {
@@ -594,6 +664,11 @@ impl App {
         self.session
             .set_transcriber_available(self.transcriber.is_some());
         self.cfg = new_cfg;
+        // Residency rides beside the activation reset: hand the new value to
+        // the Pill core and let it decide. Toggled off mid-session it changes
+        // nothing on screen until the flash retires, because activity outranks
+        // presence — the pill is never snatched away mid-dictation.
+        self.apply_presence(el);
         // The tooltip names the hotkey and provider, and settings can clear
         // the history — so the tray follows a settings change without a restart.
         self.refresh_tray();
@@ -602,17 +677,38 @@ impl App {
 
 /// The pill window and its animation, driven by the [`PillMode`] the Pill core
 /// derives. The core decides *what* mode, *when* to transition, and whether a
-/// window exists at all; the adapter derives every frame's bars, breathing
-/// pulse, and fade — including easing the bars flat once the mode leaves
-/// `Recording`. It holds no lifecycle rules.
+/// window exists at all; the adapter derives every frame's geometry from the
+/// motion model, and its bars from the ring buffer. It holds no lifecycle rules.
+///
+/// The whole of its animation state is one [`Motion`] — where the pill was,
+/// where it is going, and when it set off. There is no per-mode animation code
+/// left here: a mode change starts a tween, and every frame is `motion.at(now)`.
 struct PillAdapter {
     window: Option<pill::window::PillWindow>,
     /// Handed to each window it creates, so the wndproc hook can post to the
     /// app loop.
     hook_tx: crossbeam_channel::Sender<HookEvent>,
     bands: audio::level::BandMeter,
-    /// The current logical mode; `None` when no pill is shown.
+    /// The current logical mode; `None` when there is no window.
     mode: Option<PillMode>,
+    /// The transition in flight — or a settled Geom, once it has finished.
+    motion: Motion,
+    /// A frame is owed that the animation state alone would not ask for: the
+    /// one that lands a finished transition. Cleared by [`Self::redraw`].
+    ///
+    /// This is what makes an idle nub cost nothing: with no motion running and
+    /// no frame owed, the adapter asks for none at all and the system keeps the
+    /// layered surface alive by itself.
+    frame_owed: bool,
+    /// A `Hide` or `Destroy` the core has issued that the pill is still
+    /// animating its way to. Both arrive in the same command list as the mode
+    /// change that concealing *is*, so performing them on arrival would cut
+    /// that conceal off at its first frame.
+    ///
+    /// This defers *when* a teardown happens; it never decides *whether* one
+    /// does. See [`Self::supersede_teardown`] for the one case where a deferred
+    /// teardown is dropped — which is also the core's call, not the adapter's.
+    pending: Option<Teardown>,
     /// When the handoff started, i.e. when the mode last became `Processing`.
     ///
     /// Kept on the adapter rather than read off the mode because the handoff
@@ -625,6 +721,17 @@ struct PillAdapter {
     ring: Option<audio::ring::Buffer>,
 }
 
+/// What to do with the window once the motion taking it off screen has run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Teardown {
+    /// Off screen, window kept — the resident case, where the next reveal must
+    /// not have to rebuild a layered window.
+    Hide,
+    /// Off screen and gone. Only reached when the pill has no reason to exist
+    /// at all: residency off, and no session running.
+    Destroy,
+}
+
 impl PillAdapter {
     fn new(hook_tx: crossbeam_channel::Sender<HookEvent>) -> Self {
         Self {
@@ -632,6 +739,9 @@ impl PillAdapter {
             hook_tx,
             bands: audio::level::BandMeter::new(pill::BAR_COUNT),
             mode: None,
+            motion: Motion::settled(PillMode::Hidden, Instant::now()),
+            frame_owed: false,
+            pending: None,
             handoff_since: None,
             ring: None,
         }
@@ -641,13 +751,51 @@ impl PillAdapter {
         self.ring = Some(ring);
     }
 
-    fn is_active(&self) -> bool {
-        self.window.is_some()
+    /// Whether the pill has a frame to draw right now. False for a settled nub,
+    /// which is the point: residency costs one `UpdateLayeredWindow` and then
+    /// nothing until something happens.
+    fn wants_frame(&self, now: Instant) -> bool {
+        if self.window.is_none() {
+            return false;
+        }
+        self.frame_owed || self.motion.is_running(now) || self.mode_self_animates()
+    }
+
+    /// The modes that produce new pixels without a transition running: live
+    /// bars, the working breath, and the tail of a handoff still falling.
+    fn mode_self_animates(&self) -> bool {
+        match self.mode {
+            Some(PillMode::Recording { .. }) | Some(PillMode::Processing { .. }) => true,
+            // The flash itself is a still image. The only thing moving under it
+            // is a handoff that outlived Processing.
+            Some(PillMode::Done { .. }) => handoff_damping(self.handoff_since) > 0.0,
+            _ => false,
+        }
+    }
+
+    /// Drop a deferred teardown, because the core has since said it wants the
+    /// pill again.
+    ///
+    /// Not a lifecycle decision of the adapter's own: the core issues its
+    /// commands in order, and a later `Create` or `Show` supersedes an earlier
+    /// `Hide`/`Destroy` that has not been performed yet. All the adapter is
+    /// doing is refusing to perform a command the core has already overruled —
+    /// which is exactly what deferring it made possible.
+    fn supersede_teardown(&mut self) {
+        self.pending = None;
     }
 
     /// Build the window, off screen. A failure leaves us without one; every
     /// later command is a no-op until the core asks for another.
     fn create(&mut self, el: &ActiveEventLoop) {
+        // A window still here means a `Destroy` is deferred behind a conceal.
+        // The core has now asked for a window and there is one — reuse it
+        // rather than tearing a layered window down to build the same thing
+        // back a frame later.
+        if self.window.is_some() {
+            self.supersede_teardown();
+            return;
+        }
         match pill::window::PillWindow::create(el, self.hook_tx.clone()) {
             Ok(pw) => self.window = Some(pw),
             Err(e) => {
@@ -657,15 +805,17 @@ impl PillAdapter {
         }
     }
 
-    /// Apply a mode the core derived. Entering `Recording` starts the meter from
-    /// silence and paints one frame immediately, so the reveal that follows is
-    /// already the pill (not a transparent rectangle); the rest just swap the
-    /// mode, and the next redraw picks the bars up from there.
+    /// Apply a mode the core derived: start the transition into it from
+    /// whatever the pill currently *looks* like.
+    ///
+    /// Starting from the drawn geometry rather than from the previous mode's is
+    /// what makes an interrupted transition continue rather than jump — a chord
+    /// pressed halfway through a reveal grows from the half-revealed nub.
     ///
     /// Note what is *not* reset on the way out of `Recording`: the meter keeps
-    /// its clock, so the waveform running under the handoff is the same one that
-    /// was running a frame earlier, with no sideways jump at the mode change.
-    fn set_mode(&mut self, mode: PillMode) {
+    /// its clock, so the waveform running under the handoff is the same one
+    /// that was running a frame earlier, with no sideways jump at the change.
+    fn set_mode(&mut self, mode: PillMode, now: Instant) {
         let entering_recording = matches!(mode, PillMode::Recording { .. })
             && !matches!(self.mode, Some(PillMode::Recording { .. }));
         // Stamp the handoff on the way *into* Processing only, so a `Done` that
@@ -675,91 +825,115 @@ impl PillAdapter {
                 self.handoff_since = Some(since);
             }
         }
-        self.mode = Some(mode);
         if entering_recording {
             self.handoff_since = None;
             self.bands.reset();
-            if let Some(pw) = self.window.as_mut() {
-                let _ = pw.render_recording(&flat_bars());
-            }
         }
+        let tween = pill::geom::transition(self.mode.unwrap_or(PillMode::Hidden), mode);
+        self.motion = Motion::start(self.motion.at(now), mode, tween, now);
+        self.mode = Some(mode);
+        self.frame_owed = true;
+        // Paint the first frame before the `Show` that follows reveals it, so
+        // what appears is already the pill and never a blank rectangle.
+        self.redraw(now);
     }
 
-    fn show(&self) {
+    fn show(&mut self, now: Instant) {
+        self.supersede_teardown();
+        // Paint before revealing, so what appears is already the pill and never
+        // a blank rectangle. Normally a no-op: the `SetMode` that precedes
+        // every `Show` has drawn that frame already, and re-pushing an
+        // identical surface is the per-frame cost residency exists to avoid.
+        if !self.window.as_ref().is_some_and(|pw| pw.has_frame()) {
+            self.redraw(now);
+        }
         if let Some(pw) = self.window.as_ref() {
             pw.show();
         }
     }
 
-    fn hide(&self) {
+    /// Take the pill off screen — once the motion doing so has finished. The
+    /// core issues `Hide` with the mode change that *is* the conceal, so hiding
+    /// the window here and now would cut that animation off at its first frame.
+    fn hide(&mut self, now: Instant) {
+        self.pending = Some(Teardown::Hide);
+        self.flush_pending(now);
+    }
+
+    /// Tear the window down, on the same terms as [`Self::hide`]: the conceal
+    /// runs first, then the window goes.
+    fn destroy(&mut self, now: Instant) {
+        self.pending = Some(Teardown::Destroy);
+        self.flush_pending(now);
+    }
+
+    /// Perform a deferred hide/destroy if the motion that had to run first is
+    /// over. Called after every frame, so the teardown lands on the frame after
+    /// the last one the conceal drew.
+    fn flush_pending(&mut self, now: Instant) {
+        let Some(teardown) = self.pending else {
+            return;
+        };
+        if self.motion.is_running(now) {
+            return;
+        }
+        self.pending = None;
         if let Some(pw) = self.window.as_ref() {
             pw.hide();
         }
+        if teardown == Teardown::Destroy {
+            // The ring goes with the window — it belongs to a capture that is
+            // long over by the time the pill has no reason to exist.
+            self.mode = None;
+            self.ring = None;
+            self.handoff_since = None;
+            self.frame_owed = false;
+            drop(self.window.take());
+        }
     }
 
-    /// Tear the window down. The ring goes with it — it belongs to a capture
-    /// that is long over by the time the pill has no reason to exist.
-    fn destroy(&mut self) {
-        self.mode = None;
-        self.ring = None;
-        self.handoff_since = None;
-        drop(self.window.take());
+    /// Re-push the surface the pill is already showing. The system maintains a
+    /// layered window's pixels on its own, so this is only for the events that
+    /// can invalidate them out from under us — see [`PillWindow::repush`].
+    fn repush(&mut self) {
+        let Some(pw) = self.window.as_mut() else {
+            return;
+        };
+        if let Err(e) = pw.repush() {
+            tracing::error!(error = %e, "pill surface re-push failed");
+        }
     }
 
-    fn redraw(&mut self) {
+    /// Draw one frame: the motion's geometry at `now`, with this frame's bars.
+    fn redraw(&mut self, now: Instant) {
         let Some(pill) = self.window.as_mut() else {
             return;
         };
-        match self.mode {
-            // Terminal flash: green (delivered) or red (failed) border over the
-            // bar row, holding then fading over the final 30% of the linger.
-            // The row is normally already flat — the handoff took it there long
-            // before the worker came back — but a fast outcome can land
-            // mid-fall, so the fall goes on underneath rather than snapping.
-            Some(PillMode::Done { ok, since }) => {
-                let total = pill::core::linger(ok).as_secs_f32();
-                let t = (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
-                let alpha = if t < 0.7 {
-                    1.0
-                } else {
-                    ((1.0 - t) / 0.3).clamp(0.0, 1.0)
-                };
-                let bars = bars_for_frame(&mut self.bands, None, handoff_damping(self.handoff_since));
-                let res = if ok {
-                    pill.render_success(&bars, alpha)
-                } else {
-                    pill.render_error(&bars, alpha)
-                };
-                if let Err(e) = res {
-                    tracing::error!(error = %e, "pill outcome render failed");
-                }
-            }
-            // Worker still running: a neutral border breathing (~0.8 Hz) so a
-            // slow round-trip reads as live, not hung. The first `HANDOFF` of
-            // this mode is still the tail of the capture — the waveform keeps
-            // running underneath while the ease drains it to flat, and the
-            // border crossfades in over the same ramp.
-            Some(PillMode::Processing { since }) => {
-                let pulse =
-                    0.5 - 0.5 * (since.elapsed().as_secs_f32() * std::f32::consts::TAU * 0.8).cos();
-                let damping = handoff_damping(self.handoff_since);
-                let bars = bars_for_frame(&mut self.bands, None, damping);
-                if let Err(e) = pill.render_processing(&bars, pulse, 1.0 - damping) {
-                    tracing::error!(error = %e, "pill processing render failed");
-                }
-            }
-            // Nothing to paint. `Idle` and `Expanded` are unreachable while
-            // presence is pinned to `Off`; the nub they render lands with
-            // residency itself (#17, #27).
-            Some(PillMode::Hidden) | Some(PillMode::Idle) | Some(PillMode::Expanded) | None => {}
-            // Live capture: animate bars from the ring buffer, undamped.
-            Some(PillMode::Recording { .. }) => {
-                let bars = bars_for_frame(&mut self.bands, self.ring.as_ref(), 1.0);
-                if let Err(e) = pill.render_recording(&bars) {
-                    tracing::error!(error = %e, "pill render failed");
-                }
-            }
+        let mut geom = self.motion.at(now);
+        // The breath rides on top of the morph rather than being part of it:
+        // it is a sustained oscillation with no end state, so it cannot be a
+        // lerp between two Geoms.
+        if let Some(PillMode::Processing { since }) = self.mode {
+            geom = pill::geom::breathe(geom, now.saturating_duration_since(since));
         }
+        // The bars' *heights* are not part of the Geom — the Geom carries the
+        // row's opacity, and the waveform is live data. The handoff drains it
+        // over the same 320 ms the border is crossfading across.
+        let ring = matches!(self.mode, Some(PillMode::Recording { .. }))
+            .then_some(self.ring.as_ref())
+            .flatten();
+        let bars = if geom.bars > 0.0 {
+            bars_for_frame(&mut self.bands, ring, handoff_damping(self.handoff_since))
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = pill.render(&geom, &bars) {
+            tracing::error!(error = %e, "pill render failed");
+        }
+        // One more frame is owed while a transition is still running, so the
+        // frame that lands it is drawn even if the loop wakes up past its end.
+        self.frame_owed = self.motion.is_running(now);
+        self.flush_pending(now);
     }
 }
 

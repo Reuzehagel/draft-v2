@@ -63,10 +63,10 @@ pub fn linger(ok: bool) -> Duration {
 /// `expanded` is a flag inside `Resident` rather than a third axis, because
 /// expansion is meaningless when the pill is off or suppressed.
 ///
-/// Only `Off` is reachable in the shipped app so far: the drivers that set the
-/// other two — the fullscreen watcher (#22) and the residency toggle plus hover
-/// poller (#23, #19) — are not built yet. The rules are here, and tested, ahead
-/// of them.
+/// `Off` and `Resident { expanded: false }` are both reachable — the residency
+/// toggle sets them. The other two are their drivers': `Suppressed` is the
+/// fullscreen watcher's (#45), and `expanded` the hover poller's (#19). The
+/// rules are here, and tested, ahead of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum Presence {
@@ -184,8 +184,11 @@ pub struct Pill {
 impl Pill {
     pub fn new() -> Self {
         Self {
-            // Residency does not exist yet, so the pill starts (and, until the
-            // toggle lands, stays) session-scoped.
+            // Session-scoped until the adapter has read the config and can act
+            // on the answer — which it cannot before there is an event loop to
+            // create a window on. A pill that is `Off` for those first moments
+            // costs nothing; one that assumed residency would have to be taken
+            // back off screen for the user who turned it off.
             presence: Presence::Off,
             activity: Activity::None,
             window: false,
@@ -206,10 +209,9 @@ impl Pill {
         self.settle()
     }
 
-    /// Set the presence axis. The drivers that call this — the residency toggle
-    /// (#23), the fullscreen watcher (#22) and the hover poller (#19) — are not
-    /// built yet, which is why presence is `Off` for the whole of this ticket.
-    #[allow(dead_code)]
+    /// Set the presence axis. Called by the residency toggle at launch and on
+    /// every config reload; the fullscreen watcher (#45) and the hover poller
+    /// (#19) become its other callers in turn.
     pub fn set_presence(&mut self, presence: Presence) -> Vec<Command> {
         self.presence = presence;
         self.settle()
@@ -625,6 +627,130 @@ mod tests {
                 Command::Hide,
                 Command::Destroy
             ]
+        );
+    }
+
+    /// Residency turned on: the nub arrives, once, and stays. This is the whole
+    /// of what the toggle does from a standing start.
+    #[test]
+    fn switching_residency_on_puts_the_nub_up_and_leaves_it_there() {
+        let mut p = Pill::new();
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![
+                Command::Create,
+                Command::SetMode(PillMode::Idle),
+                Command::Show
+            ]
+        );
+        // Idempotent: a config reload that didn't change residency is not a
+        // reason to touch the window.
+        assert_eq!(p.set_presence(Presence::Resident { expanded: false }), vec![]);
+        // And nothing retires a nub — `tick` is the flash's clock alone.
+        assert!(p.tick(t(60_000)).is_empty());
+    }
+
+    /// The idle → hidden transition: residency turned off with nothing running.
+    /// The pill goes, and the window goes with it, because there is nothing
+    /// left for it to do.
+    #[test]
+    fn switching_residency_off_while_idle_takes_the_pill_and_its_window() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: false });
+        assert_eq!(
+            p.set_presence(Presence::Off),
+            vec![
+                Command::SetMode(PillMode::Hidden),
+                Command::Hide,
+                Command::Destroy
+            ]
+        );
+        assert_eq!(p.set_presence(Presence::Off), vec![]);
+    }
+
+    /// Toggled OFF mid-session: the pill is not snatched away. It rides out
+    /// Recording and Processing, holds the flash, and only then goes.
+    #[test]
+    fn residency_switched_off_mid_session_rides_the_session_out() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: false });
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        // The user saves settings with residency off while still speaking.
+        assert_eq!(p.set_presence(Presence::Off), vec![]);
+        // Recording and Processing are unaffected — activity outranks presence.
+        assert_eq!(
+            p.on_session(SessionActivity::Processing { since: t(500) }, t(500)),
+            vec![Command::SetMode(PillMode::Processing { since: t(500) })]
+        );
+        assert_eq!(
+            p.on_session(SessionActivity::Finished { ok: true }, t(800)),
+            vec![Command::SetMode(PillMode::Done {
+                ok: true,
+                since: t(800)
+            })]
+        );
+        // The flash holds its full linger...
+        assert!(p
+            .tick(t(800) + SUCCESS_LINGER - Duration::from_millis(1))
+            .is_empty());
+        // ...and only when it retires does the pill leave.
+        assert_eq!(
+            p.tick(t(800) + SUCCESS_LINGER),
+            vec![
+                Command::SetMode(PillMode::Hidden),
+                Command::Hide,
+                Command::Destroy
+            ]
+        );
+    }
+
+    /// Toggled ON mid-session: nothing appears mid-dictation, and the flash
+    /// retires to the nub rather than to nothing. The other direction of the
+    /// same rule — the return state is derived, never remembered.
+    #[test]
+    fn residency_switched_on_mid_session_shows_the_nub_once_the_flash_retires() {
+        let mut p = Pill::new();
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        // Turned on while recording: nothing on screen changes.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![]
+        );
+        p.on_session(SessionActivity::Processing { since: t(500) }, t(500));
+        p.on_session(SessionActivity::Finished { ok: false }, t(900));
+        // The longer linger, since this one failed.
+        assert!(p.tick(t(900) + SUCCESS_LINGER).is_empty());
+        // The flash resolves to the nub, and the window is kept — no Hide, no
+        // Destroy, because the pill has somewhere to be.
+        assert_eq!(
+            p.tick(t(900) + ERROR_LINGER),
+            vec![Command::SetMode(PillMode::Idle)]
+        );
+    }
+
+    /// A session started with residency off, toggled on and off again before it
+    /// ends, resolves to whatever presence says at the moment the flash retires
+    /// — not to any state it passed through on the way.
+    #[test]
+    fn only_the_presence_at_retirement_decides_where_the_flash_goes() {
+        let mut p = Pill::new();
+        p.on_session(SessionActivity::Finished { ok: true }, t(0));
+        p.set_presence(Presence::Resident { expanded: false });
+        p.set_presence(Presence::Off);
+        p.set_presence(Presence::Resident { expanded: false });
+        assert_eq!(
+            p.tick(t(0) + SUCCESS_LINGER),
+            vec![Command::SetMode(PillMode::Idle)]
         );
     }
 
