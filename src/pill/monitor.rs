@@ -249,9 +249,10 @@ impl Home {
     ///
     /// This is the readable state the rest of the pill is meant to consult:
     /// the fullscreen hide check (#45) has to require the fullscreen window to
-    /// share it, and the hover hit test (#19) has to test against its rect.
-    /// Neither exists yet, which is the only reason nothing outside the tests
-    /// calls this — the rule is here, and asserted, ahead of them.
+    /// share it. That check doesn't exist yet, which is the only reason nothing
+    /// outside the tests calls this — the rule is here, and asserted, ahead of
+    /// it. (The hover hit test reads the same monitor's placement through the
+    /// pill window, which is handed one of these at every move.)
     #[allow(dead_code)]
     pub fn current(&self) -> Option<HomeMonitor> {
         self.current
@@ -350,7 +351,7 @@ impl Home {
 
 /// The Win32 half: what the pure core cannot know.
 #[cfg(windows)]
-pub use win::{cursor_monitor, enumerate, foreground_monitor};
+pub use win::{cursor_monitor, cursor_pos, enumerate, foreground_monitor};
 
 /// Sample only the signals this policy actually reads. `primary` and `pinned`
 /// cost nothing per poll, which is most of what makes the poll affordable.
@@ -376,6 +377,11 @@ pub fn foreground_monitor() -> Option<MonitorId> {
 
 #[cfg(not(windows))]
 pub fn cursor_monitor() -> Option<MonitorId> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn cursor_pos() -> Option<(i32, i32)> {
     None
 }
 
@@ -444,10 +450,22 @@ mod win {
     }
 
     pub fn cursor_monitor() -> Option<MonitorId> {
-        let mut pt = POINT::default();
-        unsafe { GetCursorPos(&mut pt) }.ok()?;
+        let pt = cursor_point()?;
         let m = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) };
         (!m.is_invalid()).then_some(m.0 as MonitorId)
+    }
+
+    /// The cursor, in physical virtual-screen pixels — the space the pill's own
+    /// placement is in, so the hover test compares the two directly and scales
+    /// by nothing.
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        cursor_point().map(|pt| (pt.x, pt.y))
+    }
+
+    fn cursor_point() -> Option<POINT> {
+        let mut pt = POINT::default();
+        unsafe { GetCursorPos(&mut pt) }.ok()?;
+        Some(pt)
     }
 
     fn enum_monitors() -> Vec<HMONITOR> {

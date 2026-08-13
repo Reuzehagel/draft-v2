@@ -21,7 +21,7 @@
 // window's wndproc subclass closes by answering WM_MOUSEACTIVATE itself — see
 // `pill::hook`.
 
-use crate::pill::geom::Geom;
+use crate::pill::geom::{Geom, Slots};
 use crate::pill::hook::HookEvent;
 use crate::pill::monitor::HomeMonitor;
 use anyhow::{anyhow, Result};
@@ -39,6 +39,23 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowLevel};
+
+/// The surface's size in physical pixels: the home monitor's placement, which
+/// is the same fact [`PillWindow::render`] takes its scale from. One derivation
+/// for both, so they cannot disagree.
+fn surface_size(home: &HomeMonitor) -> (u32, u32) {
+    let rect = home.placement();
+    (rect.width().max(1) as u32, rect.height().max(1) as u32)
+}
+
+/// One drawn frame, kept so it can be pushed again unchanged. Everything the
+/// renderer needs and nothing else: a re-push must reproduce the pixels that
+/// are already on screen, not derive a fresh frame from a newer clock.
+struct Frame {
+    geom: Geom,
+    bars: Vec<f32>,
+    slots: Slots,
+}
 
 pub struct PillWindow {
     /// Held only for its `Drop` — and declared first so it runs first: the
@@ -63,7 +80,7 @@ pub struct PillWindow {
     mid: Pixmap,
     /// The last frame drawn, so it can be pushed again when the system drops
     /// the layered surface. `None` before the first frame.
-    last: Option<(Geom, Vec<f32>)>,
+    last: Option<Frame>,
     #[cfg(windows)]
     layered: LayeredSurface,
 }
@@ -114,8 +131,10 @@ impl PillWindow {
             unsafe { place(hwnd, &home) };
         }
 
-        let size = window.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
+        // Off the home monitor's placement, not `window.inner_size()`: the
+        // buffers and the scale `render` draws at have to come from the same
+        // fact, or the surface is drawn for one monitor and sized for another.
+        let (w, h) = surface_size(&home);
         let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
         let hires =
             Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE).ok_or_else(|| anyhow!("hires pixmap"))?;
@@ -198,16 +217,72 @@ impl PillWindow {
     /// This is the only way pixels reach the screen. Modes have no renderers of
     /// their own — a frame mid-morph belongs to no mode, and the `Geom` is what
     /// expresses that.
-    pub fn render(&mut self, geom: &Geom, bar_heights: &[f32]) -> Result<()> {
+    pub fn render(&mut self, geom: &Geom, bar_heights: &[f32], slots: &Slots) -> Result<()> {
         self.ensure_size()?;
         crate::pill::render::draw(
             &mut self.hires,
             self.home.scale() * SUPERSAMPLE as f32,
             geom,
             bar_heights,
+            slots,
         );
-        self.last = Some((*geom, bar_heights.to_vec()));
+        self.last = Some(Frame {
+            geom: *geom,
+            bars: bar_heights.to_vec(),
+            slots: *slots,
+        });
         self.blit_and_present()
+    }
+
+    /// Flip the pill's click-through.
+    ///
+    /// `WS_EX_TRANSPARENT` is off **only** while the pill is showing buttons.
+    /// During a hotkey session it stays on, and a click passes straight through
+    /// to the app being dictated into — which is where the words are going.
+    ///
+    /// A bare read-modify-write `SetWindowLongPtrW`, on the event-loop thread.
+    /// Notably *not*: `SetWindowPos(SWP_FRAMECHANGED)`, which would recompute
+    /// the frame and flicker a layered window; and never
+    /// `Window::set_cursor_hittest`, which ORs the layered bit away as the
+    /// price of hit-testing (#20, and this module's header).
+    pub fn set_click_through(&self, on: bool) {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+            };
+            let hwnd = self.layered.hwnd;
+            let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let next = if on {
+                cur | WS_EX_TRANSPARENT.0
+            } else {
+                cur & !WS_EX_TRANSPARENT.0
+            };
+            if next != cur {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = on;
+    }
+
+    /// The winit id of the pill's window, so the app loop can tell its mouse
+    /// events from any other window's.
+    pub fn id(&self) -> winit::window::WindowId {
+        self.window.id()
+    }
+
+    /// Where the pill is, in physical virtual-screen pixels — the space
+    /// `GetCursorPos` reports in, so the hover poll compares the two directly
+    /// and scales by nothing.
+    pub fn rect(&self) -> crate::pill::monitor::Rect {
+        self.home.placement()
+    }
+
+    /// The home monitor's scale, for turning a physical cursor offset into the
+    /// logical pixels the button slabs are stated in.
+    pub fn scale(&self) -> f32 {
+        self.home.scale()
     }
 
     /// Whether anything has been drawn yet. The adapter asks before revealing:
@@ -234,32 +309,45 @@ impl PillWindow {
     ///
     /// A no-op before the first frame — there is nothing to re-push yet.
     pub fn repush(&mut self) -> Result<()> {
-        let Some((geom, bars)) = self.last.take() else {
+        let Some(frame) = self.last.take() else {
             return Ok(());
         };
-        let res = self.render(&geom, &bars);
+        let res = self.render(&frame.geom, &frame.bars, &frame.slots);
         // `render` restores `last` on success; put it back if it didn't get
         // that far, so a failed re-push doesn't cost us the next one.
         if self.last.is_none() {
-            self.last = Some((geom, bars));
+            self.last = Some(frame);
         }
         res
     }
 
-    /// Match the buffers to the window. The window is fixed at the envelope and
-    /// never resized to run an animation, so in practice this only ever fires
-    /// on a DPI change — a size-changing morph must not reallocate three
-    /// pixmaps and a DIB section per frame.
+    /// Match the buffers to the **home monitor's placement**. The window is
+    /// fixed at the envelope and never resized to run an animation, so in
+    /// practice this only ever fires on a DPI change — a size-changing morph
+    /// must not reallocate three pixmaps and a DIB section per frame.
+    ///
+    /// Deliberately *not* off `window.inner_size()`. The size the window
+    /// happens to have is not a fact we own: winit answers `WM_DPICHANGED` by
+    /// resizing to its own idea of the logical size, and the DPI change it is
+    /// answering is the one our own move across monitors caused. Sizing the
+    /// buffers from that left the surface drawn at the home monitor's scale and
+    /// sized for the *other* monitor's — 155px of button bar in a 124px
+    /// surface, with both outer islands clipped off (#44).
+    ///
+    /// So the window follows the buffers rather than the other way round: when
+    /// the placement moves, the rect is re-asserted with it.
     fn ensure_size(&mut self) -> Result<()> {
-        let size = self.window.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
+        let (w, h) = surface_size(&self.home);
         if self.pixmap.width() != w || self.pixmap.height() != h {
             self.pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
             self.hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
                 .ok_or_else(|| anyhow!("hires pixmap"))?;
             self.mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
             #[cfg(windows)]
-            self.layered.resize(&self.window, w, h)?;
+            {
+                self.layered.resize(&self.window, w, h)?;
+                unsafe { place(self.layered.hwnd, &self.home) };
+            }
         }
         Ok(())
     }

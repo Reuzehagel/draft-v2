@@ -27,6 +27,7 @@ rubato = "0.16"
 hound = "3"
 parking_lot = "0.12"
 tiny-skia = "0.11"
+svgtypes = "0.16"
 realfft = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls"] }
 serde_json = "1"

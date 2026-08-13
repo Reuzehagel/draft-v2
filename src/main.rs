@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::pill::core::{Pill, PillMode};
-use crate::pill::geom::Motion;
+use crate::pill::geom::{Hover, Motion};
 use crate::pill::hook::HookEvent;
 use crate::pill::monitor::{Displays, Home, HomeMonitor};
 use crate::session::{Command, Session, SessionKind};
@@ -47,6 +47,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 const PILL_FRAME_RATE_HZ: u64 = 30;
+
+/// How far outside the nub a cursor counts as having reached it, in logical
+/// pixels. The nub is 36x10 and deliberately small; asking the cursor to land
+/// on it exactly would make the bar hard to open, and asking only that the
+/// cursor be on the *window* would open it from across the envelope.
+const HOVER_REACH: f32 = 8.0;
 
 /// Release the on-device model from RAM after this much dictation inactivity.
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -75,7 +81,7 @@ fn main() -> Result<()> {
 
     let update_rx = update::spawn_check();
 
-    let tray = tray::build(&tray_status(&cfg, None))?;
+    let tray = tray::build(&tray_status(&cfg, None, !history::is_empty()))?;
     let menu_rx = tray::menu_event_receiver();
 
     let command_spec = cfg.push_to_command.then(|| cfg.command_hotkey.clone());
@@ -136,20 +142,24 @@ fn main() -> Result<()> {
 /// Gather what the tray should currently say. Called at the events that can
 /// change it — startup, config reload, a finished dictation, the update check
 /// reporting — never on a timer.
-fn tray_status(cfg: &config::Config, update: Option<&update::UpdateInfo>) -> tray::Status {
+fn tray_status(
+    cfg: &config::Config,
+    update: Option<&update::UpdateInfo>,
+    has_history: bool,
+) -> tray::Status {
     tray::Status {
         hotkey: cfg.hotkey.clone(),
         provider: cfg.provider,
         update: update.map(|u| u.latest_version.clone()),
-        has_history: !history::is_empty(),
+        has_history,
     }
 }
 
 /// The pill's presence, per the config's residency toggle.
 ///
 /// This is the only place the toggle is read. `Suppressed` is the fullscreen
-/// watcher's to set (#45) and `expanded` is the hover poller's (#19); neither
-/// is a config question, so neither appears here.
+/// watcher's to set (#45) and `expanded` is [`App::poll_hover`]'s; neither is a
+/// config question, so neither appears here.
 fn presence_from_config(cfg: &config::Config) -> pill::core::Presence {
     if cfg.pill.resident {
         pill::core::Presence::Resident { expanded: false }
@@ -193,8 +203,9 @@ struct App {
     /// push-to-command), the capture handle, session id, and session kind;
     /// hands back `Command`s to perform.
     session: Session<audio::capture::Capture>,
-    /// The pure owner of the pill's life. `Session` is one of its drivers; the
-    /// residency toggle, the fullscreen watcher and the hover poller follow.
+    /// The pure owner of the pill's life. `Session` is one of its drivers, the
+    /// residency toggle and the hover poll are two more; the fullscreen watcher
+    /// (#45) follows.
     pill_core: Pill,
     pill: PillAdapter,
     /// Which monitor the pill lives on, and the policy deriving it. Pure: it is
@@ -424,10 +435,38 @@ impl App {
         });
     }
 
-    /// Re-read what the tray should say and push it to the shell.
-    fn refresh_tray(&self) {
-        self.tray
-            .apply(&tray_status(&self.cfg, self.update_available.as_ref()));
+    /// Push the current state to both surfaces that report it: the tray's
+    /// tooltip and menu, and the pill's Copy button.
+    ///
+    /// The two share a fact — whether there is a transcript to recover — so
+    /// they are refreshed together and off one read of it. "Copy last
+    /// transcription" and the bar's Copy button are the same recovery path;
+    /// one of them live while the other is not would be a lie about the same
+    /// history.
+    fn refresh_status(&mut self) {
+        let has_history = !history::is_empty();
+        self.tray.apply(&tray_status(
+            &self.cfg,
+            self.update_available.as_ref(),
+            has_history,
+        ));
+        self.pill_core.set_has_history(has_history);
+        let enabled = std::array::from_fn(|i| self.pill_core.enabled(i));
+        self.pill.set_enabled(enabled);
+    }
+
+    /// Perform a button press. The core decided *which* button — including
+    /// whether it was live at all — so there is nothing to check here.
+    fn run_button(&mut self, action: pill::core::Action) {
+        match action {
+            pill::core::Action::Copy => self.copy_last_transcription(),
+            // The settings window takes focus; the pill still does not. It is a
+            // subprocess, so nothing about this window changes.
+            pill::core::Action::Settings => self.open_settings(),
+            pill::core::Action::Dictate => {
+                tracing::info!("pill: dictate button clicked (wired up in #30)")
+            }
+        }
     }
 
     /// Put the most recent transcript back on the clipboard, so a paste that
@@ -463,14 +502,49 @@ impl ApplicationHandler for App {
         // window, and a window has to be created *somewhere*.
         self.rederive_home();
         self.apply_presence(el);
+        // Whether there is anything to copy is read here rather than at build
+        // time: the tray was built before the event loop, and the bar's Copy
+        // button needs the same answer.
+        self.refresh_status();
     }
 
-    /// Deliberately empty of painting. The pill drives its own frames from
+    /// Deliberately empty of *painting*. The pill drives its own frames from
     /// `about_to_wait`, and *only* when it has one to draw — a
     /// `RedrawRequested → redraw()` path would put the resident nub in a
     /// `WM_PAINT` loop, re-pushing an unchanged surface forever. A layered
     /// window's pixels are maintained by the system; there is nothing to repaint.
-    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, _event: WindowEvent) {}
+    ///
+    /// What does arrive here is the mouse: while the bar is up,
+    /// `WS_EX_TRANSPARENT` is off and the pill is a real mouse target, so
+    /// per-button hover is `CursorMoved` rather than another poll (#20).
+    /// Everything else winit offers is ignored.
+    fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.pill.window_id() != Some(id) {
+            return;
+        }
+        let now = Instant::now();
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let x = self.pill.offset_in_window(position.x as f32);
+                let hovered = x.and_then(|x| self.pill_core.button_at(x));
+                self.pill.set_cursor(x, hovered, now);
+            }
+            // The collapse itself is the hover poll's call — this only puts the
+            // indicator out, so a cursor leaving by the corner (which stays
+            // click-through) doesn't leave a button lit.
+            WindowEvent::CursorLeft { .. } => self.pill.set_cursor(None, None, now),
+            WindowEvent::MouseInput {
+                state: winit::event::ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                if let Some(action) = self.pill.cursor_x.and_then(|x| self.pill_core.action_at(x)) {
+                    self.run_button(action);
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.poll_settings_child(el);
@@ -517,7 +591,7 @@ impl ApplicationHandler for App {
             self.run_commands(cmds, el);
             // A finished dictation may have been the first transcript ever
             // recorded, which is what enables "Copy last transcription".
-            self.refresh_tray();
+            self.refresh_status();
         }
 
         // The messages winit doesn't surface, arriving from the pill window's
@@ -583,7 +657,7 @@ impl ApplicationHandler for App {
         // At most one message, only when a newer release exists.
         if let Ok(info) = self.update_rx.try_recv() {
             self.update_available = Some(info);
-            self.refresh_tray();
+            self.refresh_status();
         }
 
         // Free the on-device model if dictation has been idle long enough.
@@ -596,6 +670,11 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let cmds = self.pill_core.tick(now);
         self.run_pill_commands(cmds, el);
+
+        // Is the cursor over the pill? Before the home poll, which latches
+        // while the pill is expanded — so the answer this produces is the one
+        // that latch reads.
+        self.poll_hover(el);
 
         // Where the pill should be living, on the loop's own cadence. Latched
         // unless the pill is idle, and free for the policies with no per-poll
@@ -690,6 +769,42 @@ impl App {
         }
     }
 
+    /// Expand the pill when the cursor arrives over it, and collapse it when it
+    /// leaves.
+    ///
+    /// **Polling, not a mouse target.** The pill is click-through whenever it
+    /// is not showing buttons, so it receives no mouse messages to enter *by* —
+    /// one `GetCursorPos` against the window's own rect is the whole mechanism.
+    /// It keeps polling once expanded: winit's `CursorLeft` is what puts the
+    /// indicator out, but the cursor can leave without one (a teleport, another
+    /// window taking the pointer), and a pill left expanded under no cursor
+    /// would be a pill that swallows clicks forever.
+    ///
+    /// Skipped with no window, which is what keeps residency-off free of idle
+    /// work. Hover cannot expand a recording pill — the Pill core enforces
+    /// that, so this hands over the cursor's answer unconditionally and lets it
+    /// decide.
+    fn poll_hover(&mut self, el: &ActiveEventLoop) {
+        // Presence is the residency toggle's to own; expansion only rides
+        // along. With residency off there is nothing to expand, and saying so
+        // here would overwrite `Off` with `Resident` — as it will overwrite
+        // `Suppressed` when the fullscreen watcher lands (#45), which is why
+        // that ticket has to gate this the way the toggle already does.
+        if !self.pill.has_window() || !self.cfg.pill.resident {
+            return;
+        }
+        let Some(cursor) = pill::monitor::cursor_pos() else {
+            return;
+        };
+        let expanded = self
+            .pill
+            .cursor_over(cursor, self.pill_core.showing_buttons());
+        let cmds = self
+            .pill_core
+            .set_presence(pill::core::Presence::Resident { expanded });
+        self.run_pill_commands(cmds, el);
+    }
+
     /// The ordinary per-loop sample. The core decides whether the latch applies
     /// and whether the cursor has dwelt long enough; all this does is hand it
     /// what only the adapter can know.
@@ -735,7 +850,7 @@ impl App {
                 tracing::error!(error = %e, "config reload failed");
                 // The settings session may still have cleared the history even
                 // though its config didn't load — don't leave the menu stale.
-                self.refresh_tray();
+                self.refresh_status();
                 return;
             }
         };
@@ -803,7 +918,7 @@ impl App {
         self.apply_presence(el);
         // The tooltip names the hotkey and provider, and settings can clear
         // the history — so the tray follows a settings change without a restart.
-        self.refresh_tray();
+        self.refresh_status();
     }
 }
 
@@ -856,6 +971,18 @@ struct PillAdapter {
     handoff_since: Option<Instant>,
     /// Read-only clone of the active capture's ring buffer, for live bars.
     ring: Option<audio::ring::Buffer>,
+    /// Which button the cursor is on, and the fade between it and the last.
+    /// Deliberately outside the [`Motion`]: per-button hover is per-button
+    /// state that one `Geom` cannot carry (#29).
+    hover: Hover,
+    /// Whether each button is live, as the Pill core last derived it. Cached
+    /// here because it is a per-frame drawing input and the core is not asked
+    /// per frame; [`App::refresh_status`] is what keeps the two in step.
+    enabled: [bool; pill::core::BUTTON_COUNT],
+    /// The cursor's last known offset from the pill's centre, in logical
+    /// pixels. `MouseInput` carries no position, so this is what a click is
+    /// tested against.
+    cursor_x: Option<f32>,
 }
 
 /// What to do with the window once the motion taking it off screen has run.
@@ -882,7 +1009,93 @@ impl PillAdapter {
             pending: None,
             handoff_since: None,
             ring: None,
+            hover: Hover::new(Instant::now()),
+            enabled: [true; pill::core::BUTTON_COUNT],
+            cursor_x: None,
         }
+    }
+
+    /// Adopt the core's view of which buttons are live.
+    fn set_enabled(&mut self, enabled: [bool; pill::core::BUTTON_COUNT]) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.frame_owed = true;
+        }
+    }
+
+    /// Where the cursor is, as a logical offset from the pill's centre, and
+    /// which button that lights. A cursor wandering inside one slab moves
+    /// nothing, so it costs no frame.
+    fn set_cursor(&mut self, offset: Option<f32>, hovered: Option<usize>, now: Instant) {
+        self.cursor_x = offset;
+        if self.hover.set(hovered, now) {
+            self.frame_owed = true;
+        }
+    }
+
+    fn window_id(&self) -> Option<WindowId> {
+        self.window.as_ref().map(|pw| pw.id())
+    }
+
+    /// Where the pill is, in physical virtual-screen pixels — `None` with no
+    /// window.
+    fn rect(&self) -> Option<pill::monitor::Rect> {
+        self.window.as_ref().map(|pw| pw.rect())
+    }
+
+    /// Whether the cursor is inside the region that keeps the pill expanded.
+    ///
+    /// A direct comparison of physical virtual-screen pixels: `GetCursorPos`
+    /// and the window's placement are both in that space, and scaling either by
+    /// [`pill::window::PillWindow::scale`] would put the test in a space
+    /// neither of them is in.
+    ///
+    /// **The region is not the same coming and going.** Opening asks the cursor
+    /// to be near the *nub* — the window is the envelope, and a 36x10 nub that
+    /// sprang open from 60px away would be a pill that expands at anything
+    /// passing along the bottom of the screen. Staying open asks only that the
+    /// cursor be on the window, which is where the buttons now are. The overlap
+    /// between the two is the hysteresis: nothing can sit on a boundary and
+    /// flicker.
+    ///
+    /// What this does not decide is clicks: a layered window hit-tests on
+    /// per-pixel alpha, so the corners stay click-through however it answers.
+    fn cursor_over(&self, cursor: (i32, i32), expanded: bool) -> bool {
+        let Some(r) = self.rect() else {
+            return false;
+        };
+        let inside = |r: pill::monitor::Rect| {
+            cursor.0 >= r.left && cursor.0 < r.right && cursor.1 >= r.top && cursor.1 < r.bottom
+        };
+        if expanded {
+            return inside(r);
+        }
+        inside(self.nub_reach(r))
+    }
+
+    /// The nub, grown by [`HOVER_REACH`] on every side — the region a hover has
+    /// to reach to open the bar. In physical pixels, off the window's own rect,
+    /// so it lands on the nub at any DPI.
+    fn nub_reach(&self, r: pill::monitor::Rect) -> pill::monitor::Rect {
+        let scale = self.window.as_ref().map_or(1.0, |pw| pw.scale());
+        let half_w = ((pill::geom::NUB_W / 2.0 + HOVER_REACH) * scale).round() as i32;
+        let half_h = ((pill::geom::NUB_H / 2.0 + HOVER_REACH) * scale).round() as i32;
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        pill::monitor::Rect {
+            left: cx - half_w,
+            top: cy - half_h,
+            right: cx + half_w,
+            bottom: cy + half_h,
+        }
+    }
+
+    /// A `CursorMoved` position — physical pixels from the window's top-left —
+    /// as the logical offset from the pill's centre the button slabs are stated
+    /// in. This is the *one* place the scale divides: the slabs are logical,
+    /// every pixel Windows reports is not.
+    fn offset_in_window(&self, physical_x: f32) -> Option<f32> {
+        let (r, pw) = (self.rect()?, self.window.as_ref()?);
+        Some((physical_x - r.width() as f32 / 2.0) / pw.scale())
     }
 
     fn set_ring(&mut self, ring: audio::ring::Buffer) {
@@ -928,7 +1141,10 @@ impl PillAdapter {
         if self.window.is_none() {
             return false;
         }
-        self.frame_owed || self.motion.is_running(now) || self.mode_self_animates()
+        self.frame_owed
+            || self.motion.is_running(now)
+            || self.hover.is_running(now)
+            || self.mode_self_animates()
     }
 
     /// The modes that produce new pixels without a transition running: live
@@ -1002,6 +1218,25 @@ impl PillAdapter {
         if entering_recording {
             self.handoff_since = None;
             self.bands.reset();
+        }
+        // Click-through is off exactly while the bar is up, and the flip
+        // happens with the mode rather than on a timer: the window becomes a
+        // mouse target at the instant it has something to click.
+        //
+        // Note it goes *back on* at the start of the collapse, not the end. The
+        // pill is on its way out from under the cursor either way, and a window
+        // that swallowed clicks through a 90 ms fade would be swallowing them
+        // for the app underneath.
+        let buttons = mode.shows_buttons();
+        if buttons != self.mode.is_some_and(PillMode::shows_buttons) {
+            if let Some(pw) = self.window.as_ref() {
+                pw.set_click_through(!buttons);
+            }
+            if !buttons {
+                // Nothing to hover once the bar is gone, and a hover left
+                // standing would light a button on the next reveal.
+                self.set_cursor(None, None, now);
+            }
         }
         let tween = pill::geom::transition(self.mode.unwrap_or(PillMode::Hidden), mode);
         self.motion = Motion::start(self.motion.at(now), mode, tween, now);
@@ -1101,12 +1336,16 @@ impl PillAdapter {
         } else {
             Vec::new()
         };
-        if let Err(e) = pill.render(&geom, &bars) {
+        // Per-button hover, likewise: the Geom carries the bar's *growth*, and
+        // which button is lit is state beside it.
+        let slots = self.hover.slots(now, |i| self.enabled[i]);
+        if let Err(e) = pill.render(&geom, &bars, &slots) {
             tracing::error!(error = %e, "pill render failed");
         }
         // One more frame is owed while a transition is still running, so the
         // frame that lands it is drawn even if the loop wakes up past its end.
-        self.frame_owed = self.motion.is_running(now);
+        // The hover fade is a second, smaller one with the same need.
+        self.frame_owed = self.motion.is_running(now) || self.hover.is_running(now);
         self.flush_pending(now);
     }
 }

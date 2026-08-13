@@ -24,7 +24,8 @@
 
 use crate::pill::core::{Origin, PillMode};
 use crate::pill::geom::{
-    breathe, Geom, Motion, Tween, ENVELOPE_H, ENVELOPE_W, REVEAL, TO_IDLE, TO_RECORDING,
+    breathe, Geom, Motion, Slot, Slots, Tween, ENVELOPE_H, ENVELOPE_W, HOVER_IN, HOVER_OUT, REVEAL,
+    TO_IDLE, TO_RECORDING,
 };
 use crate::pill::render::draw;
 use std::path::PathBuf;
@@ -55,6 +56,13 @@ const DARK_DESKTOP: (u8, u8, u8) = (8, 8, 10);
 /// green flash read against it.
 const STRIP_BG: (u8, u8, u8) = (24, 24, 28);
 
+/// Every button live and none of them lit — the bar at rest, and what the modes
+/// that draw no bar at all are handed.
+const NO_SLOTS: Slots = [Slot {
+    hover: 0.0,
+    enabled: true,
+}; crate::pill::core::BUTTON_COUNT];
+
 fn out_dir() -> PathBuf {
     // Under `target/` so it is git-ignored and `cargo clean` takes it.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -74,9 +82,15 @@ fn recording() -> PillMode {
 /// `PillWindow` uses — so the anti-aliasing here is the anti-aliasing on screen,
 /// not tiny-skia's raw output at 1x.
 fn frame(geom: &Geom, bars: &[f32]) -> Pixmap {
+    frame_with(geom, bars, &NO_SLOTS)
+}
+
+/// The same, with per-button hover state — for the expanded bar, where which
+/// button is lit is not part of the Geom.
+fn frame_with(geom: &Geom, bars: &[f32], slots: &Slots) -> Pixmap {
     const SS: u32 = 4;
     let mut hi = Pixmap::new(ENVELOPE_W * SS, ENVELOPE_H * SS).unwrap();
-    draw(&mut hi, SS as f32, geom, bars);
+    draw(&mut hi, SS as f32, geom, bars, slots);
     let mut out = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
     out.draw_pixmap(
         0,
@@ -263,6 +277,72 @@ fn preview_conceals() {
                 &FLAT,
             ),
             filmstrip(done, PillMode::Hidden, crate::pill::geom::CONCEAL, &FLAT),
+        ],
+    );
+}
+
+/// The button bar: nothing hovered, each button hovered in turn, and Copy
+/// disabled — the four states the expanded pill can be settled in.
+///
+/// Over a light desktop and a black one, because the bare desktop *between* the
+/// islands is part of the design: there is no enclosing body, so what shows
+/// between them is whatever is behind the pill.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_buttons() {
+    let live = Slot {
+        hover: 0.0,
+        enabled: true,
+    };
+    let hovering = |i: usize| -> Slots {
+        std::array::from_fn(|s| Slot {
+            hover: if s == i { 1.0 } else { 0.0 },
+            ..live
+        })
+    };
+    let rows: Vec<Slots> = vec![
+        NO_SLOTS,
+        hovering(0),
+        hovering(1),
+        hovering(2),
+        // Nothing recorded yet: Copy is faint, and its slab is inert.
+        std::array::from_fn(|s| Slot {
+            enabled: s != 0,
+            ..live
+        }),
+    ];
+    let expanded = Geom::of(PillMode::Expanded);
+    let cell = cell();
+    let mut out = canvas(2, rows.len() as u32, cell, LIGHT_DESKTOP);
+    for y in 0..out.height() {
+        for x in cell.0..out.width() {
+            let (w, c) = (out.width(), opaque(DARK_DESKTOP));
+            out.pixels_mut()[(y * w + x) as usize] = c;
+        }
+    }
+    for (r, slots) in rows.iter().enumerate() {
+        let pill = frame_with(&expanded, &FLAT, slots);
+        let y = r as u32 * cell.1 + PAD;
+        blit(&mut out, &pill, PAD, y, LIGHT_DESKTOP);
+        blit(&mut out, &pill, cell.0 + PAD, y, DARK_DESKTOP);
+    }
+    let path = out_dir().join("pill-buttons.png");
+    out.save_png(&path).expect("write preview png");
+    println!("wrote {}", path.display());
+}
+
+/// The fold-out and the collapse: the flankers sliding out from behind Dictate
+/// and back. The point of the pair is that neither staggers — every button's
+/// offset is the same progress value.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_expansion() {
+    write(
+        "pill-expansion.png",
+        STRIP_BG,
+        vec![
+            filmstrip(PillMode::Idle, PillMode::Expanded, HOVER_IN, &FLAT),
+            filmstrip(PillMode::Expanded, PillMode::Idle, HOVER_OUT, &FLAT),
         ],
     );
 }
