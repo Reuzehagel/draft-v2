@@ -63,10 +63,9 @@ pub fn linger(ok: bool) -> Duration {
 /// `expanded` is a flag inside `Resident` rather than a third axis, because
 /// expansion is meaningless when the pill is off or suppressed.
 ///
-/// `Off` and `Resident { expanded: false }` are both reachable — the residency
-/// toggle sets them. The other two are their drivers': `Suppressed` is the
-/// fullscreen watcher's (#45), and `expanded` the hover poller's (#19). The
-/// rules are here, and tested, ahead of them.
+/// The residency toggle sets `Off` and `Resident`, and the hover poll sets
+/// `expanded` on the latter (#44). `Suppressed` is the fullscreen watcher's
+/// (#45) — the rules are here, and tested, ahead of it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum Presence {
@@ -88,6 +87,149 @@ pub enum Origin {
     /// bar lands (#29); the mode it derives is asserted in the tests below.
     #[allow(dead_code)]
     Click,
+}
+
+/// What clicking a button does. The adapter performs it; the core only ever
+/// says which one, so the whole of "what is under the cursor and is it live"
+/// stays assertable without a mouse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// Put the last transcript back on the clipboard — the recovery path for a
+    /// paste that landed in the wrong window, not "get the text".
+    Copy,
+    /// Start a click-started session. Wired up in a later ticket (#30); it
+    /// renders and hovers here.
+    Dictate,
+    /// Launch the settings subprocess, exactly as the tray item does.
+    Settings,
+}
+
+/// Which glyph a button wears. Lucide, resolved to a path by
+/// [`crate::pill::icons`] — the core names the icon and knows nothing about
+/// how it is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Icon {
+    Copy,
+    Mic,
+    Sliders,
+}
+
+/// One button of the bar: what it does, what it wears, and how wide it is.
+///
+/// Width is a field rather than a constant because the three are not the same
+/// size — and **the glyph box is not the button**: [`GLYPH_BOX`] is 22 in all
+/// three regardless of the island they sit in, which is what makes the centre
+/// button read as a wider target rather than a bigger icon.
+pub struct Button {
+    pub action: Action,
+    pub icon: Icon,
+    /// The island's width in logical pixels. Its height is derived — see
+    /// [`Button::height`].
+    pub w: f32,
+}
+
+impl Button {
+    /// An island is as tall as it is wide, capped at the bar's height. One
+    /// expression, and both shapes fall out of it: a 32 button is a circle, a
+    /// 48 button is a stadium.
+    pub fn height(&self) -> f32 {
+        self.w.min(BAR_H)
+    }
+
+    /// Fully rounded at its own height, at every width.
+    pub fn radius(&self) -> f32 {
+        self.height() / 2.0
+    }
+}
+
+/// The bar's height, and the cap every island's height is taken against.
+pub const BAR_H: f32 = 32.0;
+
+/// Bare desktop between islands. There is no enclosing body to gap *within*:
+/// the expanded pill is three separate shapes with the desktop showing between
+/// them.
+pub const BAR_GAP: f32 = 3.0;
+
+/// The 24-unit grid every glyph is drawn in, as a box in logical pixels. The
+/// same in all three buttons — see [`Button`].
+pub const GLYPH_BOX: f32 = 22.0;
+
+/// The button set, in the order it is laid out. **This list is the button bar**:
+/// the bar's width, the islands, the hit slabs, the glyph lookup and the click
+/// action are all derived from it, so adding a fourth button is an edit here
+/// and nowhere else.
+///
+/// The count must stay odd — see
+/// [`the_button_count_stays_odd`](tests::the_button_count_stays_odd), which is
+/// the one place that invariant is stated rather than baked into the layout.
+pub const BUTTON_COUNT: usize = 3;
+
+/// The centre button's index — the one the pill's body *is* while expanded, and
+/// the one the flankers fold out from behind. Derived rather than written down:
+/// the odd count is what makes it exist at all.
+pub const CENTRE: usize = BUTTON_COUNT / 2;
+
+pub const BUTTONS: [Button; BUTTON_COUNT] = [
+    Button {
+        action: Action::Copy,
+        icon: Icon::Copy,
+        w: 32.0,
+    },
+    Button {
+        action: Action::Dictate,
+        icon: Icon::Mic,
+        w: 48.0,
+    },
+    Button {
+        action: Action::Settings,
+        icon: Icon::Sliders,
+        w: 32.0,
+    },
+];
+
+/// The bar's total width: every island plus the desktop between them.
+pub fn bar_width() -> f32 {
+    BUTTONS.iter().map(|b| b.w).sum::<f32>() + BAR_GAP * (BUTTONS.len() - 1) as f32
+}
+
+/// Button `i`'s centre, as an offset from the pill's centre. Negative is left.
+///
+/// The bar is centred on the pill, which — with an odd count — is what puts
+/// Dictate exactly under the cursor that opened it.
+pub fn island_centre(i: usize) -> f32 {
+    let mut x = -bar_width() / 2.0;
+    for b in &BUTTONS[..i] {
+        x += b.w + BAR_GAP;
+    }
+    x + BUTTONS[i].w / 2.0
+}
+
+/// Button `i`'s hit region: **a slab, not a circle**. Full bar height, spanning
+/// the island plus half the gap on each side, so the desktop between two
+/// islands belongs to one of them rather than being a dead zone the hover
+/// flickers off in.
+///
+/// The outer ends get no half-gap: past the last island is the end padding,
+/// which is inert — it holds the pill expanded with nothing lit.
+pub fn slab(i: usize) -> (f32, f32) {
+    let c = island_centre(i);
+    let half = BUTTONS[i].w / 2.0;
+    let lo = if i == 0 { 0.0 } else { BAR_GAP / 2.0 };
+    let hi = if i + 1 == BUTTONS.len() {
+        0.0
+    } else {
+        BAR_GAP / 2.0
+    };
+    (c - half - lo, c + half + hi)
+}
+
+/// Which button `x` — an offset from the pill's centre, in logical pixels — is
+/// over, disregarding whether it is live.
+fn slab_at(x: f32) -> Option<usize> {
+    (0..BUTTONS.len()).find(|&i| {
+        let (lo, hi) = slab(i);
+        x >= lo && x < hi
+    })
 }
 
 /// What a session is currently asking the pill to show. Outranks [`Presence`].
@@ -128,6 +270,20 @@ pub enum PillMode {
     Processing { since: Instant },
     /// Terminal green/red flash.
     Done { ok: bool, since: Instant },
+}
+
+impl PillMode {
+    /// Whether this mode puts the button bar on screen — which is also the
+    /// whole of the click-through rule: `WS_EX_TRANSPARENT` is off exactly
+    /// while this is true. A hotkey session shows no buttons, so a click passes
+    /// straight through it to the app being dictated into.
+    ///
+    /// One predicate, read by the core (as [`Pill::showing_buttons`]) and by
+    /// the adapter (which flips the style): a second mode that shows buttons —
+    /// `Recording { origin: Click }`, in #30 — is then one edit, here.
+    pub fn shows_buttons(self) -> bool {
+        self == PillMode::Expanded
+    }
 }
 
 /// What a session tells the Pill core it is doing. Deliberately smaller than
@@ -179,6 +335,11 @@ pub struct Pill {
     shown: bool,
     /// The last mode handed over, so unchanged modes emit nothing.
     mode: Option<PillMode>,
+    /// Whether there is a transcript to copy. Fed by the adapter at the same
+    /// events that refresh the tray's "Copy last transcription" item, because
+    /// it is the same fact: with nothing recorded, Copy is disabled rather than
+    /// silently no-op'ing.
+    has_history: bool,
 }
 
 impl Pill {
@@ -194,7 +355,51 @@ impl Pill {
             window: false,
             shown: false,
             mode: None,
+            has_history: false,
         }
+    }
+
+    /// Tell the core whether anything has ever been transcribed. Emits no
+    /// commands: it changes what a button *does*, never what mode the pill is
+    /// in, and the glyph that dims for it is derived per frame.
+    pub fn set_has_history(&mut self, has_history: bool) {
+        self.has_history = has_history;
+    }
+
+    /// Whether the pill is showing its button bar — see
+    /// [`PillMode::shows_buttons`], which is the predicate.
+    pub fn showing_buttons(&self) -> bool {
+        self.derive_mode().shows_buttons()
+    }
+
+    /// Whether button `i` is live. Only Copy is ever disabled, and only with an
+    /// empty history.
+    pub fn enabled(&self, i: usize) -> bool {
+        match BUTTONS[i].action {
+            Action::Copy => self.has_history,
+            _ => true,
+        }
+    }
+
+    /// Which button the cursor is over, `x` being its offset from the pill's
+    /// centre in logical pixels.
+    ///
+    /// `None` for the end padding, for a disabled button — whose slab is inert,
+    /// not merely unclickable — and for a pill that is not showing buttons at
+    /// all, which is what keeps a stray `CursorMoved` from lighting anything
+    /// mid-dictation.
+    pub fn button_at(&self, x: f32) -> Option<usize> {
+        if !self.showing_buttons() {
+            return None;
+        }
+        slab_at(x).filter(|&i| self.enabled(i))
+    }
+
+    /// What clicking at `x` does. Exactly [`Self::button_at`]'s answer, read as
+    /// an action — the same slab decides both, so nothing can light up under
+    /// the cursor and then do nothing when pressed.
+    pub fn action_at(&self, x: f32) -> Option<Action> {
+        self.button_at(x).map(|i| BUTTONS[i].action)
     }
 
     /// Apply a session's report. `Finished` is stamped here, not by the session:
@@ -210,8 +415,8 @@ impl Pill {
     }
 
     /// Set the presence axis. Called by the residency toggle at launch and on
-    /// every config reload; the fullscreen watcher (#45) and the hover poller
-    /// (#19) become its other callers in turn.
+    /// every config reload, and by the hover poll every loop; the fullscreen
+    /// watcher (#45) becomes its other caller in turn.
     pub fn set_presence(&mut self, presence: Presence) -> Vec<Command> {
         self.presence = presence;
         self.settle()
@@ -755,6 +960,122 @@ mod tests {
             p.tick(t(0) + SUCCESS_LINGER),
             vec![Command::SetMode(PillMode::Idle)]
         );
+    }
+
+    /// The one place the odd count is stated. Symmetric growth puts the middle
+    /// button under the cursor that opened the bar — which needs a middle.
+    #[test]
+    fn the_button_count_stays_odd() {
+        assert_eq!(BUTTONS.len() % 2, 1, "the bar needs a centre button");
+        assert_eq!(BUTTONS[BUTTONS.len() / 2].action, Action::Dictate);
+    }
+
+    /// Every number about the expanded bar, derived from the list rather than
+    /// written down twice.
+    #[test]
+    fn the_bar_derives_the_settled_islands_from_its_button_list() {
+        assert_eq!(bar_width(), 118.0);
+        let islands: Vec<(f32, f32)> = (0..BUTTONS.len())
+            .map(|i| {
+                let c = island_centre(i);
+                (c - BUTTONS[i].w / 2.0, c + BUTTONS[i].w / 2.0)
+            })
+            .collect();
+        assert_eq!(islands, vec![(-59.0, -27.0), (-24.0, 24.0), (27.0, 59.0)]);
+        // A circle and a stadium out of one expression, both fully rounded.
+        let heights: Vec<f32> = BUTTONS.iter().map(|b| b.height()).collect();
+        assert_eq!(heights, vec![32.0, 32.0, 32.0]);
+        assert_eq!(BUTTONS[1].radius(), 16.0);
+        // The glyph box is not the button: same box in a 32 and a 48 island.
+        assert_eq!(GLYPH_BOX, 22.0);
+    }
+
+    /// Slabs, not circles: each spans its island plus half the desktop either
+    /// side, and the ends stop at the island.
+    #[test]
+    fn the_slabs_cover_the_bar_end_to_end() {
+        assert_eq!(slab(0), (-59.0, -25.5));
+        assert_eq!(slab(1), (-25.5, 25.5));
+        assert_eq!(slab(2), (25.5, 59.0));
+        // No overlaps and no seams: every point between the ends belongs to
+        // exactly one button.
+        for i in 1..BUTTONS.len() {
+            assert_eq!(slab(i - 1).1, slab(i).0);
+        }
+    }
+
+    /// A pill with buttons up, and something to copy.
+    fn expanded() -> Pill {
+        let mut p = Pill::new();
+        p.set_has_history(true);
+        p.set_presence(Presence::Resident { expanded: true });
+        p
+    }
+
+    /// The gaps are not dead zones. Sliding from Dictate to Settings crosses
+    /// 3px of bare desktop, and the hover must not flicker off in it.
+    #[test]
+    fn a_click_in_the_gap_lands_on_the_adjacent_button() {
+        let p = expanded();
+        // Just left of the seam is still Dictate; just right of it is Settings.
+        assert_eq!(p.action_at(25.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(26.0), Some(Action::Settings));
+        assert_eq!(p.action_at(-26.0), Some(Action::Copy));
+        assert_eq!(p.action_at(-25.0), Some(Action::Dictate));
+        // And the islands themselves, at their centres.
+        assert_eq!(p.action_at(-43.0), Some(Action::Copy));
+        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(43.0), Some(Action::Settings));
+    }
+
+    /// Past the last island is end padding: it holds the pill expanded with
+    /// nothing lit.
+    #[test]
+    fn a_click_in_the_end_padding_hits_nothing() {
+        let p = expanded();
+        for x in [-62.0, -60.0, -59.5, 59.0, 60.0, 62.0] {
+            assert_eq!(p.button_at(x), None, "at {x}");
+            assert_eq!(p.action_at(x), None, "at {x}");
+        }
+    }
+
+    /// With nothing recorded, Copy is disabled rather than silently no-op'ing —
+    /// and its slab is inert, so it does not light up either. Its neighbours
+    /// are unaffected.
+    #[test]
+    fn copy_is_inert_with_an_empty_history() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: true });
+        assert!(!p.enabled(0));
+        assert_eq!(p.button_at(-43.0), None);
+        assert_eq!(p.action_at(-43.0), None);
+        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
+        // The first transcript of the session brings it to life.
+        p.set_has_history(true);
+        assert_eq!(p.action_at(-43.0), Some(Action::Copy));
+    }
+
+    /// Hover cannot expand a recording pill — and with no bar on screen there
+    /// is nothing to hit either, whatever the cursor is doing over it.
+    #[test]
+    fn the_buttons_are_inert_while_a_session_runs() {
+        let mut p = expanded();
+        assert!(p.showing_buttons());
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        assert!(!p.showing_buttons());
+        for x in [-43.0, 0.0, 43.0] {
+            assert_eq!(p.button_at(x), None, "at {x}");
+            assert_eq!(p.action_at(x), None, "at {x}");
+        }
+        // And they come back when the flash retires to the hovered nub.
+        p.on_session(SessionActivity::Finished { ok: true }, t(100));
+        p.tick(t(100) + SUCCESS_LINGER);
+        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
     }
 
     #[test]

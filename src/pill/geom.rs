@@ -39,13 +39,24 @@ pub const NUB_RADIUS: f32 = 5.0;
 /// this rect, so no window move or buffer reallocation is ever part of a
 /// transition.
 ///
-/// It is also the session pill's own size, settled in #41 — the mid-size
-/// silhouette read better as the *recording* state than anything did as idle,
-/// so recording took it and the nub went smaller. One number rather than two
-/// names for it: the largest mode *is* the envelope, and if a future mode grows
-/// past it, this is the one place that has to change.
-pub const ENVELOPE_W: u32 = 62;
-pub const ENVELOPE_H: u32 = 28;
+/// The largest mode *is* the envelope, and if a future mode grows past it, this
+/// is the one place that has to change. Since #44 that mode is `Expanded`: the
+/// button bar is 118x32, and the envelope holds it with a margin all round —
+/// the end padding the hit test treats as inert, and the room the outermost
+/// island's anti-aliased edge fades into.
+///
+/// Growing it does not move the pill: every Geom is drawn centred, and
+/// [`crate::pill::PILL_BOTTOM_MARGIN`] was retuned by the same growth, so the
+/// nub and the session pill sit exactly where they did.
+pub const ENVELOPE_W: u32 = 124;
+pub const ENVELOPE_H: u32 = 36;
+
+/// The session pill's own size, settled in #41 — the mid-size silhouette read
+/// better as the *recording* state than anything did as idle, so recording took
+/// it and the nub went smaller. It was the envelope until the button bar grew
+/// past it.
+pub const SESSION_W: f32 = 62.0;
+pub const SESSION_H: f32 = 28.0;
 
 /// The pill's near-black body. Dark enough to read as an overlay rather than a
 /// widget on every desktop; the light hairline is what makes it findable on a
@@ -127,9 +138,11 @@ pub struct Geom {
     pub border_w: f32,
     /// The bar row's opacity. 0 means no row at all — the nub has none.
     pub bars: f32,
-    /// The button bar's opacity. Nothing draws buttons yet (#29 owns them);
-    /// the field is here because the expansion has to be one lerp with
-    /// everything else rather than a second animation bolted beside it.
+    /// The button bar's opacity — and, since #44, its *growth progress* too:
+    /// the flankers' offset from the centre island is this number times their
+    /// settled offset. One field for both because the fold-out has to be one
+    /// lerp with everything else rather than a second animation bolted beside
+    /// it, and a stagger would need a clock the Geom cannot carry.
     pub buttons: f32,
 }
 
@@ -157,17 +170,23 @@ impl Geom {
                 bars: 0.0,
                 buttons: 0.0,
             },
-            // Placeholder: the expanded pill is sized by the button set it
-            // carries (#18 round 2), and nothing constructs `Expanded` until
-            // the button bar lands (#29). Sized at the envelope so it cannot
-            // silently widen the window when it does.
-            PillMode::Expanded => Geom {
-                w: ENVELOPE_W as f32,
-                h: ENVELOPE_H as f32,
-                radius: NUB_RADIUS,
-                buttons: 1.0,
-                ..Geom::of(PillMode::Idle)
-            },
+            // The expanded pill is the *centre* island — the bar's other two
+            // are drawn beside it by the renderer, sliding out from behind it
+            // as `buttons` comes up. So the Geom that morphs is Dictate's, and
+            // the nub grows into the button under the cursor rather than into
+            // a body that is about to be three shapes.
+            PillMode::Expanded => {
+                let dictate = &crate::pill::core::BUTTONS[crate::pill::core::BUTTONS.len() / 2];
+                Geom {
+                    w: dictate.w,
+                    h: dictate.height(),
+                    radius: dictate.radius(),
+                    fill_a: PILL_FILL_A,
+                    border_a: HAIRLINE_A,
+                    buttons: 1.0,
+                    ..Geom::of(PillMode::Idle)
+                }
+            }
             // The bars are what say "live", so recording wears the bare
             // hairline and no accent.
             PillMode::Recording { .. } => Geom::session(),
@@ -199,9 +218,9 @@ impl Geom {
     /// reach a base shape that has nothing to do with how the session started.
     fn session() -> Self {
         Geom {
-            w: ENVELOPE_W as f32,
-            h: ENVELOPE_H as f32,
-            radius: shape_radius(ENVELOPE_W as f32, ENVELOPE_H as f32),
+            w: SESSION_W,
+            h: SESSION_H,
+            radius: shape_radius(SESSION_W, SESSION_H),
             fill: BODY,
             fill_a: PILL_FILL_A,
             border: HAIRLINE,
@@ -317,10 +336,110 @@ pub const HANDOFF: Tween = Tween {
 };
 /// Back to the nub after the flash retires.
 pub const TO_IDLE: Tween = Tween::out_cubic(160);
-/// Hover in and out. Nothing produces `Expanded` yet (#19 owns the poller);
-/// the entries are here so the table is total rather than defaulted.
+/// Hover in and out: the nub growing into the bar, and collapsing back.
 pub const HOVER_IN: Tween = Tween::out_cubic(110);
 pub const HOVER_OUT: Tween = Tween::out_cubic(90);
+
+/// The hover indicator moving between buttons, matching [`HOVER_OUT`] — the
+/// same gesture at a smaller scale.
+pub const HOVER_FADE: Tween = Tween::out_cubic(90);
+
+/// How lit each button is this frame, and whether it can be lit at all.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Slot {
+    /// The indicator's opacity behind this button, 0..1.
+    pub hover: f32,
+    /// A disabled button's glyph is drawn faint and its slab is inert — see
+    /// [`crate::pill::core::Pill::enabled`].
+    pub enabled: bool,
+}
+
+/// One [`Slot`] per button, in the button list's own order — the renderer's
+/// second input beside the [`Geom`]. An array rather than a slice, so a
+/// mismatched length is a compile error rather than a button quietly drawn at
+/// its defaults.
+pub type Slots = [Slot; crate::pill::core::BUTTON_COUNT];
+
+/// Live, unlit — what a button is when nobody has said otherwise. Deliberately
+/// not `derive`d: a defaulted `enabled: false` would draw every glyph faint.
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            hover: 0.0,
+            enabled: true,
+        }
+    }
+}
+
+/// Which button the cursor is on, and the fade between it and the last one.
+///
+/// **Deliberately outside [`Geom`].** #18's finding is that every frame derives
+/// from two whole-pill Geoms, a start time and an easing; per-button hover is
+/// per-button state that one Geom cannot carry. Contorting `Geom` into holding
+/// it would break the very model that makes the morph one lerp — so this is a
+/// second, smaller tween beside it rather than a hole in the first.
+#[derive(Clone, Copy, Debug)]
+pub struct Hover {
+    current: Option<usize>,
+    /// What the fade is coming *from*, so a slide from one button to the next
+    /// dims the old one over the same 90 ms the new one lights up.
+    previous: Option<usize>,
+    started: Instant,
+}
+
+impl Hover {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            current: None,
+            previous: None,
+            started: now,
+        }
+    }
+
+    /// Point the hover at `index`, and say whether that moved it.
+    ///
+    /// A no-op when it hasn't — restarting the fade on every `CursorMoved`
+    /// would leave the indicator permanently mid-fade while the cursor wanders
+    /// inside one slab. The caller reads the answer to decide whether a frame
+    /// is owed, rather than testing the same thing again.
+    pub fn set(&mut self, index: Option<usize>, now: Instant) -> bool {
+        if index == self.current {
+            return false;
+        }
+        self.previous = self.current;
+        self.current = index;
+        self.started = now;
+        true
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
+        HOVER_FADE
+            .ease
+            .apply(elapsed / HOVER_FADE.dur.as_secs_f32())
+    }
+
+    /// This frame's per-button state: the arriving button coming up, the
+    /// leaving one going down, everything else dark.
+    pub fn slots(&self, now: Instant, enabled: impl Fn(usize) -> bool) -> Slots {
+        let t = self.progress(now);
+        std::array::from_fn(|i| Slot {
+            hover: if self.current == Some(i) {
+                t
+            } else if self.previous == Some(i) {
+                1.0 - t
+            } else {
+                0.0
+            },
+            enabled: enabled(i),
+        })
+    }
+
+    /// Whether the fade still has frames to draw.
+    pub fn is_running(&self, now: Instant) -> bool {
+        self.current != self.previous && self.progress(now) < 1.0
+    }
+}
 
 /// The transition from `from` to `to`.
 ///
@@ -528,6 +647,89 @@ mod tests {
                 "{mode:?} is taller than the window"
             );
         }
+    }
+
+    /// The bar is the largest thing the pill draws, so the envelope has to hold
+    /// it — with room over for the inert end padding and the outermost island's
+    /// anti-aliased edge.
+    #[test]
+    fn the_envelope_holds_the_whole_button_bar() {
+        use crate::pill::core::{bar_width, BAR_H};
+        assert!(bar_width() < ENVELOPE_W as f32, "{}", bar_width());
+        assert!(BAR_H < ENVELOPE_H as f32);
+        // And the session pill, which stopped being the envelope when the bar
+        // grew past it.
+        assert!(SESSION_W < ENVELOPE_W as f32 && SESSION_H < ENVELOPE_H as f32);
+    }
+
+    /// The nub grows into the button under the cursor, not into a body that is
+    /// about to be three shapes: `Expanded`'s Geom is the centre island's.
+    #[test]
+    fn the_expanded_geom_is_the_centre_island() {
+        use crate::pill::core::BUTTONS;
+        let g = Geom::of(PillMode::Expanded);
+        let dictate = &BUTTONS[BUTTONS.len() / 2];
+        assert_eq!((g.w, g.h, g.radius), (48.0, 32.0, 16.0));
+        assert_eq!((g.w, g.h), (dictate.w, dictate.height()));
+        assert_eq!(g.buttons, 1.0);
+        // And it carries the session pill's surface, not the nub's marker
+        // alphas — it is a thing to click, not a thing to notice.
+        assert!(g.fill_a > Geom::of(PillMode::Idle).fill_a);
+    }
+
+    /// The flankers' offset is a pure function of the growth progress, and
+    /// `buttons` is that progress — which is what keeps the fold-out inside the
+    /// derived-frame model instead of being a second animation beside it.
+    #[test]
+    fn the_fold_out_rides_the_same_lerp_as_the_growth() {
+        let m = Motion::start(Geom::of(PillMode::Idle), PillMode::Expanded, HOVER_IN, t(0));
+        assert_eq!(m.at(t(0)).buttons, 0.0);
+        assert_eq!(m.at(t(110)).buttons, 1.0);
+        // Monotone all the way, so nothing slides back on the way out.
+        let mut prev = 0.0;
+        for ms in 0..=110 {
+            let b = m.at(t(ms)).buttons;
+            assert!(b >= prev, "buttons went backwards at {ms}ms");
+            prev = b;
+        }
+    }
+
+    /// Sliding from one button to the next is one crossfade: the arriving
+    /// button comes up over exactly the 90 ms the leaving one goes down.
+    #[test]
+    fn the_hover_indicator_crossfades_between_buttons() {
+        let all_live = |_| true;
+        let mut h = Hover::new(t(0));
+        assert!(h.slots(t(0), all_live).iter().all(|s| s.hover == 0.0));
+
+        h.set(Some(1), t(0));
+        assert!(h.is_running(t(0)));
+        assert_eq!(h.slots(t(0), all_live)[1].hover, 0.0);
+        assert_eq!(h.slots(t(90), all_live)[1].hover, 1.0);
+        assert!(!h.is_running(t(90)));
+
+        // On to the next button: the two move together.
+        h.set(Some(2), t(90));
+        let mid = h.slots(t(135), all_live);
+        assert!((mid[1].hover + mid[2].hover - 1.0).abs() < 1e-5, "{mid:?}");
+        assert!(mid[1].hover > 0.0 && mid[2].hover > 0.0);
+        let done = h.slots(t(180), all_live);
+        assert_eq!((done[1].hover, done[2].hover), (0.0, 1.0));
+
+        // And off the bar entirely: everything goes dark.
+        h.set(None, t(180));
+        assert!(h.slots(t(270), all_live).iter().all(|s| s.hover == 0.0));
+    }
+
+    /// A cursor wandering inside one slab is not a change. Restarting the fade
+    /// on every `CursorMoved` would leave the indicator permanently mid-fade.
+    #[test]
+    fn re_hovering_the_same_button_does_not_restart_the_fade() {
+        let mut h = Hover::new(t(0));
+        h.set(Some(0), t(0));
+        h.set(Some(0), t(45));
+        assert_eq!(h.slots(t(90), |_| true)[0].hover, 1.0);
+        assert!(!h.is_running(t(90)));
     }
 
     /// The durations, as the ticket states them. A table test rather than six
