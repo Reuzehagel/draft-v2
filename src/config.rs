@@ -53,11 +53,56 @@ pub struct PillConfig {
     /// is on and armed. Off restores the session-only pill: nothing on screen
     /// between dictations, and no idle work at all.
     pub resident: bool,
+    /// Which monitor the pill lives on. Governs the session-only pill too —
+    /// two behaviours would mean two code paths and a mode-dependent surprise.
+    pub monitor: MonitorPolicy,
+    /// The monitor `MonitorPolicy::Pinned` names: `QueryDisplayConfig`'s
+    /// EDID-derived `monitorDevicePath`, and explicitly **not** `\\.\DISPLAY1`
+    /// — a GDI adapter slot is reassigned on replug or reorder, so a pinned
+    /// slot is a setting that silently rots. A path that no longer resolves
+    /// falls back to the primary monitor.
+    pub monitor_pinned_path: Option<String>,
 }
 
 impl Default for PillConfig {
     fn default() -> Self {
-        Self { resident: true }
+        Self {
+            resident: true,
+            monitor: MonitorPolicy::Focused,
+            monitor_pinned_path: None,
+        }
+    }
+}
+
+/// How the pill's home monitor is derived.
+///
+/// `Focused` is the default because Draft pastes into the foreground window:
+/// the pill is feedback about text that is going to land *there*, so a pill on
+/// another monitor is feedback in the wrong place.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorPolicy {
+    /// The monitor holding the foreground window.
+    Focused,
+    /// The monitor holding the cursor, once it has settled there.
+    Cursor,
+    /// The primary monitor — which is also where every other policy falls back
+    /// to when it can't name one.
+    Primary,
+    /// The monitor named by `monitor_pinned_path`.
+    Pinned,
+}
+
+impl MonitorPolicy {
+    /// Human-readable name, shared by the settings picker and anything else
+    /// that has to say which policy is in force.
+    pub fn label(self) -> &'static str {
+        match self {
+            MonitorPolicy::Focused => "Focused window",
+            MonitorPolicy::Cursor => "Mouse cursor",
+            MonitorPolicy::Primary => "Primary display",
+            MonitorPolicy::Pinned => "A specific display",
+        }
     }
 }
 
@@ -234,12 +279,34 @@ mod tests {
     #[test]
     fn the_config_round_trips_through_toml() {
         for resident in [true, false] {
-            let mut cfg = Config::default();
-            cfg.pill.resident = resident;
-            let text = toml::to_string_pretty(&cfg).expect("serialise");
-            let back: Config = toml::from_str(&text).expect("deserialise");
-            assert_eq!(back, cfg, "{text}");
+            for monitor in [
+                MonitorPolicy::Focused,
+                MonitorPolicy::Cursor,
+                MonitorPolicy::Primary,
+                MonitorPolicy::Pinned,
+            ] {
+                let mut cfg = Config::default();
+                cfg.pill.resident = resident;
+                cfg.pill.monitor = monitor;
+                cfg.pill.monitor_pinned_path = (monitor == MonitorPolicy::Pinned)
+                    .then(|| r"\\?\DISPLAY#DELL#EDID".to_string());
+                let text = toml::to_string_pretty(&cfg).expect("serialise");
+                let back: Config = toml::from_str(&text).expect("deserialise");
+                assert_eq!(back, cfg, "{text}");
+            }
         }
+    }
+
+    /// The residency toggle shipped before the monitor policy did, so a config
+    /// with `[pill]` but no `monitor` key has to take the default rather than
+    /// being backed up as corrupt.
+    #[test]
+    fn a_pill_table_written_before_the_monitor_policy_takes_its_default() {
+        let cfg: Config =
+            toml::from_str("[pill]\nresident = false\n").expect("partial table parses");
+        assert!(!cfg.pill.resident);
+        assert_eq!(cfg.pill.monitor, MonitorPolicy::Focused);
+        assert_eq!(cfg.pill.monitor_pinned_path, None);
     }
 
     /// TOML has no way back once a table header is emitted: every scalar has to

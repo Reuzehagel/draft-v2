@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use crate::pill::core::{Pill, PillMode};
 use crate::pill::geom::Motion;
 use crate::pill::hook::HookEvent;
+use crate::pill::monitor::{Displays, Home, HomeMonitor};
 use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
 use winit::application::ApplicationHandler;
@@ -99,6 +100,8 @@ fn main() -> Result<()> {
     // destroyed under a receiver that outlives every one of them.
     let (hook_tx, hook_rx) = crossbeam_channel::unbounded();
 
+    let (monitor_policy, pinned_path) = monitor_policy_from_config(&cfg);
+
     let mut app = App {
         tray,
         menu_rx,
@@ -107,6 +110,10 @@ fn main() -> Result<()> {
         session,
         pill_core: Pill::new(),
         pill: PillAdapter::new(hook_tx),
+        home: Home::new(monitor_policy, pinned_path),
+        // Enumerated for real in `resumed`, on the same path a display change
+        // takes. Nothing can be placed before there is an event loop anyway.
+        displays: Displays::default(),
         hook_rx,
         transcriber,
         cfg,
@@ -151,6 +158,21 @@ fn presence_from_config(cfg: &config::Config) -> pill::core::Presence {
     }
 }
 
+/// The home-monitor policy and its pinned path, per config.
+///
+/// Read at launch and on every config reload — and by the *session-only* pill
+/// too: one policy governs both, because two would mean two code paths and a
+/// mode-dependent surprise about where the pill turns up.
+fn monitor_policy_from_config(cfg: &config::Config) -> (pill::monitor::Policy, Option<String>) {
+    let policy = match cfg.pill.monitor {
+        config::MonitorPolicy::Focused => pill::monitor::Policy::Focused,
+        config::MonitorPolicy::Cursor => pill::monitor::Policy::Cursor,
+        config::MonitorPolicy::Primary => pill::monitor::Policy::Primary,
+        config::MonitorPolicy::Pinned => pill::monitor::Policy::Pinned,
+    };
+    (policy, cfg.pill.monitor_pinned_path.clone())
+}
+
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     match cfg.activation {
         config::Activation::Toggle => activation::Mode::Toggle,
@@ -175,9 +197,18 @@ struct App {
     /// residency toggle, the fullscreen watcher and the hover poller follow.
     pill_core: Pill,
     pill: PillAdapter,
+    /// Which monitor the pill lives on, and the policy deriving it. Pure: it is
+    /// fed the display snapshot below plus the cheap per-poll signals, and says
+    /// when the answer moved.
+    home: Home,
+    /// The connected monitors as of the last enumeration. Refreshed only when
+    /// the display topology or DPI changes — enumerating per poll would be
+    /// `EnumDisplayMonitors` plus `QueryDisplayConfig` at 20 Hz, which is
+    /// exactly the idle cost residency exists to avoid.
+    displays: Displays,
     /// The messages winit doesn't surface, posted by the pill window's wndproc
-    /// subclass. Nothing acts on them yet — the home monitor (#43), the
-    /// fullscreen watcher (#45) and the wakeup ladder (#49) are their consumers.
+    /// subclass. The home monitor consumes the display ones; the fullscreen
+    /// watcher (#45) and the wakeup ladder (#49) are the remaining consumers.
     hook_rx: crossbeam_channel::Receiver<HookEvent>,
     transcriber: Option<Arc<dyn Transcriber>>,
     cfg: config::Config,
@@ -242,7 +273,21 @@ impl App {
         let now = Instant::now();
         for cmd in cmds {
             match cmd {
-                pill::core::Command::Create => self.pill.create(el),
+                // Derived immediately before the window exists, so the pill
+                // lands where the policy says even when nothing has been
+                // polling — which is every session-only pill, since the poll
+                // is skipped while there is no window to move.
+                //
+                // Off a fresh enumeration, not the cached desk: the display
+                // snapshot is kept current by the pill window's own hook, and
+                // between sessions there is no window and therefore no hook. A
+                // monitor plugged in since the last dictation would otherwise
+                // be invisible. `Create` happens once per session at most,
+                // beside opening a microphone — this is not the expensive part.
+                pill::core::Command::Create => {
+                    self.rederive_home();
+                    self.pill.create(el);
+                }
                 pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
                 pill::core::Command::Show => self.pill.show(now),
                 pill::core::Command::Hide => self.pill.hide(now),
@@ -414,6 +459,9 @@ impl ApplicationHandler for App {
     /// takes effect: the nub is on screen from launch, not from the first
     /// dictation.
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        // Before the presence, not after: `apply_presence` is what creates the
+        // window, and a window has to be created *somewhere*.
+        self.rederive_home();
         self.apply_presence(el);
     }
 
@@ -488,14 +536,25 @@ impl ApplicationHandler for App {
         // these in turn.
         while let Ok(ev) = self.hook_rx.try_recv() {
             let repush = match ev {
-                // The pill's coordinate space may no longer exist, and a DPI
-                // change means the surface is the wrong resolution.
+                // The one event that overrides the home monitor's idle-only
+                // derivation, latch and all: unplug, resolution change, lid
+                // close and RDP reconnect all arrive here, and the alternative
+                // is a pill positioned into a coordinate space that no longer
+                // exists. Re-placing re-renders, so nothing more to re-push.
                 HookEvent::DisplayChanged => {
                     tracing::info!("display topology changed");
+                    self.rederive_home();
                     true
                 }
+                // The home monitor's scale is what the pill renders at, so a
+                // DPI change re-places it: the work area moved with it, and the
+                // surface is now the wrong resolution. A *refresh*, not a
+                // re-derivation — the latch break belongs to WM_DISPLAYCHANGE
+                // alone, and a scaling slider is not a reason to change which
+                // monitor the pill lives on.
                 HookEvent::DpiChanged { dpi } => {
                     tracing::info!(dpi, "pill monitor dpi changed");
+                    self.refresh_home();
                     true
                 }
                 // Defensive: the compositor is torn down and rebuilt around a
@@ -537,6 +596,11 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let cmds = self.pill_core.tick(now);
         self.run_pill_commands(cmds, el);
+
+        // Where the pill should be living, on the loop's own cadence. Latched
+        // unless the pill is idle, and free for the policies with no per-poll
+        // signal to read.
+        self.poll_home(now);
 
         // Frames are pushed only when there is one to push. A settled nub wants
         // none at all — that is what makes residency free: one
@@ -587,6 +651,59 @@ impl App {
     fn apply_presence(&mut self, el: &ActiveEventLoop) {
         let cmds = self.pill_core.set_presence(presence_from_config(&self.cfg));
         self.run_pill_commands(cmds, el);
+    }
+
+    /// Hand the home-monitor core this moment's signals and move the pill if it
+    /// says the answer changed. The one path every derivation takes; what
+    /// differs between them is only the trigger.
+    fn derive_home(&mut self, trigger: pill::monitor::Trigger, now: Instant) {
+        let signals = pill::monitor::sample(self.home.policy());
+        if let Some(home) = self.home.update(trigger, &self.displays, signals, now) {
+            tracing::debug!(monitor = home.id, dpi = home.dpi, "pill home monitor");
+            self.pill.set_home(home);
+        }
+    }
+
+    /// Re-derive unconditionally, breaking the latch, off a freshly enumerated
+    /// desk. Startup, `WM_DISPLAYCHANGE`, a DPI change and a policy change all
+    /// come through here — one path, so a pill that comes back from an unplug
+    /// cannot behave differently from one that just launched.
+    ///
+    /// The enumeration is what makes this the expensive one, and why the
+    /// per-loop poll doesn't do it.
+    fn rederive_home(&mut self) {
+        self.displays = pill::monitor::enumerate();
+        self.derive_home(pill::monitor::Trigger::Rederive, Instant::now());
+    }
+
+    /// Re-read the home monitor's own metrics after a DPI change, leaving the
+    /// policy — and therefore which monitor the pill is on — alone.
+    fn refresh_home(&mut self) {
+        self.displays = pill::monitor::enumerate();
+        if let Some(home) = self.home.refresh(&self.displays) {
+            tracing::debug!(monitor = home.id, dpi = home.dpi, "pill home monitor rescaled");
+            self.pill.set_home(home);
+        }
+    }
+
+    /// The ordinary per-loop sample. The core decides whether the latch applies
+    /// and whether the cursor has dwelt long enough; all this does is hand it
+    /// what only the adapter can know.
+    ///
+    /// Skipped entirely with no window on screen. With residency off and no
+    /// session running there is nothing to move, and residency off means *no
+    /// idle work at all* — a `GetForegroundWindow` every 50 ms is exactly the
+    /// cost that promise rules out. The pill that a session then creates is
+    /// still placed by the policy: [`Self::run_pill_commands`] derives ahead of
+    /// every `Create`.
+    fn poll_home(&mut self, now: Instant) {
+        if !self.pill.has_window() {
+            return;
+        }
+        let trigger = pill::monitor::Trigger::Poll {
+            idle: self.pill.is_idle(now),
+        };
+        self.derive_home(trigger, now);
     }
 
     fn poll_settings_child(&mut self, el: &ActiveEventLoop) {
@@ -664,6 +781,15 @@ impl App {
         self.session
             .set_transcriber_available(self.transcriber.is_some());
         self.cfg = new_cfg;
+        // A new monitor policy takes effect on the next ordinary poll, latch
+        // and all: settings closing is not one of the events that may move the
+        // pill mid-sentence. In practice that is immediate, because the pill is
+        // idle while the user is in the settings window — and with no window at
+        // all the `Create` path derives instead.
+        let (policy, pinned_path) = monitor_policy_from_config(&self.cfg);
+        self.home.configure(policy, pinned_path);
+        self.displays = pill::monitor::enumerate();
+        self.poll_home(Instant::now());
         // Residency rides beside the activation reset: hand the new value to
         // the Pill core and let it decide. Toggled off mid-session it changes
         // nothing on screen until the flash retires, because activity outranks
@@ -688,6 +814,11 @@ struct PillAdapter {
     /// Handed to each window it creates, so the wndproc hook can post to the
     /// app loop.
     hook_tx: crossbeam_channel::Sender<HookEvent>,
+    /// Where the pill lives. Held even with no window, so the next `Create`
+    /// lands on the right monitor without having to re-derive first. `None`
+    /// only before the first derivation — and on a machine with no monitors at
+    /// all, where there is nowhere to put a window anyway.
+    home: Option<HomeMonitor>,
     bands: audio::level::BandMeter,
     /// The current logical mode; `None` when there is no window.
     mode: Option<PillMode>,
@@ -737,6 +868,7 @@ impl PillAdapter {
         Self {
             window: None,
             hook_tx,
+            home: None,
             bands: audio::level::BandMeter::new(pill::BAR_COUNT),
             mode: None,
             motion: Motion::settled(PillMode::Hidden, Instant::now()),
@@ -749,6 +881,36 @@ impl PillAdapter {
 
     fn set_ring(&mut self, ring: audio::ring::Buffer) {
         self.ring = Some(ring);
+    }
+
+    /// Adopt a home monitor the core just derived, moving the window there if
+    /// there is one. With no window this only records it — the next `Create`
+    /// reads it.
+    fn set_home(&mut self, home: HomeMonitor) {
+        self.home = Some(home);
+        if let Some(pw) = self.window.as_mut() {
+            if let Err(e) = pw.set_home(home) {
+                tracing::error!(error = %e, "could not move the pill to its home monitor");
+            }
+        }
+    }
+
+    fn has_window(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Whether the pill is doing nothing — the only stretch in which it may
+    /// move. Latched at session start and while expanded, so it cannot skate to
+    /// another monitor mid-sentence, nor slide out from under the hand about to
+    /// click it.
+    ///
+    /// A transition still running counts as busy even when the mode it is
+    /// heading for is `Idle`. The mode flips at the *start* of the morph, and
+    /// the move is a hard cut — one without the other would tear the conceal or
+    /// the reveal in half.
+    fn is_idle(&self, now: Instant) -> bool {
+        matches!(self.mode, None | Some(PillMode::Hidden) | Some(PillMode::Idle))
+            && !self.motion.is_running(now)
     }
 
     /// Whether the pill has a frame to draw right now. False for a settled nub,
@@ -796,7 +958,11 @@ impl PillAdapter {
             self.supersede_teardown();
             return;
         }
-        match pill::window::PillWindow::create(el, self.hook_tx.clone()) {
+        let Some(home) = self.home else {
+            tracing::error!("no home monitor to put the pill on");
+            return;
+        };
+        match pill::window::PillWindow::create(el, self.hook_tx.clone(), home) {
             Ok(pw) => self.window = Some(pw),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create pill window");

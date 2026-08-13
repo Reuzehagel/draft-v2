@@ -21,9 +21,9 @@
 // window's wndproc subclass closes by answering WM_MOUSEACTIVATE itself — see
 // `pill::hook`.
 
-use crate::pill::geom::{Geom, ENVELOPE_H, ENVELOPE_W};
+use crate::pill::geom::Geom;
 use crate::pill::hook::HookEvent;
-use crate::pill::PILL_BOTTOM_MARGIN;
+use crate::pill::monitor::HomeMonitor;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
 use tiny_skia::Pixmap;
@@ -35,7 +35,7 @@ use tiny_skia::Pixmap;
 // bicubic's ringing halos at the high-contrast border edge. Must be a power of
 // two so the halving chain lands exactly on device resolution.
 const SUPERSAMPLE: u32 = 4;
-use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes, WindowLevel};
@@ -48,7 +48,15 @@ pub struct PillWindow {
     #[allow(dead_code)]
     hook: crate::pill::hook::PillHook,
     window: Window,
-    pub scale: f32,
+    /// The monitor the pill lives on, and where every number below comes from:
+    /// the window's rect and the resolution it renders at. Re-derived by the
+    /// app loop's [`crate::pill::monitor::Home`] and handed here — never
+    /// captured once at creation, which is what made the scale latently wrong
+    /// on every mixed-DPI desk (#43).
+    ///
+    /// The scale is read off this rather than stored beside it: two copies of
+    /// one number is one hand-sync away from the bug this ticket exists to fix.
+    home: HomeMonitor,
     pixmap: Pixmap,
     hires: Pixmap,
     // Intermediate 2× buffer for the halving downscale chain.
@@ -61,35 +69,32 @@ pub struct PillWindow {
 }
 
 impl PillWindow {
-    /// Build the pill window and install its one wndproc hook. `hook_tx` is the
-    /// app loop's end of that hook — the messages winit never surfaces arrive
-    /// there for as long as this window lives.
-    pub fn create(el: &ActiveEventLoop, hook_tx: Sender<HookEvent>) -> Result<Self> {
-        let primary = el
-            .primary_monitor()
-            .or_else(|| el.available_monitors().next())
-            .ok_or_else(|| anyhow!("no monitor available"))?;
-        let scale = primary.scale_factor() as f32;
-        let monitor_pos = primary.position();
-        let monitor_size = primary.size();
-
-        // The window is the *envelope* — the largest mode's rect — and it never
-        // changes size again. Every mode is drawn centred inside it, so a morph
-        // from the nub to the recording pill moves no window and reallocates no
-        // buffer; only pixels change.
-        let pill_phys_w = (ENVELOPE_W as f32 * scale) as i32;
-        let pill_phys_h = (ENVELOPE_H as f32 * scale) as i32;
-        let margin_phys = (PILL_BOTTOM_MARGIN as f32 * scale) as i32;
-        let x = monitor_pos.x + (monitor_size.width as i32 - pill_phys_w) / 2;
-        let y = monitor_pos.y + monitor_size.height as i32 - pill_phys_h - margin_phys;
+    /// Build the pill window on `home` and install its one wndproc hook.
+    /// `hook_tx` is the app loop's end of that hook — the messages winit never
+    /// surfaces arrive there for as long as this window lives.
+    pub fn create(
+        el: &ActiveEventLoop,
+        hook_tx: Sender<HookEvent>,
+        home: HomeMonitor,
+    ) -> Result<Self> {
+        // The window is the *envelope* — the largest mode's rect — at the home
+        // monitor's scale, and it changes size only when that scale does. Every
+        // mode is drawn centred inside it, so a morph from the nub to the
+        // recording pill moves no window and reallocates no buffer; only pixels
+        // change.
+        //
+        // Physical, not logical: winit resolves a logical size against a
+        // scale factor of its own choosing, and on a mixed-DPI desk that is not
+        // reliably the home monitor's.
+        let rect = home.placement();
 
         let attrs = WindowAttributes::default()
             .with_title("Draft Pill")
-            .with_inner_size(LogicalSize::new(ENVELOPE_W, ENVELOPE_H))
-            .with_position(LogicalPosition::new(
-                x as f64 / scale as f64,
-                y as f64 / scale as f64,
+            .with_inner_size(PhysicalSize::new(
+                rect.width().max(1) as u32,
+                rect.height().max(1) as u32,
             ))
+            .with_position(PhysicalPosition::new(rect.left, rect.top))
             .with_decorations(false)
             .with_resizable(false)
             .with_transparent(false)
@@ -98,6 +103,16 @@ impl PillWindow {
             .with_visible(false);
 
         let window = el.create_window(attrs)?;
+
+        // Assert the rect once more against the raw HWND. `create_window` puts
+        // the window somewhere close, but the exact client size it lands on is
+        // negotiated with the DPI Windows thinks the window is on — which is
+        // not necessarily the home monitor's until the window is actually there.
+        #[cfg(windows)]
+        {
+            let hwnd = hwnd_from_window(&window)?;
+            unsafe { place(hwnd, &home) };
+        }
 
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
@@ -117,7 +132,7 @@ impl PillWindow {
             #[cfg(windows)]
             hook,
             window,
-            scale,
+            home,
             pixmap,
             hires,
             mid,
@@ -125,6 +140,35 @@ impl PillWindow {
             #[cfg(windows)]
             layered,
         })
+    }
+
+    /// Move the pill to a new home monitor — or re-place it on the same one
+    /// after its work area or DPI moved underneath.
+    ///
+    /// A **hard cut**: one window move, no animation. Animating across a bezel
+    /// means animating through physical space that does not exist, and under
+    /// the `cursor` policy the pill would be chasing a cursor that has already
+    /// arrived.
+    ///
+    /// The window is moved **in place, never recreated**. Recreating would
+    /// re-run the layered-window setup and the show path, flash, and hand winit
+    /// another chance to clobber the ex-styles.
+    ///
+    /// A no-op when nothing about the home monitor changed, so the ordinary
+    /// case of a re-derivation landing on the same answer costs nothing.
+    pub fn set_home(&mut self, home: HomeMonitor) -> Result<()> {
+        if self.home == home {
+            return Ok(());
+        }
+        self.home = home;
+        #[cfg(windows)]
+        unsafe {
+            place(self.layered.hwnd, &home)
+        };
+        // The rect just changed, so the buffers may be the wrong size and the
+        // surface is certainly at the wrong resolution. Re-rendering the frame
+        // already on screen does both — `render` runs `ensure_size` first.
+        self.repush()
     }
 
     pub fn show(&self) {
@@ -158,7 +202,7 @@ impl PillWindow {
         self.ensure_size()?;
         crate::pill::render::draw(
             &mut self.hires,
-            self.scale * SUPERSAMPLE as f32,
+            self.home.scale() * SUPERSAMPLE as f32,
             geom,
             bar_heights,
         );
@@ -175,12 +219,18 @@ impl PillWindow {
     /// Push the surface the pill is already showing again, unchanged.
     ///
     /// The layered surface is normally maintained by the system: an idle nub is
-    /// one `UpdateLayeredWindow` and then nothing, forever. Three things can
+    /// one `UpdateLayeredWindow` and then nothing, forever. Four things can
     /// invalidate it out from under us — the display topology changing, the DPI
-    /// changing, and the compositor being torn down and rebuilt around a lock,
-    /// an RDP reconnect or a wake. This is how the pill comes back from those,
+    /// changing, the compositor being torn down and rebuilt around a lock, an
+    /// RDP reconnect or a wake, and [`Self::set_home`] moving the window to a
+    /// monitor at another scale. This is how the pill comes back from those,
     /// and it is not called for any other reason: a re-push per frame is
     /// exactly the idle cost residency exists to avoid.
+    ///
+    /// A home move is on that list because it *is* one of them, not despite
+    /// being frequent: `set_home` returns early unless the home monitor
+    /// actually changed, so a foreground window moving around one monitor
+    /// re-pushes nothing at all.
     ///
     /// A no-op before the first frame — there is nothing to re-push yet.
     pub fn repush(&mut self) -> Result<()> {
@@ -436,6 +486,37 @@ unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
     };
     let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
+}
+
+/// Put the window at its home monitor's placement, size and all, in one call.
+///
+/// Raw `SetWindowPos` rather than `Window::set_outer_position`: winit's mutator
+/// runs `WindowState::set_window_flags` on the way past, which is
+/// `WindowFlags::apply_diff` — the absolute GWL_EXSTYLE write this module's
+/// header exists to warn about. It would take NOACTIVATE and LAYERED with it.
+///
+/// Size travels with the position because a move between monitors is usually
+/// also a scale change, and the two arriving as one call means the window is
+/// never briefly the old size in the new place.
+#[cfg(windows)]
+unsafe fn place(hwnd: windows::Win32::Foundation::HWND, home: &HomeMonitor) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+    };
+    let rect = home.placement();
+    // HWND_TOPMOST rather than SWP_NOZORDER: the pill is always-on-top, and
+    // this is the one call in its life that could quietly restack it.
+    if let Err(e) = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        rect.left,
+        rect.top,
+        rect.width().max(1),
+        rect.height().max(1),
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+    ) {
+        tracing::error!(error = %e, "could not place the pill on its home monitor");
+    }
 }
 
 /// Show the pill without letting it take focus, and without going through
