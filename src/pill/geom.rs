@@ -16,9 +16,10 @@
 //   the pill can be in is the same silhouette at a different size, so there is
 //   never a frame where the shape is ambiguous.
 // - **The pill only ever animates its pixels.** The window sits at a fixed
-//   [`ENVELOPE_W`]x[`ENVELOPE_H`], big enough for the largest mode, and a Geom
-//   is drawn centred inside it. Nothing is resized, moved, or reallocated to
-//   run an animation.
+//   [`ENVELOPE_W`]x[`ENVELOPE_H`], and a Geom is drawn centred in the
+//   [`PILL_BAND_H`] band at the bottom of it — since #46 the surface is taller
+//   than the pill, because the label lives above it. Nothing is resized, moved,
+//   or reallocated to run an animation.
 //
 // Pure: no winit, no Win32, no `Instant::now()`. `Motion::at` takes the `now`
 // it is asked about, exactly like the cores do.
@@ -34,22 +35,80 @@ pub const NUB_H: f32 = 10.0;
 /// one size whose radius was judged by eye rather than off the shape ratio.
 pub const NUB_RADIUS: f32 = 5.0;
 
-/// The window's fixed size, in logical pixels: the largest mode's envelope,
-/// with the smaller ones drawn centred inside it. Every mode animates within
-/// this rect, so no window move or buffer reallocation is ever part of a
-/// transition.
+/// The window's fixed size, in logical pixels: everything the pill can put on
+/// screen at once. Every mode animates within this rect, so no window move or
+/// buffer reallocation is ever part of a transition.
 ///
-/// The largest mode *is* the envelope, and if a future mode grows past it, this
-/// is the one place that has to change. Since #44 that mode is `Expanded`: the
-/// button bar is 118x32, and the envelope holds it with a margin all round —
-/// the end padding the hit test treats as inert, and the room the outermost
-/// island's anti-aliased edge fades into.
+/// **The envelope is no longer the largest mode.** Until #46 it was the button
+/// bar plus a margin, and every Geom was drawn centred in it. The label sits
+/// *above* the pill in the same layered window — a second `WS_EX_NOACTIVATE`
+/// window would double the surface-hazard footprint and let the style-clobbering
+/// bug bite twice — so the surface is now two bands: [`PILL_BAND_H`] at the
+/// bottom, which is the old envelope and is where every Geom is centred, and
+/// the label's band above it.
 ///
-/// Growing it does not move the pill: every Geom is drawn centred, and
-/// [`crate::pill::PILL_BOTTOM_MARGIN`] was retuned by the same growth, so the
-/// nub and the session pill sit exactly where they did.
-pub const ENVELOPE_W: u32 = 124;
-pub const ENVELOPE_H: u32 = 36;
+/// Growing it does not move the pill. The pill's band is anchored to the
+/// *bottom* of the surface and [`crate::pill::PILL_BOTTOM_MARGIN`] is measured
+/// from the same edge, so the nub and the session pill sit exactly where they
+/// did and the window grew upwards into empty screen.
+pub const ENVELOPE_W: u32 = 260;
+pub const ENVELOPE_H: u32 = 80;
+
+/// The band at the bottom of the envelope the pill itself lives in — the old
+/// envelope, unchanged: the button bar is 118x32, and this holds it with a
+/// margin all round for the inert end padding and the outermost island's
+/// anti-aliased edge.
+///
+/// Every [`Geom`] is drawn centred in *this*, not in the surface. Which is the
+/// one thing that has to stay true for the pill not to have moved.
+pub const PILL_BAND_H: f32 = 36.0;
+
+/// The label's text size, in logical pixels. Small: it is a name for what is
+/// under the cursor, not a message.
+pub const LABEL_PX: f32 = 11.5;
+
+/// The label's chip: its height, and the clear space either side of the text
+/// inside it.
+///
+/// The text floats over bare desktop, and the pill's own argument applies to it
+/// twice over — a light face is invisible on a light desktop, and there is no
+/// near-black body under a label as there is under a glyph. So the label wears
+/// the pill's own surface, in the pill's own colours: a fourth island, above
+/// the three.
+pub const LABEL_H: f32 = 20.0;
+pub const LABEL_PAD_X: f32 = 9.0;
+
+/// Clear space between the chip's bottom edge and the button bar's top one.
+const LABEL_GAP: f32 = 8.0;
+
+/// The label's text colour and alpha — the hairline's near-white, so the chip
+/// and the pill read as the same family rather than as a tooltip borrowed from
+/// somewhere else.
+pub const LABEL_TEXT: Rgb = HAIRLINE;
+pub const LABEL_TEXT_A: f32 = 245.0;
+
+/// The pill's centre line inside a surface `surface_h` device pixels tall.
+///
+/// Bottom-anchored, which is the whole of "the pill sits at the bottom of a
+/// taller surface": every length the renderer derives comes off this rather
+/// than off the pixmap's middle.
+pub fn pill_centre_y(surface_h: f32, scale: f32) -> f32 {
+    surface_h - PILL_BAND_H * scale / 2.0
+}
+
+/// The label's centre line: a fixed gap above the top edge of a pill `body_h`
+/// logical pixels tall.
+///
+/// Measured from the pill rather than from the top of the surface, because what
+/// the gap has to look right against is the thing the label is naming — and
+/// from the pill **as it is this frame**, not from the bar it was. A chip
+/// anchored to the bar's height would hold its place while the bar collapsed
+/// out from under it, leaving "Copied" pointing at 20px of bare desktop with a
+/// nub below. Off `Geom::h` it rides the collapse down as part of the same
+/// lerp, with no second clock — the islands' offsets are derived the same way.
+pub fn label_centre_y(surface_h: f32, scale: f32, body_h: f32) -> f32 {
+    pill_centre_y(surface_h, scale) - (body_h / 2.0 + LABEL_GAP + LABEL_H / 2.0) * scale
+}
 
 /// The session pill's own size, settled in #41 — the mid-size silhouette read
 /// better as the *recording* state than anything did as idle, so recording took
@@ -74,8 +133,9 @@ const NUB_BORDER_A: f32 = 120.0;
 /// the nub is a marker rather than a surface.
 const NUB_FILL_A: f32 = 140.0;
 
-/// The session pill's fill alpha, held over from #41.
-const PILL_FILL_A: f32 = 245.0;
+/// The session pill's fill alpha, held over from #41. Also the label chip's —
+/// the chip is the pill's own surface at another size, not a second material.
+pub const PILL_FILL_A: f32 = 245.0;
 
 /// The hairline's alpha, and the floor no mode's border ever drops below. The
 /// body is near-black, so on a black desktop nothing but a light edge separates
@@ -625,10 +685,11 @@ mod tests {
         assert!(!is_blank(&idle));
     }
 
-    /// Every mode has to fit the window the pill is created at, because the
-    /// window is never resized to run an animation.
+    /// Every mode has to fit the *pill's band*, because the window is never
+    /// resized to run an animation and the band is all of it the pill gets —
+    /// the rest belongs to the label.
     #[test]
-    fn no_mode_exceeds_the_envelope() {
+    fn no_mode_exceeds_the_pill_band() {
         for mode in [
             PillMode::Hidden,
             PillMode::Idle,
@@ -642,24 +703,71 @@ mod tests {
                 g.w <= ENVELOPE_W as f32,
                 "{mode:?} is wider than the window"
             );
-            assert!(
-                g.h <= ENVELOPE_H as f32,
-                "{mode:?} is taller than the window"
-            );
+            assert!(g.h <= PILL_BAND_H, "{mode:?} is taller than its band");
         }
     }
 
-    /// The bar is the largest thing the pill draws, so the envelope has to hold
-    /// it — with room over for the inert end padding and the outermost island's
+    /// The bar is the largest thing the pill draws, so its band has to hold it
+    /// — with room over for the inert end padding and the outermost island's
     /// anti-aliased edge.
     #[test]
-    fn the_envelope_holds_the_whole_button_bar() {
+    fn the_pill_band_holds_the_whole_button_bar() {
         use crate::pill::core::{bar_width, BAR_H};
         assert!(bar_width() < ENVELOPE_W as f32, "{}", bar_width());
-        assert!(BAR_H < ENVELOPE_H as f32);
+        const { assert!(BAR_H < PILL_BAND_H) };
         // And the session pill, which stopped being the envelope when the bar
         // grew past it.
-        assert!(SESSION_W < ENVELOPE_W as f32 && SESSION_H < ENVELOPE_H as f32);
+        assert!(SESSION_W < ENVELOPE_W as f32 && SESSION_H < PILL_BAND_H);
+    }
+
+    /// The pill's band is at the *bottom* of the surface, and the label's above
+    /// it, with room for the chip between the bar's top edge and the surface's.
+    #[test]
+    fn the_label_band_holds_the_chip_clear_of_the_bar() {
+        let (h, scale) = (ENVELOPE_H as f32, 1.0);
+        let pill = pill_centre_y(h, scale);
+        // The tallest thing the pill is ever drawn as, which is the one that
+        // pushes the chip closest to the top of the surface.
+        let label = label_centre_y(h, scale, crate::pill::core::BAR_H);
+        assert!(label < pill, "the label is not above the pill");
+        let bar_top = pill - crate::pill::core::BAR_H / 2.0;
+        assert!(label + LABEL_H / 2.0 < bar_top, "the chip touches the bar");
+        assert!(
+            label - LABEL_H / 2.0 > 0.0,
+            "the chip is clipped at the top"
+        );
+        // And over the nub it comes down to the same gap, rather than holding
+        // the bar's place with bare desktop under it.
+        let over_nub = label_centre_y(h, scale, NUB_H);
+        assert!(over_nub > label, "the chip did not follow the pill down");
+        assert_eq!(
+            (pill - NUB_H / 2.0) - (over_nub + LABEL_H / 2.0),
+            bar_top - (label + LABEL_H / 2.0),
+            "the gap changed with the pill's size"
+        );
+    }
+
+    /// The whole point of growing the envelope upwards rather than about its
+    /// centre: **the pill is exactly where it was**.
+    ///
+    /// One number, and it must not drift — the pill's centre sits 38 logical
+    /// pixels above the work area's bottom edge, which is where it sat when the
+    /// surface was 124x36 and the gap under it was this same 20. Written as
+    /// that literal rather than derived from `pill_centre_y`, which would be
+    /// its own definition rearranged and true of any envelope at all.
+    #[test]
+    fn the_pill_sits_exactly_where_it_did_before_the_label() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let h = ENVELOPE_H as f32 * scale;
+            // The window's bottom edge is `PILL_BOTTOM_MARGIN` above the work
+            // area's, so this is the pill's centre measured off the screen.
+            let above_work_area =
+                (h - pill_centre_y(h, scale)) / scale + crate::pill::PILL_BOTTOM_MARGIN as f32;
+            assert!(
+                (above_work_area - 38.0).abs() < 1e-3,
+                "at {scale}x the pill moved to {above_work_area} above the work area"
+            );
+        }
     }
 
     /// The nub grows into the button under the cursor, not into a body that is

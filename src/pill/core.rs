@@ -114,7 +114,8 @@ pub enum Icon {
     Sliders,
 }
 
-/// One button of the bar: what it does, what it wears, and how wide it is.
+/// One button of the bar: what it does, what it wears, what it is called, and
+/// how wide it is.
 ///
 /// Width is a field rather than a constant because the three are not the same
 /// size — and **the glyph box is not the button**: [`GLYPH_BOX`] is 22 in all
@@ -123,6 +124,10 @@ pub enum Icon {
 pub struct Button {
     pub action: Action,
     pub icon: Icon,
+    /// What the label says while the cursor is on it (#46). Held here rather
+    /// than in a table beside the list, for the same reason everything else
+    /// about the bar is: a fourth button is one edit, in one place.
+    pub name: &'static str,
     /// The island's width in logical pixels. Its height is derived — see
     /// [`Button::height`].
     pub w: f32,
@@ -173,16 +178,22 @@ pub const BUTTONS: [Button; BUTTON_COUNT] = [
     Button {
         action: Action::Copy,
         icon: Icon::Copy,
+        // The tray's wording is "Copy last transcription"; this is the same
+        // recovery path said shorter, because the label is one line over a
+        // 36px nub rather than a menu item with a menu's width.
+        name: "Copy last transcript",
         w: 32.0,
     },
     Button {
         action: Action::Dictate,
         icon: Icon::Mic,
+        name: "Dictate",
         w: 48.0,
     },
     Button {
         action: Action::Settings,
         icon: Icon::Sliders,
+        name: "Settings",
         w: 32.0,
     },
 ];
@@ -223,9 +234,17 @@ pub fn slab(i: usize) -> (f32, f32) {
     (c - half - lo, c + half + hi)
 }
 
-/// Which button `x` — an offset from the pill's centre, in logical pixels — is
-/// over, disregarding whether it is live.
-fn slab_at(x: f32) -> Option<usize> {
+/// Which button `(x, y)` — an offset from the pill's centre, in logical pixels
+/// — is over, disregarding whether it is live.
+///
+/// The vertical half is what "full bar height" actually means, and it is
+/// checked rather than assumed: until #46 the window *was* the bar's height and
+/// there was nowhere else to be, but the envelope now holds a label above the
+/// pill, and a cursor up there is over the window without being over a button.
+fn slab_at(x: f32, y: f32) -> Option<usize> {
+    if y.abs() > BAR_H / 2.0 {
+        return None;
+    }
     (0..BUTTONS.len()).find(|&i| {
         let (lo, hi) = slab(i);
         x >= lo && x < hi
@@ -381,25 +400,25 @@ impl Pill {
         }
     }
 
-    /// Which button the cursor is over, `x` being its offset from the pill's
-    /// centre in logical pixels.
+    /// Which button the cursor is over, `(x, y)` being its offset from the
+    /// pill's centre in logical pixels.
     ///
-    /// `None` for the end padding, for a disabled button — whose slab is inert,
-    /// not merely unclickable — and for a pill that is not showing buttons at
-    /// all, which is what keeps a stray `CursorMoved` from lighting anything
-    /// mid-dictation.
-    pub fn button_at(&self, x: f32) -> Option<usize> {
+    /// `None` for the end padding, for the label's band above the bar, for a
+    /// disabled button — whose slab is inert, not merely unclickable — and for
+    /// a pill that is not showing buttons at all, which is what keeps a stray
+    /// `CursorMoved` from lighting anything mid-dictation.
+    pub fn button_at(&self, x: f32, y: f32) -> Option<usize> {
         if !self.showing_buttons() {
             return None;
         }
-        slab_at(x).filter(|&i| self.enabled(i))
+        slab_at(x, y).filter(|&i| self.enabled(i))
     }
 
-    /// What clicking at `x` does. Exactly [`Self::button_at`]'s answer, read as
-    /// an action — the same slab decides both, so nothing can light up under
-    /// the cursor and then do nothing when pressed.
-    pub fn action_at(&self, x: f32) -> Option<Action> {
-        self.button_at(x).map(|i| BUTTONS[i].action)
+    /// What clicking at `(x, y)` does. Exactly [`Self::button_at`]'s answer,
+    /// read as an action — the same slab decides both, so nothing can light up
+    /// under the cursor and then do nothing when pressed.
+    pub fn action_at(&self, x: f32, y: f32) -> Option<Action> {
+        self.button_at(x, y).map(|i| BUTTONS[i].action)
     }
 
     /// Apply a session's report. `Finished` is stamped here, not by the session:
@@ -1039,14 +1058,14 @@ mod tests {
     fn a_click_in_the_gap_lands_on_the_adjacent_button() {
         let p = expanded();
         // Just left of the seam is still Dictate; just right of it is Settings.
-        assert_eq!(p.action_at(25.0), Some(Action::Dictate));
-        assert_eq!(p.action_at(26.0), Some(Action::Settings));
-        assert_eq!(p.action_at(-26.0), Some(Action::Copy));
-        assert_eq!(p.action_at(-25.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(25.0, 0.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(26.0, 0.0), Some(Action::Settings));
+        assert_eq!(p.action_at(-26.0, 0.0), Some(Action::Copy));
+        assert_eq!(p.action_at(-25.0, 0.0), Some(Action::Dictate));
         // And the islands themselves, at their centres.
-        assert_eq!(p.action_at(-43.0), Some(Action::Copy));
-        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
-        assert_eq!(p.action_at(43.0), Some(Action::Settings));
+        assert_eq!(p.action_at(-43.0, 0.0), Some(Action::Copy));
+        assert_eq!(p.action_at(0.0, 0.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(43.0, 0.0), Some(Action::Settings));
     }
 
     /// Past the last island is end padding: it holds the pill expanded with
@@ -1055,8 +1074,27 @@ mod tests {
     fn a_click_in_the_end_padding_hits_nothing() {
         let p = expanded();
         for x in [-62.0, -60.0, -59.5, 59.0, 60.0, 62.0] {
-            assert_eq!(p.button_at(x), None, "at {x}");
-            assert_eq!(p.action_at(x), None, "at {x}");
+            assert_eq!(p.button_at(x, 0.0), None, "at {x}");
+            assert_eq!(p.action_at(x, 0.0), None, "at {x}");
+        }
+    }
+
+    /// A slab is full bar height and no more. Above the bar is the label's
+    /// band, which is part of the window and part of no button — the cursor is
+    /// over the pill up there without being over anything to press.
+    #[test]
+    fn the_label_band_above_the_bar_hits_nothing() {
+        let p = expanded();
+        // Inside the bar, top to bottom, over each island.
+        for x in [-43.0, 0.0, 43.0] {
+            for y in [-15.9, 0.0, 15.9] {
+                assert!(p.button_at(x, y).is_some(), "at ({x}, {y})");
+            }
+        }
+        // And just outside it, where the label lives.
+        for y in [-16.1, -24.0, -40.0, 16.1] {
+            assert_eq!(p.button_at(0.0, y), None, "at y {y}");
+            assert_eq!(p.action_at(0.0, y), None, "at y {y}");
         }
     }
 
@@ -1068,12 +1106,12 @@ mod tests {
         let mut p = Pill::new();
         p.set_presence(Presence::Resident { expanded: true });
         assert!(!p.enabled(0));
-        assert_eq!(p.button_at(-43.0), None);
-        assert_eq!(p.action_at(-43.0), None);
-        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
+        assert_eq!(p.button_at(-43.0, 0.0), None);
+        assert_eq!(p.action_at(-43.0, 0.0), None);
+        assert_eq!(p.action_at(0.0, 0.0), Some(Action::Dictate));
         // The first transcript of the session brings it to life.
         p.set_has_history(true);
-        assert_eq!(p.action_at(-43.0), Some(Action::Copy));
+        assert_eq!(p.action_at(-43.0, 0.0), Some(Action::Copy));
     }
 
     /// Hover cannot expand a recording pill — and with no bar on screen there
@@ -1090,13 +1128,13 @@ mod tests {
         );
         assert!(!p.showing_buttons());
         for x in [-43.0, 0.0, 43.0] {
-            assert_eq!(p.button_at(x), None, "at {x}");
-            assert_eq!(p.action_at(x), None, "at {x}");
+            assert_eq!(p.button_at(x, 0.0), None, "at {x}");
+            assert_eq!(p.action_at(x, 0.0), None, "at {x}");
         }
         // And they come back when the flash retires to the hovered nub.
         p.on_session(SessionActivity::Finished { ok: true }, t(100));
         p.tick(t(100) + SUCCESS_LINGER);
-        assert_eq!(p.action_at(0.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(0.0, 0.0), Some(Action::Dictate));
     }
 
     #[test]

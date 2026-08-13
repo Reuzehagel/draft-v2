@@ -7,19 +7,30 @@
 // mode at all — which a `draw_recording`/`draw_success` split has no way to
 // express.
 //
-// The Geom is drawn centred in the pixmap rather than filling it. The window
-// sits at a fixed envelope big enough for the largest mode, so a 36x10 nub, a
-// 62x28 recording pill and a 118x32 button bar are the same window with
-// different pixels in it — nothing is resized, moved, or reallocated to run an
-// animation.
+// The Geom is drawn centred in the *pill's band* — the bottom `PILL_BAND_H` of
+// the surface — rather than filling the pixmap. The window sits at a fixed
+// envelope, so a 36x10 nub, a 62x28 recording pill and a 118x32 button bar are
+// the same window with different pixels in it — nothing is resized, moved, or
+// reallocated to run an animation.
 //
-// The one thing the Geom does not carry is which button the cursor is on: that
-// is per-button state a single whole-pill Geom cannot express (#29), so it
-// arrives beside it as a `Slot` per button.
+// Above that band is the label (#46), which is why the band is not the whole
+// surface: `geom::pill_centre_y` is where every length below is measured from,
+// and `pm.height() / 2.0` is a bug here.
+//
+// Two things the Geom does not carry. Which button the cursor is on is
+// per-button state a single whole-pill Geom cannot express (#29), so it arrives
+// beside it as a `Slot` per button. What the label says is a second surface
+// with its own clock — a flash outlives the hover under it — so it arrives as a
+// `Fade`.
 
 use crate::pill::core::{island_centre, slab, Button, BUTTONS, BUTTON_COUNT, CENTRE, GLYPH_BOX};
-use crate::pill::geom::{Geom, Slot};
+use crate::pill::geom::{
+    label_centre_y, pill_centre_y, Geom, Slot, BODY, HAIRLINE, HAIRLINE_A, LABEL_H, LABEL_PAD_X,
+    LABEL_PX, LABEL_TEXT, LABEL_TEXT_A, PILL_FILL_A,
+};
 use crate::pill::icons;
+use crate::pill::label::Fade;
+use crate::pill::text;
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
@@ -73,6 +84,19 @@ impl Bars {
     }
 }
 
+/// The pill's centre in `pm`, in device pixels — horizontally the surface's
+/// middle, vertically the [`pill_centre_y`] band anchor.
+///
+/// The one place either is worked out. `pm.height() / 2.0` was that answer
+/// until #46 put the label above the pill, and it is now wrong everywhere; a
+/// single derivation is what stops it coming back in one caller.
+fn centre(pm: &Pixmap, scale: f32) -> (f32, f32) {
+    (
+        pm.width() as f32 / 2.0,
+        pill_centre_y(pm.height() as f32, scale),
+    )
+}
+
 fn clear_transparent(pm: &mut Pixmap) {
     pm.fill(Color::TRANSPARENT);
 }
@@ -107,17 +131,23 @@ pub fn draw(
     geom: &Geom,
     bar_heights: &[f32],
     slots: &[Slot; BUTTON_COUNT],
+    label: &Fade,
 ) {
     clear_transparent(pm);
+
+    // Before the pill's own early-out: the label is a separate surface in the
+    // same window, and a degenerate Geom is no reason for it not to be drawn.
+    draw_label(pm, scale, geom.h, label);
 
     let (border_w, body_w, body_h) = body_of(geom, scale);
     if body_w <= 0.0 || body_h <= 0.0 {
         return;
     }
-    // Centred in the envelope: the pill grows and shrinks about its own middle,
-    // which is what keeps it bottom-centred on screen at every size.
-    let x = (pm.width() as f32 - body_w) / 2.0;
-    let y = (pm.height() as f32 - body_h) / 2.0;
+    // Centred in the pill's band: the pill grows and shrinks about its own
+    // middle, which is what keeps it bottom-centred on screen at every size.
+    let (cx, cy) = centre(pm, scale);
+    let x = cx - body_w / 2.0;
+    let y = cy - body_h / 2.0;
     let radius = (geom.radius * scale).min(body_h / 2.0).min(body_w / 2.0);
 
     let islands = islands(pm, geom, scale, border_w);
@@ -163,7 +193,7 @@ pub fn draw(
     );
 
     if geom.bars > 0.0 {
-        draw_bars(pm, &Bars::new(body_w, body_h), bar_heights, geom.bars);
+        draw_bars(pm, cy, &Bars::new(body_w, body_h), bar_heights, geom.bars);
     }
 
     // On top of every island, its own and the body's alike — the indicator sits
@@ -173,6 +203,95 @@ pub fn draw(
             draw_indicator(pm, island, scale, slots[i].hover * geom.buttons);
             draw_glyph(pm, &BUTTONS[i], island, scale, geom.buttons, slots[i]);
         }
+    }
+}
+
+/// The label: one chip above the pill, with the text crossfading inside it.
+///
+/// **One chip, not two.** A crossfade between two texts of different widths
+/// could be two chips dissolving through each other; instead the chip's width
+/// lerps between the two while the texts cross inside it, which is the pill's
+/// own doctrine applied one surface up — one shape morphing rather than two
+/// animations side by side. Arriving from nothing and leaving for it are the
+/// same lerp with one side missing, so the chip fades in and out at its settled
+/// width rather than growing out of zero.
+///
+/// The measuring is here rather than in `pill::label` on purpose: a width needs
+/// a face, and the label's state machine is asserted without one.
+fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
+    if fade.is_blank() {
+        return;
+    }
+    let (a_from, a_to) = fade.opacities();
+    let opacity = (a_from + a_to).clamp(0.0, 1.0);
+    let px = LABEL_PX * scale;
+    let from = fade.from.and_then(|t| text::label(t, px));
+    let to = fade.to.and_then(|t| text::label(t, px));
+    // No face installed, or nothing that draws: no chip either. A chip with
+    // nothing in it would be a blank slab above the pill saying less than
+    // nothing.
+    let text_w = match (from.as_deref(), to.as_deref()) {
+        (Some(a), Some(b)) => a.width + (b.width - a.width) * fade.t.clamp(0.0, 1.0),
+        (Some(a), None) => a.width,
+        (None, Some(b)) => b.width,
+        (None, None) => return,
+    };
+
+    let (cx, _) = centre(pm, scale);
+    let cy = label_centre_y(pm.height() as f32, scale, body_h);
+    let h = LABEL_H * scale;
+    let w = text_w + 2.0 * LABEL_PAD_X * scale;
+    let border_w = scale.max(1.0);
+    let mut pb = PathBuilder::new();
+    rounded_rect(&mut pb, cx - w / 2.0, cy - h / 2.0, w, h, h / 2.0);
+    let Some(chip) = pb.finish() else {
+        return;
+    };
+
+    let mut fill = Paint::default();
+    fill.set_color_rgba8(BODY.0, BODY.1, BODY.2, alpha_u8(PILL_FILL_A * opacity));
+    fill.anti_alias = true;
+    pm.fill_path(&chip, &fill, FillRule::Winding, Transform::identity(), None);
+
+    let mut edge = Paint::default();
+    edge.set_color_rgba8(
+        HAIRLINE.0,
+        HAIRLINE.1,
+        HAIRLINE.2,
+        alpha_u8(HAIRLINE_A * opacity),
+    );
+    edge.anti_alias = true;
+    pm.stroke_path(
+        &chip,
+        &edge,
+        &Stroke {
+            width: border_w,
+            ..Default::default()
+        },
+        Transform::identity(),
+        None,
+    );
+
+    for (t, a) in [(from, a_from), (to, a_to)] {
+        let Some(t) = t else { continue };
+        if a <= 0.0 {
+            continue;
+        }
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(
+            LABEL_TEXT.0,
+            LABEL_TEXT.1,
+            LABEL_TEXT.2,
+            alpha_u8(LABEL_TEXT_A * a),
+        );
+        paint.anti_alias = true;
+        pm.fill_path(
+            &t.path,
+            &paint,
+            FillRule::Winding,
+            Transform::from_translate(cx, cy),
+            None,
+        );
     }
 }
 
@@ -201,7 +320,7 @@ fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
     }
     let (lo, hi) = (slab(0).0 * scale, slab(BUTTONS.len() - 1).1 * scale);
     let h = crate::pill::core::BAR_H * scale;
-    let (cx, cy) = (pm.width() as f32 / 2.0, pm.height() as f32 / 2.0);
+    let (cx, cy) = centre(pm, scale);
     let Some(rect) = Rect::from_ltrb(cx + lo, cy - h / 2.0, cx + hi, cy + h / 2.0) else {
         return;
     };
@@ -232,7 +351,7 @@ struct Island {
 /// number**: no per-button clock, so a frame mid-fold-out is still derived from
 /// the Geom alone.
 fn islands(pm: &Pixmap, geom: &Geom, scale: f32, border_w: f32) -> [Island; BUTTON_COUNT] {
-    let (cx, cy) = (pm.width() as f32 / 2.0, pm.height() as f32 / 2.0);
+    let (cx, cy) = centre(pm, scale);
     let (_, body_w, body_h) = body_of(geom, scale);
     // The same transparent margin the body gets, so a flanker's edge has room
     // to fade into instead of stair-stepping.
@@ -416,13 +535,12 @@ fn alpha_u8(a: f32) -> u8 {
     a.clamp(0.0, 255.0) as u8
 }
 
-fn draw_bars(pm: &mut Pixmap, g: &Bars, bar_heights: &[f32], opacity: f32) {
+fn draw_bars(pm: &mut Pixmap, cy: f32, g: &Bars, bar_heights: &[f32], opacity: f32) {
     if bar_heights.is_empty() || g.bar_w <= 0.0 {
         return;
     }
     let total_w = g.span(bar_heights.len());
     let start_x = (pm.width() as f32 - total_w) / 2.0;
-    let cy = pm.height() as f32 / 2.0;
     let r = g.bar_w / 2.0;
 
     let mut paint = Paint::default();
@@ -511,14 +629,29 @@ mod tests {
         origin: Origin::Hotkey,
     };
 
+    /// No hover and no acknowledgement — what the label is almost all the time,
+    /// and what every test that is not about the label passes.
+    const NO_LABEL: Fade = Fade {
+        from: None,
+        to: None,
+        t: 1.0,
+    };
+
     fn envelope() -> Pixmap {
         Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap()
+    }
+
+    /// The row through the pill's centre, which is **not** the pixmap's middle:
+    /// the pill sits in a band at the bottom of the surface with the label's
+    /// band above it. Everything below measures against this.
+    fn cy(pm: &Pixmap, scale: f32) -> u32 {
+        pill_centre_y(pm.height() as f32, scale).round() as u32
     }
 
     /// Draw a mode into a fresh envelope-sized pixmap at 1x.
     fn frame(mode: PillMode, bars: &[f32]) -> Pixmap {
         let mut pm = envelope();
-        draw(&mut pm, 1.0, &Geom::of(mode), bars, &NO_SLOTS);
+        draw(&mut pm, 1.0, &Geom::of(mode), bars, &NO_SLOTS, &NO_LABEL);
         pm
     }
 
@@ -541,8 +674,8 @@ mod tests {
     #[test]
     fn the_nub_draws_a_small_bare_body_with_a_light_edge() {
         let pm = frame(PillMode::Idle, &FLAT);
-        let cy = ENVELOPE_H / 2;
-        // 36 wide, centred in a 62-wide envelope: the body starts at x=13.
+        let cy = cy(&pm, 1.0);
+        // 36 wide, centred across the envelope.
         let left = (ENVELOPE_W - 36) / 2;
         // Outside the nub is untouched — the envelope is not the pill.
         assert_eq!(
@@ -569,7 +702,7 @@ mod tests {
     fn the_nub_occupies_the_settled_rect() {
         let pm = frame(PillMode::Idle, &FLAT);
         let opaque = |x: u32, y: u32| pm.pixel(x, y).unwrap().alpha() > 8;
-        let cy = ENVELOPE_H / 2;
+        let cy = cy(&pm, 1.0);
         let cx = ENVELOPE_W / 2;
         let width = (0..ENVELOPE_W).filter(|&x| opaque(x, cy)).count();
         let height = (0..ENVELOPE_H).filter(|&y| opaque(cx, y)).count();
@@ -618,7 +751,7 @@ mod tests {
             let g = Geom::of(mode);
             let pm = frame(mode, &FLAT);
             let left = ((ENVELOPE_W as f32 - g.w) / 2.0).round() as u32;
-            let (edge, body) = edge_and_body(&pm, left, ENVELOPE_H / 2);
+            let (edge, body) = edge_and_body(&pm, left, cy(&pm, 1.0));
             assert!(edge > 60, "{name}: edge too dark to separate ({edge})");
             assert!(
                 edge > body * 3,
@@ -637,8 +770,8 @@ mod tests {
     fn a_frame_mid_morph_draws_a_body_between_the_two_modes() {
         let half = Geom::of(PillMode::Idle).lerp(Geom::of(REC), 0.5);
         let mut pm = envelope();
-        draw(&mut pm, 1.0, &half, &FLAT, &NO_SLOTS);
-        let cy = ENVELOPE_H / 2;
+        draw(&mut pm, 1.0, &half, &FLAT, &NO_SLOTS, &NO_LABEL);
+        let cy = cy(&pm, 1.0);
         let width = (0..ENVELOPE_W)
             .filter(|&x| pm.pixel(x, cy).unwrap().alpha() > 8)
             .count();
@@ -698,14 +831,14 @@ mod tests {
         let g = Geom::of(PillMode::Idle);
         let mut one = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
         let mut two = Pixmap::new(ENVELOPE_W * 2, ENVELOPE_H * 2).unwrap();
-        draw(&mut one, 1.0, &g, &FLAT, &NO_SLOTS);
-        draw(&mut two, 2.0, &g, &FLAT, &NO_SLOTS);
+        draw(&mut one, 1.0, &g, &FLAT, &NO_SLOTS, &NO_LABEL);
+        draw(&mut two, 2.0, &g, &FLAT, &NO_SLOTS, &NO_LABEL);
         let count = |pm: &Pixmap, y: u32| {
             (0..pm.width())
                 .filter(|&x| pm.pixel(x, y).unwrap().alpha() > 8)
                 .count()
         };
-        let (a, b) = (count(&one, ENVELOPE_H / 2), count(&two, ENVELOPE_H));
+        let (a, b) = (count(&one, cy(&one, 1.0)), count(&two, cy(&two, 2.0)));
         assert!(
             (b as i32 - 2 * a as i32).abs() <= 3,
             "1x drew {a} px, 2x drew {b}"
@@ -715,7 +848,14 @@ mod tests {
     /// Draw the expanded bar at 1x, with `slots`.
     fn bar(slots: &[Slot; BUTTON_COUNT]) -> Pixmap {
         let mut pm = envelope();
-        draw(&mut pm, 1.0, &Geom::of(PillMode::Expanded), &FLAT, slots);
+        draw(
+            &mut pm,
+            1.0,
+            &Geom::of(PillMode::Expanded),
+            &FLAT,
+            slots,
+            &NO_LABEL,
+        );
         pm
     }
 
@@ -739,7 +879,7 @@ mod tests {
     #[test]
     fn the_expanded_bar_draws_three_islands_over_bare_desktop() {
         let pm = bar(&NO_SLOTS);
-        let runs = runs(&pm, ENVELOPE_H / 2);
+        let runs = runs(&pm, cy(&pm, 1.0));
         assert_eq!(runs.len(), 3, "{runs:?}");
         let widths: Vec<u32> = runs.iter().map(|(a, b)| b - a + 1).collect();
         // 32, 48, 32, to within the ~1px margin each edge fades into.
@@ -771,8 +911,9 @@ mod tests {
                 &Geom::of(PillMode::Idle).lerp(expanded, t),
                 &FLAT,
                 &NO_SLOTS,
+                &NO_LABEL,
             );
-            runs(&pm, ENVELOPE_H / 2)
+            runs(&pm, cy(&pm, 1.0))
         };
         // A quarter of the way in they have barely left, and are dim enough to
         // still be one silhouette with the body.
@@ -793,7 +934,7 @@ mod tests {
         let dark = bar(&slots);
         slots[0].hover = 1.0;
         let lit = bar(&slots);
-        let cy = ENVELOPE_H / 2;
+        let cy = cy(&lit, 1.0);
         // Inside the Copy island, clear of its glyph: the indicator's fill.
         let x = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(0)) as u32;
         let inside =
@@ -822,7 +963,7 @@ mod tests {
         slots[0].enabled = false;
         let dead = bar(&slots);
         let cx = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(0)) as u32;
-        let cy = ENVELOPE_H / 2;
+        let cy = cy(&live, 1.0);
         // The brightest pixel anywhere in the glyph box, which is the glyph.
         let glyph = |pm: &Pixmap| {
             (cx - 11..cx + 11)
@@ -868,6 +1009,7 @@ mod tests {
             &Geom::of(PillMode::Expanded),
             &FLAT,
             &NO_SLOTS,
+            &NO_LABEL,
         );
         // 4x → 2x → 1x, exactly as `blit_and_present` does it.
         let paint = tiny_skia::PixmapPaint {
@@ -880,7 +1022,7 @@ mod tests {
         let mut out = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
         out.draw_pixmap(0, 0, mid.as_ref(), &paint, half, None);
 
-        let cy = ENVELOPE_H / 2;
+        let cy = cy(&out, 1.0);
         // The middle of each gap: between Copy and Dictate, and between
         // Dictate and Settings.
         for (i, b) in BUTTONS.iter().enumerate().take(BUTTONS.len() - 1) {
@@ -901,7 +1043,143 @@ mod tests {
     #[test]
     fn the_nub_draws_no_buttons() {
         let pm = frame(PillMode::Idle, &FLAT);
-        assert_eq!(runs(&pm, ENVELOPE_H / 2).len(), 1);
+        assert_eq!(runs(&pm, cy(&pm, 1.0)).len(), 1);
+    }
+
+    /// Draw the expanded bar with the label saying `fade`.
+    fn with_label(fade: &Fade) -> Pixmap {
+        let mut pm = envelope();
+        draw(
+            &mut pm,
+            1.0,
+            &Geom::of(PillMode::Expanded),
+            &FLAT,
+            &NO_SLOTS,
+            fade,
+        );
+        pm
+    }
+
+    /// One settled text, fully faded in.
+    fn showing(text: &'static str) -> Fade {
+        Fade {
+            from: None,
+            to: Some(text),
+            t: 1.0,
+        }
+    }
+
+    /// The drawn extent of row `y`, left to right.
+    fn rows_x(pm: &Pixmap, y: u32) -> (u32, u32) {
+        let r = runs(pm, y);
+        (r[0].0, r.last().unwrap().1)
+    }
+
+    /// The rows the label's chip occupies, measured off the drawn pixels:
+    /// every drawn row above the button bar's top edge, which is the only thing
+    /// up there that is not the pill.
+    fn label_rows(pm: &Pixmap) -> Vec<u32> {
+        let bar_top = pill_centre_y(pm.height() as f32, 1.0) - crate::pill::core::BAR_H / 2.0;
+        (0..bar_top as u32)
+            .filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).unwrap().alpha() > 8))
+            .collect()
+    }
+
+    /// With nothing hovered the label is not merely faint — there are no pixels
+    /// above the pill at all. "Nothing is shown when no button is hovered" is a
+    /// claim about the surface, not about an alpha.
+    #[test]
+    fn no_hover_draws_no_label() {
+        let pm = bar(&NO_SLOTS);
+        assert!(label_rows(&pm).is_empty(), "{:?}", label_rows(&pm));
+    }
+
+    /// A hovered button's name is a chip above the bar, clear of it — text on a
+    /// surface of its own, because a bare light face over a light desktop is
+    /// not text at all.
+    #[test]
+    fn a_hovered_button_draws_a_chip_above_the_bar() {
+        let pm = with_label(&showing("Settings"));
+        let rows = label_rows(&pm);
+        assert!(!rows.is_empty(), "the label drew nothing");
+        // It sits where the layout says, and does not touch the bar.
+        let want = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h);
+        let (top, bottom) = (rows[0] as f32, *rows.last().unwrap() as f32);
+        assert!(
+            (top - (want - LABEL_H / 2.0)).abs() <= 2.0
+                && (bottom - (want + LABEL_H / 2.0)).abs() <= 2.0,
+            "chip spans {top}..{bottom}, wanted {want} +- {}",
+            LABEL_H / 2.0
+        );
+        let bar_top = pill_centre_y(ENVELOPE_H as f32, 1.0) - crate::pill::core::BAR_H / 2.0;
+        assert!(bottom < bar_top, "the chip touches the bar");
+        // Dark body, light text: the two things that make it readable on any
+        // desktop, checked as the pill's own body is.
+        let cy = want.round() as u32;
+        let ink = (cy - 4..cy + 4)
+            .flat_map(|y| (0..ENVELOPE_W).map(move |x| (x, y)))
+            .map(|(x, y)| brightest(pm.pixel(x, y).unwrap()))
+            .max()
+            .unwrap();
+        assert!(ink > 120, "no light text in the chip ({ink})");
+        // Just inside the chip's left edge, clear of the text: dark body.
+        let body = brightest(pm.pixel(rows_x(&pm, cy).0 + 3, cy).unwrap());
+        assert!(body < 60, "the chip's body is not dark ({body})");
+    }
+
+    /// The chip is sized to the text it holds — a fixed-width slab would leave
+    /// "Settings" swimming in it and clip "Copy last transcript".
+    #[test]
+    fn the_chip_is_sized_to_its_text() {
+        let width = |text: &'static str| {
+            let pm = with_label(&showing(text));
+            let y = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h).round()
+                as u32;
+            runs(&pm, y)
+                .iter()
+                .map(|(a, b)| (*a, *b))
+                .fold((u32::MAX, 0), |(lo, hi), (a, b)| (lo.min(a), hi.max(b)))
+        };
+        let (s0, s1) = width("Settings");
+        let (c0, c1) = width("Copy last transcript");
+        assert!(c1 - c0 > s1 - s0, "the chip ignored its text");
+        // Both centred on the pill, and inside the envelope.
+        for (lo, hi) in [(s0, s1), (c0, c1)] {
+            let centre = (lo + hi) as f32 / 2.0;
+            assert!(
+                (centre - ENVELOPE_W as f32 / 2.0).abs() <= 2.0,
+                "off centre"
+            );
+            assert!(hi < ENVELOPE_W, "the chip overflows the envelope");
+        }
+    }
+
+    /// Mid-crossfade there is **one** chip, not two dissolving through each
+    /// other — measured off the drawn pixels, so a renderer that drew a chip
+    /// per text would fail here whatever the widths said.
+    #[test]
+    fn the_crossfade_draws_one_chip() {
+        let fade = Fade {
+            from: Some("Settings"),
+            to: Some("Copy last transcript"),
+            t: 0.5,
+        };
+        let pm = with_label(&fade);
+        let y =
+            label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h).round() as u32;
+        // The chip's own row, above the text's ink: one continuous run.
+        let edge = (y as f32 - LABEL_H / 2.0 + 2.0) as u32;
+        assert_eq!(runs(&pm, edge).len(), 1, "{:?}", runs(&pm, edge));
+        // And its width is between the two texts' own.
+        let span = |f: &Fade| {
+            let pm = with_label(f);
+            let r = runs(&pm, edge);
+            r.last().unwrap().1 - r[0].0
+        };
+        let narrow = span(&showing("Settings"));
+        let wide = span(&showing("Copy last transcript"));
+        let mid = span(&fade);
+        assert!(narrow < mid && mid < wide, "{narrow} {mid} {wide}");
     }
 
     /// A fully-rounded corner has to be a real circular arc. The old quadratic
