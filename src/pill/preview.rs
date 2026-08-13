@@ -27,6 +27,7 @@ use crate::pill::geom::{
     breathe, Geom, Motion, Slot, Slots, Tween, ENVELOPE_H, ENVELOPE_W, HOVER_IN, HOVER_OUT, REVEAL,
     TO_IDLE, TO_RECORDING,
 };
+use crate::pill::label::{Fade, Label, COPIED};
 use crate::pill::render::draw;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,6 +36,11 @@ use tiny_skia::{Pixmap, PremultipliedColorU8};
 /// Nearest-neighbour zoom. Nearest rather than smooth on purpose: this is for
 /// judging a hairline and an anti-aliased corner, and a resample would show a
 /// blur the pill does not have.
+///
+/// Held at 6 through #46's envelope growth: the sheets are several megapixels
+/// each now, and they are disposable files under `target/` — trading the
+/// fidelity this tool exists for against their size would be the wrong way
+/// round.
 const ZOOM: u32 = 6;
 /// Space around each pill, in pre-zoom pixels.
 const PAD: u32 = 10;
@@ -85,12 +91,26 @@ fn frame(geom: &Geom, bars: &[f32]) -> Pixmap {
     frame_with(geom, bars, &NO_SLOTS)
 }
 
+/// No hover and no acknowledgement — the label's usual state, and what every
+/// sheet but `preview_labels` shows.
+const NO_LABEL: Fade = Fade {
+    from: None,
+    to: None,
+    t: 1.0,
+};
+
 /// The same, with per-button hover state — for the expanded bar, where which
 /// button is lit is not part of the Geom.
 fn frame_with(geom: &Geom, bars: &[f32], slots: &Slots) -> Pixmap {
+    labelled(geom, bars, slots, &NO_LABEL)
+}
+
+/// The same again, with the label saying something — the one sheet where it is
+/// the subject rather than the absence.
+fn labelled(geom: &Geom, bars: &[f32], slots: &Slots, label: &Fade) -> Pixmap {
     const SS: u32 = 4;
     let mut hi = Pixmap::new(ENVELOPE_W * SS, ENVELOPE_H * SS).unwrap();
-    draw(&mut hi, SS as f32, geom, bars, slots);
+    draw(&mut hi, SS as f32, geom, bars, slots, label);
     let mut out = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
     out.draw_pixmap(
         0,
@@ -329,6 +349,123 @@ fn preview_buttons() {
     let path = out_dir().join("pill-buttons.png");
     out.save_png(&path).expect("write preview png");
     println!("wrote {}", path.display());
+}
+
+/// The label, over a light desktop and a black one.
+///
+/// Rows: each button's name in turn, and "Copied". The pair of backgrounds is
+/// the point — the label floats over bare desktop with no pill under it, so its
+/// chip is carrying the whole of its legibility, exactly as the pill's body
+/// does for the glyphs.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_labels() {
+    let now = Instant::now();
+    // Through the real state machine, settled: what a hover that has finished
+    // fading actually produces, rather than a `Fade` written out by hand.
+    let settled = |set: &dyn Fn(&mut Label)| -> (Fade, Slots) {
+        let mut l = Label::new(now);
+        set(&mut l);
+        (l.at(now + Duration::from_millis(200)), NO_SLOTS)
+    };
+    let lit = |i: usize| -> Slots {
+        std::array::from_fn(|s| Slot {
+            hover: if s == i { 1.0 } else { 0.0 },
+            enabled: true,
+        })
+    };
+    let rows: Vec<(Fade, Slots)> = (0..crate::pill::core::BUTTON_COUNT)
+        .map(|i| {
+            let (fade, _) = settled(&|l: &mut Label| {
+                l.set_hover(Some(i), now);
+            });
+            (fade, lit(i))
+        })
+        .chain(std::iter::once(settled(&|l: &mut Label| {
+            l.set_hover(Some(0), now);
+            l.flash(COPIED, now);
+        })))
+        .collect();
+
+    let expanded = Geom::of(PillMode::Expanded);
+    let cell = cell();
+    let mut out = canvas(2, rows.len() as u32, cell, LIGHT_DESKTOP);
+    for y in 0..out.height() {
+        for x in cell.0..out.width() {
+            let (w, c) = (out.width(), opaque(DARK_DESKTOP));
+            out.pixels_mut()[(y * w + x) as usize] = c;
+        }
+    }
+    for (r, (fade, slots)) in rows.iter().enumerate() {
+        let pill = labelled(&expanded, &FLAT, slots, fade);
+        let y = r as u32 * cell.1 + PAD;
+        blit(&mut out, &pill, PAD, y, LIGHT_DESKTOP);
+        blit(&mut out, &pill, cell.0 + PAD, y, DARK_DESKTOP);
+    }
+    let path = out_dir().join("pill-labels.png");
+    out.save_png(&path).expect("write preview png");
+    println!("wrote {}", path.display());
+}
+
+/// One text changing into another, as a filmstrip: the chip's width lerps
+/// between the two while the words cross inside it. The point of the row is
+/// that it is *one* chip throughout — never two dissolving through each other.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_label_crossfade() {
+    let t0 = Instant::now();
+    let strip = |set: &dyn Fn(&mut Label)| -> Vec<Pixmap> {
+        let mut l = Label::new(t0);
+        set(&mut l);
+        let expanded = Geom::of(PillMode::Expanded);
+        (0..STEPS)
+            .map(|s| {
+                let at = t0
+                    + crate::pill::label::LABEL_FADE
+                        .dur
+                        .mul_f32(s as f32 / (STEPS - 1) as f32);
+                labelled(&expanded, &FLAT, &NO_SLOTS, &l.at(at))
+            })
+            .collect()
+    };
+    write(
+        "pill-label-crossfade.png",
+        STRIP_BG,
+        vec![
+            // Arriving from nothing: one layer, fading in at its settled width.
+            strip(&|l: &mut Label| {
+                l.set_hover(Some(2), t0);
+            }),
+            // Settings → Copy last transcript, the widest change the bar makes.
+            strip(&|l: &mut Label| {
+                l.set_hover(Some(2), t0 - Duration::from_millis(500));
+                l.set_hover(Some(0), t0);
+            }),
+        ],
+    );
+}
+
+/// A held "Copied" while the bar collapses out from under it.
+///
+/// The commonest thing a user does after clicking Copy is move the cursor away,
+/// so this is what the acknowledgement mostly gets seen against. The chip's gap
+/// above the pill comes off the `Geom`'s own height, so it rides the collapse
+/// down as part of the same lerp rather than holding the bar's place over a
+/// nub with bare desktop between them.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_label_over_a_collapsing_pill() {
+    let t0 = Instant::now();
+    let mut label = Label::new(t0);
+    label.flash(COPIED, t0);
+    let motion = Motion::start(Geom::of(PillMode::Expanded), PillMode::Idle, HOVER_OUT, t0);
+    let strip: Vec<Pixmap> = (0..STEPS)
+        .map(|s| {
+            let at = t0 + HOVER_OUT.dur.mul_f32(s as f32 / (STEPS - 1) as f32);
+            labelled(&motion.at(at), &FLAT, &NO_SLOTS, &label.at(at))
+        })
+        .collect();
+    write("pill-label-collapse.png", STRIP_BG, vec![strip]);
 }
 
 /// The fold-out and the collapse: the flankers sliding out from behind Dictate

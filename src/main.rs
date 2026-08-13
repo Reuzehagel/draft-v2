@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use crate::pill::core::{Pill, PillMode};
 use crate::pill::geom::{Hover, Motion};
 use crate::pill::hook::HookEvent;
+use crate::pill::label::Label;
 use crate::pill::monitor::{Displays, Home, HomeMonitor};
 use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
@@ -461,7 +462,17 @@ impl App {
     /// whether it was live at all — so there is nothing to check here.
     fn run_button(&mut self, action: pill::core::Action) {
         match action {
-            pill::core::Action::Copy => self.copy_last_transcription(),
+            // The label is what makes this button visibly do anything. Draft
+            // pastes via clipboard + Ctrl+V, so the transcript being copied is
+            // usually already on the clipboard: without the acknowledgement, a
+            // copy that worked perfectly looks exactly like a click that
+            // didn't land. Only a copy that *did* land says so.
+            pill::core::Action::Copy => {
+                if self.copy_last_transcription() {
+                    self.pill
+                        .flash_label(pill::label::COPIED, std::time::Instant::now());
+                }
+            }
             // The settings window takes focus; the pill still does not. It is a
             // subprocess, so nothing about this window changes.
             pill::core::Action::Settings => self.open_settings(),
@@ -474,13 +485,26 @@ impl App {
     /// Put the most recent transcript back on the clipboard, so a paste that
     /// landed nowhere can be recovered with a manual Ctrl+V. No-op (logged) if
     /// the history is empty or the clipboard can't be opened.
-    fn copy_last_transcription(&mut self) {
+    ///
+    /// Answers whether the text actually reached the clipboard, which is what
+    /// the pill's label acknowledges — the tray item has a menu closing under
+    /// it and says nothing either way.
+    fn copy_last_transcription(&mut self) -> bool {
         match history::last() {
             Some(entry) => match paste::set_clipboard(&entry.text) {
-                Ok(()) => tracing::info!("last transcript copied to clipboard"),
-                Err(e) => tracing::error!(error = %e, "failed to copy last transcript"),
+                Ok(()) => {
+                    tracing::info!("last transcript copied to clipboard");
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to copy last transcript");
+                    false
+                }
             },
-            None => tracing::info!("copy last transcript: history is empty"),
+            None => {
+                tracing::info!("copy last transcript: history is empty");
+                false
+            }
         }
     }
 }
@@ -529,9 +553,11 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                let x = self.pill.offset_in_window(position.x as f32);
-                let hovered = x.and_then(|x| self.pill_core.button_at(x));
-                self.pill.set_cursor(x, hovered, now);
+                let at = self
+                    .pill
+                    .offset_in_window((position.x as f32, position.y as f32));
+                let hovered = at.and_then(|(x, y)| self.pill_core.button_at(x, y));
+                self.pill.set_cursor(at, hovered, now);
             }
             // The collapse itself is the hover poll's call — this only puts the
             // indicator out, so a cursor leaving by the corner (which stays
@@ -542,7 +568,11 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                if let Some(action) = self.pill.cursor_x.and_then(|x| self.pill_core.action_at(x)) {
+                if let Some(action) = self
+                    .pill
+                    .cursor
+                    .and_then(|(x, y)| self.pill_core.action_at(x, y))
+                {
                     self.run_button(action);
                 }
             }
@@ -559,6 +589,10 @@ impl ApplicationHandler for App {
             } else if ev.id == self.tray.menu_ids.settings {
                 self.open_settings();
             } else if ev.id == self.tray.menu_ids.copy_last {
+                // No flash: the pill is a nub (or not there at all) with a menu
+                // closing over it, and an acknowledgement for a press that
+                // happened somewhere else is a status report — which the label
+                // is deliberately not.
                 self.copy_last_transcription();
             }
         }
@@ -687,6 +721,11 @@ impl ApplicationHandler for App {
         // unless the pill is idle, and free for the policies with no per-poll
         // signal to read.
         self.poll_home(now);
+
+        // Has the label's flash run out? The only thing about the pill that
+        // moves with nothing behind it, so it is asked rather than told — and
+        // asked before the frame check, which is what draws the answer.
+        self.pill.tick_label(now);
 
         // Frames are pushed only when there is one to push. A settled nub wants
         // none at all — that is what makes residency free: one
@@ -1061,10 +1100,15 @@ struct PillAdapter {
     /// here because it is a per-frame drawing input and the core is not asked
     /// per frame; [`App::refresh_status`] is what keeps the two in step.
     enabled: [bool; pill::core::BUTTON_COUNT],
+    /// What the label is saying, and the crossfade between it and the last
+    /// thing it said. A third piece of per-frame state beside the [`Motion`]
+    /// and the [`Hover`], for the same reason as the second: it is a surface
+    /// with its own clock, and a flash outlives the hover under it (#46).
+    label: Label,
     /// The cursor's last known offset from the pill's centre, in logical
     /// pixels. `MouseInput` carries no position, so this is what a click is
     /// tested against.
-    cursor_x: Option<f32>,
+    cursor: Option<(f32, f32)>,
 }
 
 /// What to do with the window once the motion taking it off screen has run.
@@ -1093,26 +1137,53 @@ impl PillAdapter {
             ring: None,
             hover: Hover::new(Instant::now()),
             enabled: [true; pill::core::BUTTON_COUNT],
-            cursor_x: None,
+            label: Label::new(Instant::now()),
+            cursor: None,
         }
+    }
+
+    /// Note that something the renderer reads has moved, so the loop draws
+    /// once more.
+    ///
+    /// Every mutator below reports whether it changed anything, and every one
+    /// of them means the same thing by it — a frame is owed. One place to say
+    /// so, rather than the same `if changed` at each.
+    fn owe(&mut self, changed: bool) {
+        self.frame_owed |= changed;
     }
 
     /// Adopt the core's view of which buttons are live.
     fn set_enabled(&mut self, enabled: [bool; pill::core::BUTTON_COUNT]) {
-        if self.enabled != enabled {
-            self.enabled = enabled;
-            self.frame_owed = true;
-        }
+        let changed = self.enabled != enabled;
+        self.enabled = enabled;
+        self.owe(changed);
     }
 
     /// Where the cursor is, as a logical offset from the pill's centre, and
-    /// which button that lights. A cursor wandering inside one slab moves
-    /// nothing, so it costs no frame.
-    fn set_cursor(&mut self, offset: Option<f32>, hovered: Option<usize>, now: Instant) {
-        self.cursor_x = offset;
-        if self.hover.set(hovered, now) {
-            self.frame_owed = true;
-        }
+    /// which button that lights and names. A cursor wandering inside one slab
+    /// moves nothing, so it costs no frame.
+    fn set_cursor(&mut self, offset: Option<(f32, f32)>, hovered: Option<usize>, now: Instant) {
+        self.cursor = offset;
+        // Both, always: they are two surfaces answering the same move, and
+        // short-circuiting would leave the label naming the button the
+        // indicator has just left.
+        let lit = self.hover.set(hovered, now);
+        let named = self.label.set_hover(hovered, now);
+        self.owe(lit || named);
+    }
+
+    /// Say something over the pill for a beat — a landed copy, which the pill
+    /// otherwise has no way to distinguish from a click that did nothing.
+    fn flash_label(&mut self, text: &'static str, now: Instant) {
+        let flashed = self.label.flash(text, now);
+        self.owe(flashed);
+    }
+
+    /// Retire an expired flash. The one thing about the pill that moves with no
+    /// event behind it, so the app loop calls it every pass.
+    fn tick_label(&mut self, now: Instant) {
+        let retired = self.label.tick(now);
+        self.owe(retired);
     }
 
     fn window_id(&self) -> Option<WindowId> {
@@ -1135,10 +1206,14 @@ impl PillAdapter {
     /// **The region is not the same coming and going.** Opening asks the cursor
     /// to be near the *nub* — the window is the envelope, and a 36x10 nub that
     /// sprang open from 60px away would be a pill that expands at anything
-    /// passing along the bottom of the screen. Staying open asks only that the
-    /// cursor be on the window, which is where the buttons now are. The overlap
-    /// between the two is the hysteresis: nothing can sit on a boundary and
-    /// flicker.
+    /// passing along the bottom of the screen. Staying open asks that it be on
+    /// the *bar*, which is where the buttons are. The overlap between the two
+    /// is the hysteresis: nothing can sit on a boundary and flicker.
+    ///
+    /// Neither region is the window rect, and since #46 that matters: the
+    /// envelope grew to 260x80 to hold the label, so "on the window" would now
+    /// hold the bar open from 70px to either side of it and from the label's
+    /// band, which is not a button and does not keep one open.
     ///
     /// What this does not decide is clicks: a layered window hit-tests on
     /// per-pixel alpha, so the corners stay click-through however it answers.
@@ -1146,23 +1221,30 @@ impl PillAdapter {
         let Some(r) = self.rect() else {
             return false;
         };
-        let inside = |r: pill::monitor::Rect| {
-            cursor.0 >= r.left && cursor.0 < r.right && cursor.1 >= r.top && cursor.1 < r.bottom
+        let reach = if expanded {
+            self.reach(r, pill::core::bar_width(), pill::core::BAR_H)
+        } else {
+            self.reach(r, pill::geom::NUB_W, pill::geom::NUB_H)
         };
-        if expanded {
-            return inside(r);
-        }
-        inside(self.nub_reach(r))
+        cursor.0 >= reach.left
+            && cursor.0 < reach.right
+            && cursor.1 >= reach.top
+            && cursor.1 < reach.bottom
     }
 
-    /// The nub, grown by [`HOVER_REACH`] on every side — the region a hover has
-    /// to reach to open the bar. In physical pixels, off the window's own rect,
-    /// so it lands on the nub at any DPI.
-    fn nub_reach(&self, r: pill::monitor::Rect) -> pill::monitor::Rect {
+    /// A `w` x `h` logical shape centred on the pill, grown by [`HOVER_REACH`]
+    /// on every side. In physical pixels, off the window's own rect, so it
+    /// lands on the shape at any DPI.
+    ///
+    /// Centred on the *pill's band* rather than on the window: the pill sits at
+    /// the bottom of the surface, so the window's middle is up in the label's
+    /// band where nothing is drawn.
+    fn reach(&self, r: pill::monitor::Rect, w: f32, h: f32) -> pill::monitor::Rect {
         let scale = self.window.as_ref().map_or(1.0, |pw| pw.scale());
-        let half_w = ((pill::geom::NUB_W / 2.0 + HOVER_REACH) * scale).round() as i32;
-        let half_h = ((pill::geom::NUB_H / 2.0 + HOVER_REACH) * scale).round() as i32;
-        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let half_w = ((w / 2.0 + HOVER_REACH) * scale).round() as i32;
+        let half_h = ((h / 2.0 + HOVER_REACH) * scale).round() as i32;
+        let cx = (r.left + r.right) / 2;
+        let cy = r.top + pill::geom::pill_centre_y(r.height() as f32, scale).round() as i32;
         pill::monitor::Rect {
             left: cx - half_w,
             top: cy - half_h,
@@ -1175,9 +1257,17 @@ impl PillAdapter {
     /// as the logical offset from the pill's centre the button slabs are stated
     /// in. This is the *one* place the scale divides: the slabs are logical,
     /// every pixel Windows reports is not.
-    fn offset_in_window(&self, physical_x: f32) -> Option<f32> {
+    ///
+    /// Both axes, since #46: the surface is taller than the bar, and a cursor
+    /// in the label's band is over the window without being over a button.
+    fn offset_in_window(&self, physical: (f32, f32)) -> Option<(f32, f32)> {
         let (r, pw) = (self.rect()?, self.window.as_ref()?);
-        Some((physical_x - r.width() as f32 / 2.0) / pw.scale())
+        let scale = pw.scale();
+        let cy = pill::geom::pill_centre_y(r.height() as f32, scale);
+        Some((
+            (physical.0 - r.width() as f32 / 2.0) / scale,
+            (physical.1 - cy) / scale,
+        ))
     }
 
     fn set_ring(&mut self, ring: audio::ring::Buffer) {
@@ -1226,6 +1316,7 @@ impl PillAdapter {
         self.frame_owed
             || self.motion.is_running(now)
             || self.hover.is_running(now)
+            || self.label.is_running(now)
             || self.mode_self_animates()
     }
 
@@ -1318,6 +1409,16 @@ impl PillAdapter {
                 // Nothing to hover once the bar is gone, and a hover left
                 // standing would light a button on the next reveal.
                 self.set_cursor(None, None, now);
+                // The *name* goes with the button, but the acknowledgement does
+                // not: a copy is acknowledged for a second whether or not the
+                // cursor stays, and moving away the instant you click is the
+                // commonest thing to do. What does take it is a session — a
+                // "Copied" over a recording pill would be saying nothing about
+                // what the pill is now doing.
+                if mode != PillMode::Idle {
+                    let dismissed = self.label.dismiss(now);
+                    self.owe(dismissed);
+                }
             }
         }
         let tween = pill::geom::transition(self.mode.unwrap_or(PillMode::Hidden), mode);
@@ -1379,6 +1480,10 @@ impl PillAdapter {
             self.ring = None;
             self.handoff_since = None;
             self.frame_owed = false;
+            // Wiped rather than faded: there is nothing left to fade out *on*,
+            // and the next window must not open with the tail of a crossfade
+            // that belonged to one that is gone.
+            self.label.reset(now);
             drop(self.window.take());
         }
     }
@@ -1421,13 +1526,17 @@ impl PillAdapter {
         // Per-button hover, likewise: the Geom carries the bar's *growth*, and
         // which button is lit is state beside it.
         let slots = self.hover.slots(now, |i| self.enabled[i]);
-        if let Err(e) = pill.render(&geom, &bars, &slots) {
+        // And the label, likewise: what it says is a surface of its own with
+        // its own clock, not something a Geom could carry.
+        let label = self.label.at(now);
+        if let Err(e) = pill.render(&geom, &bars, &slots, &label) {
             tracing::error!(error = %e, "pill render failed");
         }
         // One more frame is owed while a transition is still running, so the
         // frame that lands it is drawn even if the loop wakes up past its end.
-        // The hover fade is a second, smaller one with the same need.
-        self.frame_owed = self.motion.is_running(now) || self.hover.is_running(now);
+        // The hover and label fades are two smaller ones with the same need.
+        self.frame_owed =
+            self.motion.is_running(now) || self.hover.is_running(now) || self.label.is_running(now);
         self.flush_pending(now);
     }
 }

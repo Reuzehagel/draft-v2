@@ -23,6 +23,7 @@
 
 use crate::pill::geom::{Geom, Slots};
 use crate::pill::hook::HookEvent;
+use crate::pill::label::Fade;
 use crate::pill::monitor::HomeMonitor;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
@@ -55,6 +56,7 @@ struct Frame {
     geom: Geom,
     bars: Vec<f32>,
     slots: Slots,
+    label: Fade,
 }
 
 pub struct PillWindow {
@@ -217,7 +219,13 @@ impl PillWindow {
     /// This is the only way pixels reach the screen. Modes have no renderers of
     /// their own — a frame mid-morph belongs to no mode, and the `Geom` is what
     /// expresses that.
-    pub fn render(&mut self, geom: &Geom, bar_heights: &[f32], slots: &Slots) -> Result<()> {
+    pub fn render(
+        &mut self,
+        geom: &Geom,
+        bar_heights: &[f32],
+        slots: &Slots,
+        label: &Fade,
+    ) -> Result<()> {
         self.ensure_size()?;
         crate::pill::render::draw(
             &mut self.hires,
@@ -225,11 +233,13 @@ impl PillWindow {
             geom,
             bar_heights,
             slots,
+            label,
         );
         self.last = Some(Frame {
             geom: *geom,
             bars: bar_heights.to_vec(),
             slots: *slots,
+            label: *label,
         });
         self.blit_and_present()
     }
@@ -312,7 +322,7 @@ impl PillWindow {
         let Some(frame) = self.last.take() else {
             return Ok(());
         };
-        let res = self.render(&frame.geom, &frame.bars, &frame.slots);
+        let res = self.render(&frame.geom, &frame.bars, &frame.slots, &frame.label);
         // `render` restores `last` on success; put it back if it didn't get
         // that far, so a failed re-push doesn't cost us the next one.
         if self.last.is_none() {
