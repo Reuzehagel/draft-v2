@@ -10,24 +10,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod activation;
-mod audio;
 mod autostart;
-mod config;
-mod history;
 mod hotkey;
 mod llm;
-mod logging;
 mod paste;
-mod paths;
 mod pill;
-mod postprocess;
-mod secrets;
 mod session;
 mod settings_ui;
 mod single_instance;
-mod transcribe;
 mod tray;
 mod update;
+
+// The shared core lives in the library so `draft-cli` can reach it too. Bound
+// into the crate root under their old names, so `crate::config` and friends
+// still resolve from every adapter module — the extraction moved the code,
+// not the vocabulary.
+use draft::{audio, config, history, logging, postprocess, secrets, transcribe};
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -328,7 +326,7 @@ impl App {
         let outcome_tx = self.outcome_tx.clone();
         let append_space = self.cfg.append_trailing_space;
         let restore_clipboard = self.cfg.restore_clipboard;
-        let pipeline = postprocess::Pipeline::from_config(&self.cfg);
+        let pipeline = postprocess::Pipeline::for_session(&self.cfg);
         let paste_mode = match self.cfg.paste_mode {
             config::PasteMode::Clipboard => paste::PasteMode::Clipboard,
             config::PasteMode::Unicode => paste::PasteMode::Unicode,

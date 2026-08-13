@@ -4,7 +4,7 @@ Windows push-to-talk speech-to-text: hold a global hotkey, speak, release, and t
 
 ## Commands
 
-`cargo test` covers the activation FSM, voice commands, replacements, WAV encoding, the settings window's theme, and the pill's core, motion model and rendering. There is no CI — run `cargo test`, `cargo clippy` and `cargo fmt --check` locally before committing; clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch. Windows-only: `cpal`, `global-hotkey`, and the `windows` crate make this non-portable.
+`cargo test` covers the activation FSM, voice commands, replacements, WAV encoding, decoding (`tests/decode.rs`, against the committed one-second fixtures in `tests/fixtures/`), the settings window's theme, and the pill's core, motion model and rendering. There is no CI — run `cargo test`, `cargo clippy` and `cargo fmt --check` locally before committing; clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch. Windows-only: `cpal`, `global-hotkey`, and the `windows` crate make this non-portable.
 
 To *look* at the pill without launching anything:
 
@@ -16,12 +16,16 @@ writes every mode (over a light and a dark desktop) and every transition (as a f
 
 ## Architecture
 
-Two processes from one binary:
+One library and two binaries. `lib.rs` holds the shared core — `paths`, `config`, `secrets`, `logging`, `history`, `audio`, `postprocess`, `transcribe`, `decode`, `transcription_run` — and nothing in it may reach back to the adapter (no `session`, `pill`, `tray`, `paste`, `hotkey`, `activation`, `settings_ui`, `llm`, `update`, `single_instance`). That closure is what makes a second binary possible; keep it.
 
-- **Main process** (`main.rs`): single-instance gate, tray icon, global hotkeys, winit event loop. It is the *adapter* — it performs the Commands that `session.rs` returns.
-- **Settings subprocess**: the same exe relaunched with `--settings`, running eframe/egui (`settings_ui/`). The main process polls for its exit and reloads `config.toml` afterward — settings never talk to the main process directly.
+- **`draft.exe`** (`main.rs`), a *window* program — no console. Two processes come out of it:
+  - **Main process**: single-instance gate, tray icon, global hotkeys, winit event loop. It is the *adapter* — it performs the Commands that `session.rs` returns.
+  - **Settings subprocess**: the same exe relaunched with `--settings`, running eframe/egui (`settings_ui/`). The main process polls for its exit and reloads `config.toml` afterward — settings never talk to the main process directly.
+- **`draft-cli.exe`** (`cli/main.rs`), a *console* program: `draft-cli transcribe <file>` decodes a media file and prints the transcript. A window program can't print to a terminal or make a shell wait for it, hence the separate artifact — see `docs/adr/0001-console-subcommand-in-a-second-binary.md`.
 
 Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/toggle/double-press-lock) → `session.rs` (pure core: events + `now` in, Commands out) → `audio/` (cpal capture, resample to 16 kHz mono) → worker thread → `transcribe/` → `postprocess/` (replacements, then voice commands) → `paste.rs` (clipboard+Ctrl+V or SendInput unicode). `pill/` is a peer core, not downstream of dictation.
+
+Transcription run (`transcription_run.rs`): file → `decode.rs` (symphonia demux/decode, resampled to 16 kHz mono by the *same* `audio::resample`) → `transcribe::build` → **Replacements only**. No voice commands (a recording's speaker isn't addressing Draft) and no history (nothing is pasted, so there's nothing to recover). Both are absences by construction, not flags.
 
 Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat model as an instruction and pastes the answer; it skips the postprocess pipeline.
 

@@ -5,9 +5,20 @@ edition = "2021"
 description = "Push-to-talk speech-to-text for Windows"
 license = "MIT"
 
+[lib]
+name = "draft"
+path = "src/lib.rs"
+
 [[bin]]
 name = "draft"
 path = "src/main.rs"
+
+# Console-subsystem sibling of `draft.exe`. See
+# docs/adr/0001-console-subcommand-in-a-second-binary.md — a window program
+# cannot print to a terminal or make a shell wait for it.
+[[bin]]
+name = "draft-cli"
+path = "src/cli/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -36,6 +47,18 @@ eframe = { version = "0.29", default-features = false, features = ["default_font
 egui = "0.29"
 keyring = { version = "3", features = ["windows-native"] }
 transcribe-rs = { version = "0.3", default-features = false, features = ["onnx"] }
+clap = { version = "4", features = ["derive"] }
+# `aac` and `isomp4` are not default features and both are mandatory: m4a is
+# AAC in an MP4 container, and the motivating case is "transcribe this video".
+symphonia = { version = "0.6", default-features = false, features = [
+    "mp3",
+    "isomp4",
+    "aac",
+    "alac",
+    "wav",
+    "pcm",
+    "flac",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
