@@ -83,9 +83,8 @@ pub enum Presence {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Origin {
     Hotkey,
-    /// The pill's own Dictate button. Nothing can produce one until the button
-    /// bar lands (#29); the mode it derives is asserted in the tests below.
-    #[allow(dead_code)]
+    /// The pill's own Dictate button. A mouse-started session has no "release
+    /// the key" gesture, so it carries its own cancel and confirm (#47).
     Click,
 }
 
@@ -97,11 +96,17 @@ pub enum Action {
     /// Put the last transcript back on the clipboard — the recovery path for a
     /// paste that landed in the wrong window, not "get the text".
     Copy,
-    /// Start a click-started session. Wired up in a later ticket (#30); it
-    /// renders and hovers here.
+    /// Start a click-started session, routed through the same `Session`
+    /// lifecycle a chord takes — same capture, same transcription, same paste.
     Dictate,
     /// Launch the settings subprocess, exactly as the tray item does.
     Settings,
+    /// Throw the click-started session's audio away: no transcription, no
+    /// paste, no history entry and no flash. A flash reports an outcome, and
+    /// cancelling isn't one.
+    Cancel,
+    /// Finish the click-started session. Identical to releasing the hotkey.
+    Confirm,
 }
 
 /// Which glyph a button wears. Lucide, resolved to a path by
@@ -112,6 +117,8 @@ pub enum Icon {
     Copy,
     Mic,
     Sliders,
+    X,
+    Check,
 }
 
 /// One button of the bar: what it does, what it wears, what it is called, and
@@ -251,6 +258,119 @@ fn slab_at(x: f32, y: f32) -> Option<usize> {
     })
 }
 
+// --- The click-started pill ---------------------------------------------
+//
+// A mouse-started session has no "release the key" gesture, so it carries the
+// two buttons that gesture stood for. They are **not the button bar**: the bar
+// is three islands over bare desktop, and this is one body with two discs
+// inside it — the pill a session is running in, not a menu.
+//
+// Everything below is a number the ticket states, and the layout is asserted
+// against the sum it was stated as:
+//
+//     7 + 20 + 12 + 34 bars + 12 + 20 + 7 = 112
+
+/// The click-started pill's body: **always one**, never the bar's three
+/// islands.
+pub const CLICK_W: f32 = 112.0;
+pub const CLICK_H: f32 = 32.0;
+
+/// Clear space between the body's edge and the outer edge of a button.
+pub const CHECK_PAD: f32 = 7.0;
+
+/// Cancel and confirm are 20px circles — **smaller than any hover-bar button**,
+/// because these sit *inside* a body rather than being one.
+pub const CHECK_BUTTON: f32 = 20.0;
+
+/// Clear space between a button and the bar row it flanks.
+pub const CHECK_GAP: f32 = 12.0;
+
+/// What one button claims of the body's half-width: itself, its padding, and
+/// the clear space between it and the waveform.
+///
+/// The one number the renderer needs to place both the discs and the row, so
+/// it is derived here rather than reconstructed there — the layout changes in
+/// one file or it drifts between two.
+pub const CHECK_CLAIM: f32 = CHECK_PAD + CHECK_BUTTON + CHECK_GAP;
+
+/// The glyph box cancel and confirm draw in — the button itself, unlike the
+/// bar's, whose [`GLYPH_BOX`] is smaller than every island it sits in.
+///
+/// These are 20px discs inside a 32px body rather than islands *being* the
+/// body, so there is no island padding to hold a mark clear of: the disc's own
+/// edge is what does that, and a box smaller than the disc would leave a 20px
+/// circle with a 14px mark rattling around in it.
+pub const CHECK_GLYPH_BOX: f32 = CHECK_BUTTON;
+
+/// Button `i`'s centre inside a body `body_w` wide, as an offset from the
+/// pill's centre. Negative is left, which is cancel.
+///
+/// Takes the width rather than assuming [`CLICK_W`] because the renderer asks
+/// it about a body mid-morph: measured inward from whatever edge the body has
+/// this frame, the pair sit under the bar's centre island at the start of the
+/// fold and at their settled places by the end. One derivation, two callers.
+pub fn check_centre(body_w: f32, i: usize) -> f32 {
+    let x = (body_w / 2.0 - CHECK_PAD - CHECK_BUTTON / 2.0).max(0.0);
+    if i == 0 {
+        -x
+    } else {
+        x
+    }
+}
+
+/// The two buttons, in the order they are laid out. Cancel on the left,
+/// confirm on the right — the destructive one furthest from the confirm the
+/// user is reaching for.
+///
+/// A second list rather than a mode on the first: these are a different size,
+/// a different shape and a different job, and folding them into [`BUTTONS`]
+/// would put "which of the two lists am I in" inside every derivation the bar
+/// makes off it.
+pub const CHECK_BUTTONS: [Button; 2] = [
+    Button {
+        action: Action::Cancel,
+        icon: Icon::X,
+        name: "Cancel",
+        w: CHECK_BUTTON,
+    },
+    Button {
+        action: Action::Confirm,
+        icon: Icon::Check,
+        name: "Confirm",
+        w: CHECK_BUTTON,
+    },
+];
+
+/// Button `i`'s hit region, on the bar's own doctrine: full body height,
+/// spanning the button plus half the gap on its *inner* side, so the desktop
+/// between a button and the waveform belongs to the button rather than being a
+/// dead zone. The outer ends stop at the button — past it is [`CHECK_PAD`],
+/// which is inert.
+///
+/// Always at the settled width: a hit region is only ever asked about a pill
+/// that has arrived, since the check is not clickable mid-morph.
+pub fn check_slab(i: usize) -> (f32, f32) {
+    let c = check_centre(CLICK_W, i);
+    let half = CHECK_BUTTON / 2.0;
+    if i == 0 {
+        (c - half, c + half + CHECK_GAP / 2.0)
+    } else {
+        (c - half - CHECK_GAP / 2.0, c + half)
+    }
+}
+
+/// Which of the two `(x, y)` — an offset from the pill's centre, in logical
+/// pixels — is over.
+fn check_slab_at(x: f32, y: f32) -> Option<usize> {
+    if y.abs() > CLICK_H / 2.0 {
+        return None;
+    }
+    (0..CHECK_BUTTONS.len()).find(|&i| {
+        let (lo, hi) = check_slab(i);
+        x >= lo && x < hi
+    })
+}
+
 /// What a session is currently asking the pill to show. Outranks [`Presence`].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Activity {
@@ -292,16 +412,37 @@ pub enum PillMode {
 }
 
 impl PillMode {
-    /// Whether this mode puts the button bar on screen — which is also the
+    /// Whether this mode puts anything clickable on screen — which is also the
     /// whole of the click-through rule: `WS_EX_TRANSPARENT` is off exactly
-    /// while this is true. A hotkey session shows no buttons, so a click passes
-    /// straight through it to the app being dictated into.
+    /// while this is true.
     ///
-    /// One predicate, read by the core (as [`Pill::showing_buttons`]) and by
-    /// the adapter (which flips the style): a second mode that shows buttons —
-    /// `Recording { origin: Click }`, in #30 — is then one edit, here.
+    /// Two modes qualify, and they are the two the origin distinction exists
+    /// for: the hovered bar, and a session the user started with the mouse. A
+    /// **hotkey** session shows nothing to press, so a click passes straight
+    /// through it to the app being dictated into — the bare recording pill is
+    /// not a stop target and is not clickable at all.
     pub fn shows_buttons(self) -> bool {
+        self.shows_bar() || self.shows_check()
+    }
+
+    /// Whether this mode puts the three-island [`BUTTONS`] bar on screen.
+    /// Narrower than [`Self::shows_buttons`]: the click-started pill is
+    /// clickable without being the bar, and everything derived from the bar's
+    /// list — slabs, hover, the label's names — has to follow this one.
+    pub fn shows_bar(self) -> bool {
         self == PillMode::Expanded
+    }
+
+    /// Whether this mode carries cancel and confirm. **Recording only**: they
+    /// do not survive into Processing, and Processing and Done render
+    /// identically whatever started the session.
+    pub fn shows_check(self) -> bool {
+        matches!(
+            self,
+            PillMode::Recording {
+                origin: Origin::Click
+            }
+        )
     }
 }
 
@@ -386,9 +527,15 @@ impl Pill {
     }
 
     /// Whether the pill is showing its button bar — see
-    /// [`PillMode::shows_buttons`], which is the predicate.
-    pub fn showing_buttons(&self) -> bool {
-        self.derive_mode().shows_buttons()
+    /// [`PillMode::shows_bar`], which is the predicate.
+    ///
+    /// The *bar*, deliberately, not everything clickable. The adapter asks
+    /// this to size the region that keeps the pill expanded, and that question
+    /// is only ever about the bar: a click-started session is a mouse target
+    /// without being one, and asking for the bar's reach around it would hold
+    /// a claim open that the session is about to hand back.
+    pub fn showing_bar(&self) -> bool {
+        self.derive_mode().shows_bar()
     }
 
     /// Whether button `i` is live. Only Copy is ever disabled, and only with an
@@ -400,24 +547,39 @@ impl Pill {
         }
     }
 
-    /// Which button the cursor is over, `(x, y)` being its offset from the
-    /// pill's centre in logical pixels.
+    /// Which *bar* button the cursor is over, `(x, y)` being its offset from
+    /// the pill's centre in logical pixels.
     ///
     /// `None` for the end padding, for the label's band above the bar, for a
     /// disabled button — whose slab is inert, not merely unclickable — and for
-    /// a pill that is not showing buttons at all, which is what keeps a stray
+    /// a pill that is not showing the bar at all, which is what keeps a stray
     /// `CursorMoved` from lighting anything mid-dictation.
+    ///
+    /// Deliberately the *bar's* index and nothing else: it is what the hover
+    /// indicator and the label are indexed by, and a click-started session's
+    /// two buttons are a different list. What can be *pressed* is
+    /// [`Self::action_at`], which is the wider question.
     pub fn button_at(&self, x: f32, y: f32) -> Option<usize> {
-        if !self.showing_buttons() {
+        if !self.showing_bar() {
             return None;
         }
         slab_at(x, y).filter(|&i| self.enabled(i))
     }
 
-    /// What clicking at `(x, y)` does. Exactly [`Self::button_at`]'s answer,
-    /// read as an action — the same slab decides both, so nothing can light up
-    /// under the cursor and then do nothing when pressed.
+    /// What clicking at `(x, y)` does — the one question the adapter asks, so
+    /// that "which set of buttons is up" is decided here rather than there.
+    ///
+    /// Over the bar it is exactly [`Self::button_at`]'s answer read as an
+    /// action, so nothing can light up under the cursor and then do nothing
+    /// when pressed. Over a click-started session it is cancel or confirm, and
+    /// **only while it is recording**: a click that arrives after the handoff
+    /// has begun finds no button, which is what makes a late cancel a no-op
+    /// rather than a race.
     pub fn action_at(&self, x: f32, y: f32) -> Option<Action> {
+        let mode = self.derive_mode();
+        if mode.shows_check() {
+            return check_slab_at(x, y).map(|i| CHECK_BUTTONS[i].action);
+        }
         self.button_at(x, y).map(|i| BUTTONS[i].action)
     }
 
@@ -1119,14 +1281,14 @@ mod tests {
     #[test]
     fn the_buttons_are_inert_while_a_session_runs() {
         let mut p = expanded();
-        assert!(p.showing_buttons());
+        assert!(p.showing_bar());
         p.on_session(
             SessionActivity::Recording {
                 origin: Origin::Hotkey,
             },
             t(0),
         );
-        assert!(!p.showing_buttons());
+        assert!(!p.showing_bar());
         for x in [-43.0, 0.0, 43.0] {
             assert_eq!(p.button_at(x, 0.0), None, "at {x}");
             assert_eq!(p.action_at(x, 0.0), None, "at {x}");
@@ -1150,5 +1312,130 @@ mod tests {
             .contains(&Command::SetMode(PillMode::Recording {
                 origin: Origin::Click
             })));
+    }
+
+    /// A pill recording something the user started with the mouse.
+    fn click_recording() -> Pill {
+        let mut p = expanded();
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Click,
+            },
+            t(0),
+        );
+        p
+    }
+
+    /// The layout, as the ticket writes it: `7 + 20 + 12 + 34 + 12 + 20 + 7`.
+    /// Stated as that sum rather than as the numbers it produces, because the
+    /// sum is the thing that has to keep adding up.
+    #[test]
+    fn the_click_started_pill_adds_up_to_its_body() {
+        // The waveform gets whatever the two buttons have not claimed.
+        let row = CLICK_W - 2.0 * CHECK_CLAIM;
+        assert_eq!(row, 34.0);
+        assert_eq!(
+            CHECK_PAD + CHECK_BUTTON + CHECK_GAP + row + CHECK_GAP + CHECK_BUTTON + CHECK_PAD,
+            CLICK_W
+        );
+        assert_eq!((CLICK_W, CLICK_H), (112.0, 32.0));
+        // Circles, and smaller than any button the hover bar carries.
+        for b in &CHECK_BUTTONS {
+            assert_eq!((b.w, b.height(), b.radius()), (20.0, 20.0, 10.0));
+            assert!(BUTTONS.iter().all(|bar| bar.w > b.w), "{:?}", b.action);
+        }
+        assert_eq!(
+            (check_centre(CLICK_W, 0), check_centre(CLICK_W, 1)),
+            (-39.0, 39.0)
+        );
+        // The claim each button makes is the pad, the button and the gap — the
+        // one number the renderer places both the discs and the row from.
+        assert_eq!(CHECK_CLAIM, 39.0);
+    }
+
+    /// Origin decides presentation: the same session, started the other way,
+    /// shows the two buttons and is a mouse target.
+    #[test]
+    fn origin_decides_whether_a_recording_pill_is_clickable() {
+        let hotkey = PillMode::Recording {
+            origin: Origin::Hotkey,
+        };
+        let click = PillMode::Recording {
+            origin: Origin::Click,
+        };
+        // A hotkey session is bare: no buttons at all, so `WS_EX_TRANSPARENT`
+        // stays on and clicks pass through to the app being dictated into.
+        assert!(!hotkey.shows_buttons());
+        assert!(!hotkey.shows_bar() && !hotkey.shows_check());
+        // A click-started one shows its check — and is still not the bar, which
+        // is what keeps hover, the label and the slabs off it.
+        assert!(click.shows_buttons());
+        assert!(click.shows_check() && !click.shows_bar());
+        // And the bar is the bar: clickable, but never a check.
+        assert!(PillMode::Expanded.shows_bar() && !PillMode::Expanded.shows_check());
+    }
+
+    /// Cancel and confirm, at their centres and across the gap that separates
+    /// them from the waveform — which belongs to the button, as the bar's gaps
+    /// do. The pad past each button is inert.
+    #[test]
+    fn the_check_is_hit_across_its_button_and_its_inner_gap() {
+        let p = click_recording();
+        assert_eq!(p.action_at(-39.0, 0.0), Some(Action::Cancel));
+        assert_eq!(p.action_at(39.0, 0.0), Some(Action::Confirm));
+        // Inward, to the middle of the gap.
+        assert_eq!(p.action_at(-24.0, 0.0), Some(Action::Cancel));
+        assert_eq!(p.action_at(24.0, 0.0), Some(Action::Confirm));
+        // The waveform between them is not a button.
+        for x in [-22.0, 0.0, 22.0] {
+            assert_eq!(p.action_at(x, 0.0), None, "at {x}");
+        }
+        // Nor is the pad outside them, nor the label's band above.
+        for (x, y) in [(-52.0, 0.0), (52.0, 0.0), (-39.0, -20.0), (39.0, 24.0)] {
+            assert_eq!(p.action_at(x, y), None, "at ({x}, {y})");
+        }
+    }
+
+    /// The bar's own machinery must not follow the pill into a session: hover
+    /// and the label are indexed by the bar's list, and a click-started pill is
+    /// not the bar however clickable it is.
+    #[test]
+    fn a_click_started_session_lights_no_bar_button() {
+        let p = click_recording();
+        assert!(p.action_at(39.0, 0.0).is_some(), "it is a mouse target");
+        for x in [-43.0, -39.0, 0.0, 39.0, 43.0] {
+            assert_eq!(p.button_at(x, 0.0), None, "at {x}");
+        }
+    }
+
+    /// Cancel is Recording-only. A click that arrives after the handoff has
+    /// begun — the button was under the cursor a frame ago — finds nothing,
+    /// rather than discarding a capture that is already at the worker.
+    #[test]
+    fn the_check_does_not_survive_the_handoff() {
+        let mut p = click_recording();
+        assert_eq!(p.action_at(-39.0, 0.0), Some(Action::Cancel));
+        p.on_session(SessionActivity::Processing { since: t(100) }, t(100));
+        assert!(
+            p.action_at(39.0, 0.0).is_none(),
+            "Processing is not a mouse target"
+        );
+        for x in [-39.0, 0.0, 39.0] {
+            assert_eq!(p.action_at(x, 0.0), None, "at {x}");
+        }
+        // Nor does the flash that follows it.
+        p.on_session(SessionActivity::Finished { ok: true }, t(200));
+        assert_eq!(p.action_at(39.0, 0.0), None);
+    }
+
+    /// And once it is over, the bar the session came out of is back — with its
+    /// own buttons, at their own places.
+    #[test]
+    fn a_cancelled_session_hands_the_bar_back() {
+        let mut p = click_recording();
+        // Cancel reports no session at all: no flash to sit through.
+        p.on_session(SessionActivity::None, t(500));
+        assert_eq!(p.action_at(0.0, 0.0), Some(Action::Dictate));
+        assert_eq!(p.action_at(-39.0, 0.0), Some(Action::Copy));
     }
 }

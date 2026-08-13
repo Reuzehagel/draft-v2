@@ -24,8 +24,8 @@
 
 use crate::pill::core::{Origin, PillMode};
 use crate::pill::geom::{
-    breathe, Geom, Motion, Slot, Slots, Tween, ENVELOPE_H, ENVELOPE_W, HOVER_IN, HOVER_OUT, REVEAL,
-    TO_IDLE, TO_RECORDING,
+    breathe, Geom, Motion, Slot, Slots, Tween, CANCELLED, ENVELOPE_H, ENVELOPE_W, HOVER_IN,
+    HOVER_OUT, MORPH, REVEAL, TO_IDLE, TO_RECORDING,
 };
 use crate::pill::label::{Fade, Label, COPIED};
 use crate::pill::render::draw;
@@ -81,6 +81,14 @@ fn out_dir() -> PathBuf {
 fn recording() -> PillMode {
     PillMode::Recording {
         origin: Origin::Hotkey,
+    }
+}
+
+/// The same session, started with the mouse: one body carrying cancel and
+/// confirm, because a click has no "release the key" to finish it with.
+fn click_recording() -> PillMode {
+    PillMode::Recording {
+        origin: Origin::Click,
     }
 }
 
@@ -204,15 +212,21 @@ fn filmstrip(from: PillMode, to: PillMode, tween: Tween, bars: &[f32]) -> Vec<Pi
 
 /// Every mode, over a light desktop and a black one.
 ///
-/// Rows, top to bottom: Idle (the nub), Recording, Processing, Done delivered,
-/// Done failed. Columns: light desktop, black desktop.
+/// Rows, top to bottom: Idle (the nub), Recording, Recording started with the
+/// mouse, Processing, Done delivered, Done failed. Columns: light desktop,
+/// black desktop.
+///
+/// Rows two and three are the pair to look at together: the same session,
+/// presented two ways, and the confirm disc is the one piece of chrome in the
+/// pill that changes *meaning* rather than looks.
 #[test]
 #[ignore = "writes PNGs for eyeballing; run with --ignored"]
 fn preview_modes() {
     let now = Instant::now();
-    let modes: [(PillMode, &[f32]); 5] = [
+    let modes: [(PillMode, &[f32]); 6] = [
         (PillMode::Idle, &FLAT),
         (recording(), &LIVE),
+        (click_recording(), &LIVE),
         (PillMode::Processing { since: now }, &FLAT),
         (
             PillMode::Done {
@@ -480,6 +494,34 @@ fn preview_expansion() {
         vec![
             filmstrip(PillMode::Idle, PillMode::Expanded, HOVER_IN, &FLAT),
             filmstrip(PillMode::Expanded, PillMode::Idle, HOVER_OUT, &FLAT),
+        ],
+    );
+}
+
+/// The click-started session's two edges — and the fact that it has only two.
+///
+/// Row one: the bar handing over, with the three glyphs going out over exactly
+/// the 170 ms cancel and confirm come in. Row two: the handoff, which takes
+/// the check with it, so Processing looks the same however the session began.
+/// Row three: a cancel, which goes **straight back to the nub** — there is no
+/// reverse edge to the bar, so the handover is forward-only by construction.
+#[test]
+#[ignore = "writes PNGs for eyeballing; run with --ignored"]
+fn preview_click_session() {
+    write(
+        "pill-click-session.png",
+        STRIP_BG,
+        vec![
+            filmstrip(PillMode::Expanded, click_recording(), MORPH, &LIVE),
+            filmstrip(
+                click_recording(),
+                PillMode::Processing {
+                    since: Instant::now(),
+                },
+                crate::pill::geom::HANDOFF,
+                &LIVE,
+            ),
+            filmstrip(click_recording(), PillMode::Idle, CANCELLED, &LIVE),
         ],
     );
 }
