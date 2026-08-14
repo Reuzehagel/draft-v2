@@ -338,9 +338,14 @@ impl App {
 
     /// Perform the Pill core's commands. Nothing here decides anything: the
     /// core says create/show/hide/destroy and which mode, the adapter obeys.
+    ///
+    /// `Create` is the one that can fail, so it is the one that reports back —
+    /// exactly as `StartCapture` does in [`Self::run_commands`]. The core
+    /// answers with the mode and the show it was holding, or with nothing.
     fn run_pill_commands(&mut self, cmds: Vec<pill::core::Command>, el: &ActiveEventLoop) {
         let now = Instant::now();
-        for cmd in cmds {
+        let mut queue: VecDeque<pill::core::Command> = cmds.into_iter().collect();
+        while let Some(cmd) = queue.pop_front() {
             match cmd {
                 // Derived immediately before the window exists, so the pill
                 // lands where the policy says even when nothing has been
@@ -363,7 +368,8 @@ impl App {
                     if !self.pill.has_window() {
                         self.attention.at_a_new_window();
                     }
-                    self.pill.create(el);
+                    let created = self.pill.create(el);
+                    queue.extend(self.pill_core.window_created(created));
                 }
                 pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
                 pill::core::Command::Show => self.pill.show(now),
@@ -1651,26 +1657,31 @@ impl PillAdapter {
         self.pending = None;
     }
 
-    /// Build the window, off screen. A failure leaves us without one; every
-    /// later command is a no-op until the core asks for another.
-    fn create(&mut self, el: &ActiveEventLoop) {
+    /// Build the window, off screen. Answers whether there is one afterwards —
+    /// the core is told, and corrects itself, rather than going on issuing
+    /// commands to a window that was never built (#53).
+    fn create(&mut self, el: &ActiveEventLoop) -> bool {
         // A window still here means a `Destroy` is deferred behind a conceal.
         // The core has now asked for a window and there is one — reuse it
         // rather than tearing a layered window down to build the same thing
         // back a frame later.
         if self.window.is_some() {
             self.supersede_teardown();
-            return;
+            return true;
         }
         let Some(home) = self.home else {
             tracing::error!("no home monitor to put the pill on");
-            return;
+            return false;
         };
         match pill::window::PillWindow::create(el, self.hook_tx.clone(), home) {
-            Ok(pw) => self.window = Some(pw),
+            Ok(pw) => {
+                self.window = Some(pw);
+                true
+            }
             Err(e) => {
                 tracing::error!(error = %e, "failed to create pill window");
                 self.window = None;
+                false
             }
         }
     }
