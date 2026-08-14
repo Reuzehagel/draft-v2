@@ -356,8 +356,15 @@ impl App {
                 // snapshot is kept current by the pill window's own hook, and
                 // between sessions there is no window and therefore no hook. A
                 // monitor plugged in since the last dictation would otherwise
-                // be invisible. `Create` happens once per session at most,
-                // beside opening a microphone — this is not the expensive part.
+                // be invisible. A `Create` arrives once per session, beside
+                // opening a microphone — this is not the expensive part.
+                //
+                // Since #54 a create that fails also arrives on the retry's
+                // own cadence, and the enumeration comes with it deliberately:
+                // "no monitor to put a pill on" is one of the reasons a create
+                // fails, and a retry off the cached desk would be a retry that
+                // cannot see the reason clear. Once a second at its fastest,
+                // decaying to once every thirty.
                 pill::core::Command::Create => {
                     self.rederive_home();
                     // A window that does not exist yet has no hook, so the two
@@ -369,7 +376,7 @@ impl App {
                         self.attention.at_a_new_window();
                     }
                     let created = self.pill.create(el);
-                    queue.extend(self.pill_core.window_created(created));
+                    queue.extend(self.pill_core.window_created(created, now));
                 }
                 pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
                 pill::core::Command::Show => self.pill.show(now),
@@ -912,6 +919,9 @@ impl ApplicationHandler<Wake> for App {
             reachable: self.pill.is_active(),
             near: self.near,
             suppressed: self.cfg.pill.resident && self.fullscreen.suppressed(),
+            // A window that failed to build: the loop has to come back for the
+            // core to ask again, and nothing else here would bring it back.
+            retrying: self.pill_core.retrying(),
         });
         el.set_control_flow(match rung.period() {
             Some(period) => ControlFlow::WaitUntil(now + period),
