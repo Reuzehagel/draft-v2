@@ -10,9 +10,39 @@
 //   `allocate_ui_with_layout` with a pinned size) or it balloons the parent.
 // - Every control is CONTROL_W wide and right-aligned, so a pane reads as
 //   two clean columns.
+// - A galley from `layout_no_wrap` is free to be wider than the rect it is
+//   painted into, so text whose length isn't ours to control (device names)
+//   is laid out with `elided_galley` against the width actually free for it.
+//   The dropdown popup keeps the button's CONTROL_W at every window size;
+//   it is never widened to fit content.
 
 use super::theme::*;
+use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2};
+
+/// Lay text out on one line, elided with a trailing `…` when it doesn't fit
+/// `max_width`. The galley never measures wider than `max_width`, so a caller
+/// painting it into a rect of that width paints nothing outside it — which a
+/// `layout_no_wrap` galley is free to do. `galley.elided` says whether a tail
+/// was lost; callers use it to decide whether the full text is worth a tooltip.
+fn elided_galley(
+    ctx: &egui::Context,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = TextWrapping::truncate_at_width(max_width.max(0.0));
+    ctx.fonts(|f| f.layout_job(job))
+}
 
 /// A flush group of rows constrained to a readable column width.
 pub(super) fn group<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -93,8 +123,31 @@ pub(super) fn combo<T: PartialEq + Clone>(
     r.response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
+/// Left inset of an option row's label.
+const COMBO_ITEM_INSET: f32 = 10.0;
+/// Where the checkmark is centred, measured in from the row's right edge.
+const COMBO_ITEM_CHECK_INSET: f32 = 16.0;
+/// How far left of its centre the checkmark reaches.
+const COMBO_ITEM_CHECK_REACH: f32 = 4.0;
+/// Trailing space an option row keeps clear for the checkmark: out to the
+/// check's leading edge plus a gap. Reserved on every row, selected or not, so
+/// a label sits at the same width wherever the selection is and can never run
+/// under the check.
+const COMBO_ITEM_CHECK_W: f32 = COMBO_ITEM_CHECK_INSET + COMBO_ITEM_CHECK_REACH + 8.0;
+
+/// The width a `row_w`-wide option row leaves for its label.
+fn combo_item_text_w(row_w: f32) -> f32 {
+    row_w - COMBO_ITEM_INSET - COMBO_ITEM_CHECK_W
+}
+
 /// One option row in a dropdown: hover fill + a trailing checkmark when it's
 /// the current value.
+///
+/// Layout invariant: the popup is CONTROL_W wide whatever the labels are, so a
+/// label that doesn't fit is elided — device names arrive from Windows at any
+/// length and used to draw straight past the popup edge. An elided row carries
+/// the full label as a hover tooltip; a row that fits carries none, so the
+/// tooltip itself is the signal that there is more text.
 pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
@@ -103,19 +156,27 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
         ui.painter()
             .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
     }
-    let galley =
-        ui.painter()
-            .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.0), FG);
-    let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
+    let text_w = combo_item_text_w(rect.width());
+    let galley = elided_galley(ui.ctx(), text, egui::FontId::proportional(13.0), FG, text_w);
+    let elided = galley.elided;
+    let pos = egui::pos2(
+        rect.left() + COMBO_ITEM_INSET,
+        rect.center().y - galley.size().y / 2.0,
+    );
     ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+    let resp = if elided {
+        resp.on_hover_text(text)
+    } else {
+        resp
+    };
 
     if selected {
         // Hand-drawn check so it doesn't depend on glyph coverage.
         let cy = rect.center().y;
-        let cx = rect.right() - 16.0;
+        let cx = rect.right() - COMBO_ITEM_CHECK_INSET;
         ui.painter().add(egui::Shape::line(
             vec![
-                egui::pos2(cx - 4.0, cy + 0.5),
+                egui::pos2(cx - COMBO_ITEM_CHECK_REACH, cy + 0.5),
                 egui::pos2(cx - 1.0, cy + 3.5),
                 egui::pos2(cx + 5.0, cy - 4.0),
             ],
@@ -559,4 +620,99 @@ pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut e
             body(ui);
         });
     scrim_clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Row widths an option row is actually allocated. `combo_item` measures
+    /// against `ui.available_width()` *inside* the popup, which is CONTROL_W
+    /// less the popup frame's margins — so the tests span from CONTROL_W down
+    /// to a comfortably narrower row rather than assuming the ideal one.
+    const ROW_WIDTHS: [f32; 3] = [CONTROL_W, CONTROL_W - 8.0, CONTROL_W - 24.0];
+
+    /// A context with fonts loaded. `RawInput::default()` leaves
+    /// `max_texture_side` unset, and a zero-sized atlas lays every glyph out at
+    /// zero width — every measurement then "fits" and the test proves nothing.
+    fn font_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                max_texture_side: Some(2048),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        ctx
+    }
+
+    /// A Windows device name is longer than any popup we're willing to draw,
+    /// so it is elided — and the galley measures within the width it was given
+    /// rather than running past the popup edge the way `layout_no_wrap` did.
+    #[test]
+    fn a_long_option_label_is_elided_within_its_row() {
+        let ctx = font_ctx();
+        let long = "Microfoonmatrix (Intel® Smart Sound Technologie voor digitale microfoons)";
+        for row_w in ROW_WIDTHS {
+            let max = combo_item_text_w(row_w);
+            let g = elided_galley(&ctx, long, egui::FontId::proportional(13.0), FG, max);
+            assert!(g.elided, "a 72-char device name must not fit {max}px");
+            assert!(
+                g.size().x <= max,
+                "galley {} wider than the {max}px it was given",
+                g.size().x
+            );
+            let last = g.rows[0].glyphs.last().expect("a laid-out row");
+            assert_eq!(last.chr, '…', "elided text ends in an ellipsis");
+        }
+    }
+
+    /// …and a label that fits is untouched: no ellipsis, and `elided` is false
+    /// so the caller shows no tooltip.
+    #[test]
+    fn a_short_option_label_is_left_alone() {
+        let ctx = font_ctx();
+        for row_w in ROW_WIDTHS {
+            for label in ["Hold", "Toggle", "System default"] {
+                let g = elided_galley(
+                    &ctx,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    FG,
+                    combo_item_text_w(row_w),
+                );
+                assert!(!g.elided, "{label:?} fits a {row_w}px row and stays whole");
+                assert_eq!(g.text(), label);
+                assert!(g.rows[0].glyphs.iter().all(|gl| gl.chr != '…'));
+            }
+        }
+    }
+
+    /// A label long enough to reach the check is cut short of it — the row
+    /// reserves the check column whether or not it is the selected row, so
+    /// nothing shifts as the selection moves.
+    #[test]
+    fn a_label_stops_short_of_the_check_column() {
+        let ctx = font_ctx();
+        for row_w in ROW_WIDTHS {
+            let g = elided_galley(
+                &ctx,
+                "Microfoonmatrix (Intel® Smart Sound Technologie)",
+                egui::FontId::proportional(13.0),
+                FG,
+                combo_item_text_w(row_w),
+            );
+            // The label starts at COMBO_ITEM_INSET from the row's left edge;
+            // the check's leading edge sits COMBO_ITEM_CHECK_INSET +
+            // COMBO_ITEM_CHECK_REACH in from its right — the same arithmetic
+            // `combo_item` paints with.
+            let label_right = COMBO_ITEM_INSET + g.size().x;
+            let check_left = row_w - COMBO_ITEM_CHECK_INSET - COMBO_ITEM_CHECK_REACH;
+            assert!(
+                label_right <= check_left,
+                "in a {row_w}px row the label ends at {label_right}, check starts at {check_left}"
+            );
+        }
+    }
 }

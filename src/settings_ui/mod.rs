@@ -6,8 +6,8 @@
 // it changed.
 //
 // Layout is a two-pane "app settings" shell: a left rail navigates between
-// sections (Recording / Transcription / Output / System) and the right pane
-// shows that section's rows as flush groups separated by hairline rules.
+// panes (`Tab::ALL` is the rail order) and the right pane shows that pane's
+// rows as flush groups separated by hairline rules.
 //
 // The module splits along what-changes-together lines:
 // - `theme`   — every colour, metric, and the egui style install.
