@@ -12,7 +12,8 @@
 //              per-poll signals in, a [`HomeMonitor`] out when it moved. It owns
 //              the latch and the cursor dwell, which is what makes both
 //              assertable without a desktop to drag a mouse across.
-//   `win`    — the Win32 half: enumerate the monitors, and read the two signals.
+//   `win`    — the Win32 half: enumerate the monitors, ask the taskbar what
+//              `rcWork` won't tell us about it, and read the two signals.
 //
 // The rules the pure half encodes, from #22:
 //
@@ -73,6 +74,12 @@ pub struct MonitorInfo {
     pub work: Rect,
     /// Effective DPI; 96 is 100%.
     pub dpi: u32,
+    /// The **autohide reserve**, in physical pixels: how much of the bottom of
+    /// `work` an auto-hiding taskbar is going to cover when it slides out.
+    ///
+    /// Zero for a pinned taskbar, which is already out of `rcWork` — that case
+    /// is not this field's business and must not move by a pixel (#72).
+    pub autohide_reserve: i32,
     pub primary: bool,
     /// `QueryDisplayConfig`'s EDID-derived `monitorDevicePath`. This, and
     /// explicitly not `\\.\DISPLAY1` — a GDI adapter slot is reassigned on
@@ -128,6 +135,8 @@ pub struct HomeMonitor {
     pub id: MonitorId,
     pub work: Rect,
     pub dpi: u32,
+    /// See [`MonitorInfo::autohide_reserve`].
+    pub autohide_reserve: i32,
 }
 
 impl HomeMonitor {
@@ -143,13 +152,20 @@ impl HomeMonitor {
     /// Anchored to `rcWork`, so the visual gap is identical on every monitor,
     /// the pill cannot collide with a taskbar, and a left- or top-docked taskbar
     /// is handled for free by the work rect's own origin.
+    ///
+    /// Minus the **autohide reserve**, which is the one thing `rcWork` does not
+    /// answer for: an auto-hiding taskbar is reserved no space at all, so the
+    /// work area runs to the screen bottom and the taskbar slides out over the
+    /// pill (#72). The reserve is zero whenever the work rect already accounts
+    /// for the taskbar, which is every pinned case — so this arithmetic is
+    /// unchanged on the desktops it was right on.
     pub fn placement(&self) -> Rect {
         let scale = self.scale();
         let w = (crate::pill::geom::ENVELOPE_W as f32 * scale).round() as i32;
         let h = (crate::pill::geom::ENVELOPE_H as f32 * scale).round() as i32;
         let margin = (crate::pill::PILL_BOTTOM_MARGIN as f32 * scale).round() as i32;
         let left = self.work.left + (self.work.width() - w) / 2;
-        let top = self.work.bottom - h - margin;
+        let top = self.work.bottom - self.autohide_reserve - h - margin;
         Rect {
             left,
             top,
@@ -165,6 +181,7 @@ impl From<&MonitorInfo> for HomeMonitor {
             id: m.id,
             work: m.work,
             dpi: m.dpi,
+            autohide_reserve: m.autohide_reserve,
         }
     }
 }
@@ -403,6 +420,9 @@ mod win {
         MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::Win32::UI::Shell::{
+        SHAppBarMessage, ABE_BOTTOM, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE, APPBARDATA,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, MONITORINFOF_PRIMARY,
     };
@@ -434,9 +454,73 @@ mod win {
                 primary,
                 device_path,
                 friendly_name,
+                autohide_reserve: 0,
             });
         }
+        charge_autohide_reserve(&mut monitors);
         Displays::new(monitors)
+    }
+
+    /// Charge every monitor the strip an auto-hiding taskbar will cover when it
+    /// slides out — the one thing about a taskbar `rcWork` does not say, because
+    /// an auto-hiding one is reserved no space at all (#72).
+    ///
+    /// One query answers for the whole desk. Windows 11 puts a taskbar on every
+    /// monitor, but they share the primary's auto-hide setting, its edge, and
+    /// its *logical* thickness; `ABM_GETAUTOHIDEBAREX` would only say whether a
+    /// given monitor has one, since it returns a window handle rather than a
+    /// size. So the primary's thickness is measured once and re-scaled per
+    /// monitor, which is what keeps the mixed-DPI desk right: the same taskbar
+    /// is 48 physical pixels on a 100% panel and 72 on a 150% one.
+    fn charge_autohide_reserve(monitors: &mut [MonitorInfo]) {
+        let Some(thickness) = autohide_taskbar_thickness() else {
+            return;
+        };
+        let primary_dpi = monitors
+            .iter()
+            .find(|m| m.primary)
+            .map_or(DEFAULT_DPI, |m| m.dpi);
+        let logical = thickness as f32 * 96.0 / primary_dpi as f32;
+        for m in monitors.iter_mut() {
+            m.autohide_reserve = (logical * m.dpi as f32 / 96.0).round() as i32;
+        }
+    }
+
+    /// The taskbar's thickness in physical pixels, and **only** when it both
+    /// auto-hides and is docked to the bottom.
+    ///
+    /// Any other edge reserves nothing, deliberately: the pill is anchored
+    /// bottom-centre, so a taskbar sliding out from the left, top or right is
+    /// not on its way to the same pixels. A pinned taskbar reserves nothing
+    /// either, on any edge — it is already out of `rcWork`, and charging it
+    /// twice would push the pill up by its own height.
+    fn autohide_taskbar_thickness() -> Option<i32> {
+        if !taskbar_autohides() {
+            return None;
+        }
+        let mut abd = appbar_data();
+        // Unlike `ABM_GETSTATE`, this one's return is a plain success flag.
+        if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) } == 0 {
+            return None;
+        }
+        if abd.uEdge != ABE_BOTTOM {
+            return None;
+        }
+        let thickness = abd.rc.bottom - abd.rc.top;
+        (thickness > 0).then_some(thickness)
+    }
+
+    fn taskbar_autohides() -> bool {
+        let mut abd = appbar_data();
+        let state = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) } as u32;
+        state & ABS_AUTOHIDE != 0
+    }
+
+    fn appbar_data() -> APPBARDATA {
+        APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            ..Default::default()
+        }
     }
 
     /// The monitor holding the foreground window. `None` when there is no
@@ -666,6 +750,7 @@ mod tests {
                 primary: true,
                 device_path: Some(r"\\?\DISPLAY#LAPTOP#EDID".into()),
                 friendly_name: Some("Built-in display".into()),
+                autohide_reserve: 0,
             },
             MonitorInfo {
                 id: EXTERNAL,
@@ -679,6 +764,7 @@ mod tests {
                 primary: false,
                 device_path: Some(r"\\?\DISPLAY#DELL#EDID".into()),
                 friendly_name: Some("DELL U2720Q".into()),
+                autohide_reserve: 0,
             },
         ])
     }
@@ -986,6 +1072,28 @@ mod tests {
         assert_eq!(home.refresh(&rescaled), None);
     }
 
+    /// Turning auto-hide on leaves `rcWork` untouched — the reserve is the only
+    /// thing that moves, so it has to count as a move on its own or the pill
+    /// stays under the taskbar until something else re-places it.
+    #[test]
+    fn a_taskbar_switching_to_auto_hide_re_places_the_pill() {
+        let desk = desk();
+        let mut home = Home::new(Policy::Primary, None);
+        home.update(Trigger::Rederive, &desk, Signals::default(), t(0));
+        let mut all = desk.all().to_vec();
+        // The work area now runs to the bottom of the panel, and the taskbar is
+        // going to slide out over the 72 physical pixels it gave back.
+        all[0].work.bottom += 72;
+        all[0].autohide_reserve = 72;
+        let hiding = Displays::new(all);
+        let after = home.refresh(&hiding).expect("auto-hide is a move");
+        assert_eq!(after.autohide_reserve, 72);
+        assert_eq!(
+            after.placement(),
+            HomeMonitor::from(&desk.all()[0]).placement()
+        );
+    }
+
     /// A home monitor that has gone is not this event's problem: the
     /// `WM_DISPLAYCHANGE` that unplugged it re-derives properly.
     #[test]
@@ -1063,6 +1171,7 @@ mod tests {
             primary: true,
             device_path: None,
             friendly_name: None,
+            autohide_reserve: 0,
         };
         let home = HomeMonitor::from(&m);
         let p = home.placement();
@@ -1071,6 +1180,81 @@ mod tests {
         // Centred on the work area, not on the monitor.
         let slack = (m.work.left + m.work.right) / 2 - (p.left + p.right) / 2;
         assert!(slack.abs() <= 1, "off-centre by {slack}");
+    }
+
+    /// An auto-hiding taskbar is reserved no space, so `rcWork` runs to the
+    /// screen bottom and the taskbar slides out over the pill (#72). The
+    /// **autohide reserve** is the only thing standing between them.
+    #[test]
+    fn the_pill_clears_an_auto_hiding_taskbar_it_will_not_see_in_the_work_area() {
+        // The same 1080p screen, taskbar set to auto-hide: `rcWork` is now the
+        // whole panel, and the 48px bar is going to appear across its bottom.
+        let hidden = MonitorInfo {
+            id: 7,
+            work: Rect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            dpi: 96,
+            primary: true,
+            device_path: None,
+            friendly_name: None,
+            autohide_reserve: 48,
+        };
+        let p = HomeMonitor::from(&hidden).placement();
+        assert!(
+            p.bottom <= hidden.work.bottom - hidden.autohide_reserve,
+            "the taskbar will slide out over the pill"
+        );
+
+        // And it clears it by the same gap it clears a pinned one by: the pill
+        // sits where it would have if Windows had reserved the space itself.
+        let pinned = MonitorInfo {
+            work: Rect {
+                bottom: 1032,
+                ..hidden.work
+            },
+            autohide_reserve: 0,
+            ..hidden.clone()
+        };
+        assert_eq!(p, HomeMonitor::from(&pinned).placement());
+    }
+
+    /// A pinned taskbar must not be charged twice. This is the whole of the
+    /// old behaviour, restated as the thing the fix may not disturb.
+    #[test]
+    fn a_pinned_taskbar_reserves_nothing_and_places_the_pill_exactly_as_before() {
+        for m in desk().all() {
+            assert_eq!(m.autohide_reserve, 0);
+            let home = HomeMonitor::from(m);
+            let p = home.placement();
+            let margin = (crate::pill::PILL_BOTTOM_MARGIN as f32 * home.scale()).round() as i32;
+            assert_eq!(p.bottom, home.work.bottom - margin, "monitor {}", m.id);
+        }
+    }
+
+    /// The reserve is physical pixels, so the same taskbar costs more of them
+    /// on a 150% panel — which is what keeps the *visible* gap identical across
+    /// a mixed-DPI desk, exactly as the work-area anchor does.
+    #[test]
+    fn the_reserve_scales_with_the_monitor_it_is_on() {
+        let mut all = desk().all().to_vec();
+        // 48 logical px of taskbar: 72 physical on the 150% laptop, 48 on the
+        // 100% external.
+        all[0].autohide_reserve = 72;
+        all[1].autohide_reserve = 48;
+        for m in &all {
+            let home = HomeMonitor::from(m);
+            let p = home.placement();
+            let gap = (home.work.bottom - m.autohide_reserve - p.bottom) as f32 / home.scale();
+            assert!(
+                (gap - crate::pill::PILL_BOTTOM_MARGIN as f32).abs() <= 1.0,
+                "monitor {} gap {gap}",
+                m.id
+            );
+        }
     }
 
     /// The window is the envelope, scaled by the home monitor — which is what
@@ -1097,6 +1281,7 @@ mod tests {
             id: 1,
             work: Rect::default(),
             dpi: 96,
+            autohide_reserve: 0,
         };
         assert_eq!(home.scale(), 1.0);
         home.dpi = 144;
