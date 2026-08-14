@@ -24,8 +24,8 @@
 // `Fade`.
 
 use crate::pill::core::{
-    check_centre, island_centre, slab, Action, Button, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTON,
-    CHECK_BUTTONS, CHECK_CLAIM, CHECK_GLYPH_BOX, GLYPH_BOX,
+    check_centre, Action, BodyStyle, Button, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTON,
+    CHECK_BUTTONS, CHECK_CLAIM, CHECK_GLYPH_BOX, GLYPH_BOX, UNIFIED_SLOT_W,
 };
 use crate::pill::geom::{
     label_centre_y, pill_centre_y, Geom, Rgb, Slot, BODY, HAIRLINE, HAIRLINE_A, LABEL_H,
@@ -149,6 +149,16 @@ fn body_of(geom: &Geom, scale: f32) -> (f32, f32, f32) {
     )
 }
 
+/// `style` is the third thing the Geom does not carry, and the only one the
+/// user chooses. It cannot be a Geom field — a body style is not interpolable,
+/// and a frame mid-morph belongs to no mode to read it off — so it arrives here
+/// beside the Geom, from the same config the Pill core reads it from.
+///
+/// It buys **one** branch: whether the flankers are shapes of their own, and
+/// therefore where each button sits. Everything past that — the indicator, the
+/// glyphs, their emphasis — is the same code drawing the same marks. Unified
+/// gets no extra pass, which is the whole of "it costs a layout branch, not a
+/// renderer": no resting disc, no brighter glyph, no wider slab.
 pub fn draw(
     pm: &mut Pixmap,
     scale: f32,
@@ -156,6 +166,7 @@ pub fn draw(
     bar_heights: &[f32],
     slots: &[Slot; BUTTON_COUNT],
     label: &Fade,
+    style: BodyStyle,
 ) {
     clear_transparent(pm);
 
@@ -174,10 +185,14 @@ pub fn draw(
     let y = cy - body_h / 2.0;
     let radius = (geom.radius * scale).min(body_h / 2.0).min(body_w / 2.0);
 
-    let islands = islands(pm, geom, scale, border_w);
+    let islands = islands(pm, geom, scale, border_w, style);
     // Behind the body, because that is what "slide out from behind Dictate"
     // means: at the start of the fold-out the flankers are underneath it.
-    if geom.buttons > 0.0 {
+    //
+    // Islands only. A unified bar has nothing to draw here — its slots are
+    // regions of the body about to be drawn below, and the body is opaque, so
+    // there is no gap to hold open against the hit test either.
+    if geom.buttons > 0.0 && style == BodyStyle::Islands {
         draw_hit_strip(pm, scale, geom.buttons);
         for (i, island) in islands.iter().enumerate() {
             if i != CENTRE {
@@ -438,11 +453,18 @@ fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
 /// only appears once the fold-out is mostly done: a bar that swallowed clicks
 /// across its full width before it had drawn itself would be catching them for
 /// buttons that are not there yet.
+///
+/// **Islands only**, and structurally so: the strip exists to fill the gaps
+/// between three shapes, and a unified bar has none — its body is opaque across
+/// every slab already.
 fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
     if progress < 0.5 {
         return;
     }
-    let (lo, hi) = (slab(0).0 * scale, slab(BUTTONS.len() - 1).1 * scale);
+    let (lo, hi) = (
+        BodyStyle::Islands.slab(0).0 * scale,
+        BodyStyle::Islands.slab(BUTTON_COUNT - 1).1 * scale,
+    );
     let h = crate::pill::core::BAR_H * scale;
     let (cx, cy) = centre(pm, scale);
     let Some(rect) = Rect::from_ltrb(cx + lo, cy - h / 2.0, cx + hi, cy + h / 2.0) else {
@@ -459,6 +481,12 @@ fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
 const HIT_A: u8 = 3;
 
 /// One button's drawn shape this frame, in device pixels.
+///
+/// Under [`BodyStyle::Islands`] that is the island itself. Under
+/// [`BodyStyle::Unified`] it is the button's slot — a region of the one body,
+/// never filled or stroked, but the same rect the indicator insets from and the
+/// same centre the glyph is drawn on. One type, because past the layout branch
+/// the two styles draw a button identically.
 struct Island {
     cx: f32,
     cy: f32,
@@ -467,14 +495,24 @@ struct Island {
     r: f32,
 }
 
-/// Where every island is right now.
+/// Where every button is right now.
 ///
-/// The centre island is the pill's own body — whatever size the morph has it
-/// at — and the flankers are at `island_centre(i)` scaled by the growth
-/// progress, which is `geom.buttons`. **Offset is a pure function of that one
-/// number**: no per-button clock, so a frame mid-fold-out is still derived from
-/// the Geom alone.
-fn islands(pm: &Pixmap, geom: &Geom, scale: f32, border_w: f32) -> [Island; BUTTON_COUNT] {
+/// Under islands the centre one is the pill's own body — whatever size the
+/// morph has it at — and the flankers are at [`BodyStyle::centre`] for the
+/// growth progress, which is `geom.buttons`. **Offset is a pure function of
+/// that one number**: no per-button clock, so a frame mid-fold-out is still
+/// derived from the Geom alone.
+///
+/// Under unified every button is a slot inside the body, measured off the width
+/// the body has this frame — so the same fold-out falls out of the same call,
+/// with the body's own growth doing what the progress does for the flankers.
+fn islands(
+    pm: &Pixmap,
+    geom: &Geom,
+    scale: f32,
+    border_w: f32,
+    style: BodyStyle,
+) -> [Island; BUTTON_COUNT] {
     let (cx, cy) = centre(pm, scale);
     let (_, body_w, body_h) = body_of(geom, scale);
     // The same transparent margin the body gets, so a flanker's edge has room
@@ -482,24 +520,42 @@ fn islands(pm: &Pixmap, geom: &Geom, scale: f32, border_w: f32) -> [Island; BUTT
     let inset = border_w * 0.5 + scale;
     let progress = geom.buttons.clamp(0.0, 1.0);
     std::array::from_fn(|i| {
-        if i == CENTRE {
-            return Island {
+        let x = cx + style.centre(geom.w, progress, i) * scale;
+        match style {
+            // The body *is* the centre island, so it is not derived a second
+            // time — the morph already has its size.
+            BodyStyle::Islands if i == CENTRE => Island {
                 cx,
                 cy,
                 w: body_w,
                 h: body_h,
                 r: (geom.radius * scale).min(body_h / 2.0).min(body_w / 2.0),
-            };
-        }
-        let b = &BUTTONS[i];
-        let w = (b.w * scale - 2.0 * inset).max(0.0);
-        let h = (b.height() * scale - 2.0 * inset).max(0.0);
-        Island {
-            cx: cx + island_centre(i) * scale * progress,
-            cy,
-            w,
-            h,
-            r: (b.radius() * scale).min(h / 2.0).min(w / 2.0),
+            },
+            BodyStyle::Islands => {
+                let b = &BUTTONS[i];
+                let w = (b.w * scale - 2.0 * inset).max(0.0);
+                let h = (b.height() * scale - 2.0 * inset).max(0.0);
+                Island {
+                    cx: x,
+                    cy,
+                    w,
+                    h,
+                    r: (b.radius() * scale).min(h / 2.0).min(w / 2.0),
+                }
+            }
+            // A slot is as tall as the body it is cut from, so the indicator
+            // insets from the body's own edges exactly as an island's does.
+            // Uniform in every slot, Dictate's included: there is no wider slab.
+            BodyStyle::Unified => {
+                let w = UNIFIED_SLOT_W * scale;
+                Island {
+                    cx: x,
+                    cy,
+                    w,
+                    h: body_h,
+                    r: (w / 2.0).min(body_h / 2.0),
+                }
+            }
         }
     })
 }
@@ -761,6 +817,8 @@ mod tests {
         t: 1.0,
     };
 
+    use crate::pill::bodies::{style_of, ISLANDS, UNIFIED};
+
     fn envelope() -> Pixmap {
         Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap()
     }
@@ -775,7 +833,15 @@ mod tests {
     /// Draw a mode into a fresh envelope-sized pixmap at 1x.
     fn frame(mode: PillMode, bars: &[f32]) -> Pixmap {
         let mut pm = envelope();
-        draw(&mut pm, 1.0, &Geom::of(mode), bars, &NO_SLOTS, &NO_LABEL);
+        draw(
+            &mut pm,
+            1.0,
+            &Geom::of(mode),
+            bars,
+            &NO_SLOTS,
+            &NO_LABEL,
+            style_of(mode),
+        );
         pm
     }
 
@@ -894,7 +960,15 @@ mod tests {
     fn a_frame_mid_morph_draws_a_body_between_the_two_modes() {
         let half = Geom::of(PillMode::Idle).lerp(Geom::of(REC), 0.5);
         let mut pm = envelope();
-        draw(&mut pm, 1.0, &half, &FLAT, &NO_SLOTS, &NO_LABEL);
+        draw(
+            &mut pm,
+            1.0,
+            &half,
+            &FLAT,
+            &NO_SLOTS,
+            &NO_LABEL,
+            BodyStyle::Islands,
+        );
         let cy = cy(&pm, 1.0);
         let width = (0..ENVELOPE_W)
             .filter(|&x| pm.pixel(x, cy).unwrap().alpha() > 8)
@@ -955,8 +1029,24 @@ mod tests {
         let g = Geom::of(PillMode::Idle);
         let mut one = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
         let mut two = Pixmap::new(ENVELOPE_W * 2, ENVELOPE_H * 2).unwrap();
-        draw(&mut one, 1.0, &g, &FLAT, &NO_SLOTS, &NO_LABEL);
-        draw(&mut two, 2.0, &g, &FLAT, &NO_SLOTS, &NO_LABEL);
+        draw(
+            &mut one,
+            1.0,
+            &g,
+            &FLAT,
+            &NO_SLOTS,
+            &NO_LABEL,
+            BodyStyle::Islands,
+        );
+        draw(
+            &mut two,
+            2.0,
+            &g,
+            &FLAT,
+            &NO_SLOTS,
+            &NO_LABEL,
+            BodyStyle::Islands,
+        );
         let count = |pm: &Pixmap, y: u32| {
             (0..pm.width())
                 .filter(|&x| pm.pixel(x, y).unwrap().alpha() > 8)
@@ -969,16 +1059,22 @@ mod tests {
         );
     }
 
-    /// Draw the expanded bar at 1x, with `slots`.
+    /// Draw the islands bar at 1x, with `slots`.
     fn bar(slots: &[Slot; BUTTON_COUNT]) -> Pixmap {
+        bar_of(ISLANDS, slots)
+    }
+
+    /// The same, in whichever body `mode` names.
+    fn bar_of(mode: PillMode, slots: &[Slot; BUTTON_COUNT]) -> Pixmap {
         let mut pm = envelope();
         draw(
             &mut pm,
             1.0,
-            &Geom::of(PillMode::Expanded),
+            &Geom::of(mode),
             &FLAT,
             slots,
             &NO_LABEL,
+            style_of(mode),
         );
         pm
     }
@@ -1016,8 +1112,112 @@ mod tests {
         // And the whole bar spans its derived width, centred.
         let span = runs[2].1 - runs[0].0 + 1;
         assert!(
-            span.abs_diff(crate::pill::core::bar_width() as u32) <= 2,
+            span.abs_diff(BodyStyle::Islands.bar_width() as u32) <= 2,
             "bar span {span}"
+        );
+    }
+
+    /// The reduced option, the other way round: **one** body, 104 wide, with
+    /// nothing between the buttons because there is nothing to be between.
+    /// Measured off the drawn pixels, so a renderer that kept the islands would
+    /// fail here whatever the style said.
+    #[test]
+    fn the_unified_bar_draws_one_body_across_its_whole_width() {
+        let pm = bar_of(UNIFIED, &NO_SLOTS);
+        let runs = runs(&pm, cy(&pm, 1.0));
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let width = runs[0].1 - runs[0].0 + 1;
+        assert!(width.abs_diff(104) <= 2, "body width {width}");
+        // Centred on the pill, like everything else it draws.
+        let centre = (runs[0].0 + runs[0].1) as f32 / 2.0;
+        assert!((centre - ENVELOPE_W as f32 / 2.0).abs() <= 1.0, "{centre}");
+    }
+
+    /// The brightest pixel in each button's box, and how much of that box is
+    /// bright — a glyph is thin strokes, a filled disc is most of a circle.
+    fn glyph_box(pm: &Pixmap, cx: f32, cy: u32, half: i32) -> (u8, usize) {
+        let px: Vec<u8> = (-half..=half)
+            .flat_map(|x| (-half..=half).map(move |y| (x, y)))
+            .map(|(x, y)| {
+                brightest(
+                    pm.pixel((cx as i32 + x) as u32, (cy as i32 + y) as u32)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        (
+            px.iter().copied().max().unwrap(),
+            px.iter().filter(|&&p| p > 200).count(),
+        )
+    }
+
+    /// **Unified marks nothing.** Three uniform slots, three glyphs at one
+    /// emphasis, and no resting disc under any of them.
+    ///
+    /// The disc is the claim worth measuring, because the pill *does* draw one:
+    /// a click-started session's confirm, which is a default action said in
+    /// paint. Read the same way here, every slot comes back a glyph on bare
+    /// body — under a fifth of confirm's lit area, and no slot brighter than
+    /// its neighbours.
+    #[test]
+    fn the_unified_body_draws_no_primary_mark() {
+        let pm = bar_of(UNIFIED, &NO_SLOTS);
+        let row = cy(&pm, 1.0);
+        let cx = ENVELOPE_W as f32 / 2.0;
+        let boxes: Vec<(u8, usize)> = (0..BUTTON_COUNT)
+            .map(|i| glyph_box(&pm, cx + BodyStyle::Unified.settled_centre(i), row, 10))
+            .collect();
+        // No brighter glyph: every slot peaks at the same idle emphasis.
+        let peaks: Vec<u8> = boxes.iter().map(|b| b.0).collect();
+        assert!(
+            peaks.iter().max().unwrap() - peaks.iter().min().unwrap() <= 2,
+            "one glyph is brighter than the others: {peaks:?}"
+        );
+        // And no disc under any of them. Confirm's own is the yardstick.
+        let confirm = frame(CLICK_REC, &FLAT);
+        let (_, disc) = glyph_box(
+            &confirm,
+            cx + crate::pill::core::check_centre(CLICK_W, 1),
+            cy(&confirm, 1.0),
+            7,
+        );
+        for (i, (_, lit)) in boxes.iter().enumerate() {
+            assert!(
+                *lit * 5 < disc,
+                "slot {i} is lit like a disc ({lit} against confirm's {disc})"
+            );
+        }
+    }
+
+    /// Every slot is the same width, at rest and lit — so the indicator that
+    /// says "this one" is the same shape wherever it lands. Under islands the
+    /// centre's is half again wider, because the island under it is.
+    #[test]
+    fn the_unified_indicator_is_the_same_shape_in_every_slot() {
+        let lit = |style: PillMode, i: usize| {
+            let mut slots = NO_SLOTS;
+            slots[i].hover = 1.0;
+            let pm = bar_of(style, &slots);
+            let dark = bar_of(style, &NO_SLOTS);
+            let cy = cy(&pm, 1.0);
+            // How many pixels along the centre row the indicator brightened.
+            (0..ENVELOPE_W)
+                .filter(|&x| {
+                    brightest(pm.pixel(x, cy).unwrap()) > brightest(dark.pixel(x, cy).unwrap())
+                })
+                .count()
+        };
+        let unified: Vec<usize> = (0..BUTTON_COUNT).map(|i| lit(UNIFIED, i)).collect();
+        assert!(unified.iter().all(|&w| w > 0), "nothing lit: {unified:?}");
+        assert!(
+            unified.iter().max().unwrap() - unified.iter().min().unwrap() <= 2,
+            "the slots are not uniform: {unified:?}"
+        );
+        // The islands bar, by contrast, lights a visibly wider centre.
+        let islands: Vec<usize> = (0..BUTTON_COUNT).map(|i| lit(ISLANDS, i)).collect();
+        assert!(
+            islands[CENTRE] > islands[0] + 8,
+            "the stadium stopped reading as one: {islands:?}"
         );
     }
 
@@ -1026,7 +1226,7 @@ mod tests {
     /// else, so this is the whole of the animation.
     #[test]
     fn the_flankers_slide_out_from_behind_the_centre() {
-        let expanded = Geom::of(PillMode::Expanded);
+        let expanded = Geom::of(ISLANDS);
         let at = |t: f32| {
             let mut pm = envelope();
             draw(
@@ -1036,6 +1236,7 @@ mod tests {
                 &FLAT,
                 &NO_SLOTS,
                 &NO_LABEL,
+                BodyStyle::Islands,
             );
             runs(&pm, cy(&pm, 1.0))
         };
@@ -1130,10 +1331,11 @@ mod tests {
         draw(
             &mut hi,
             SS as f32,
-            &Geom::of(PillMode::Expanded),
+            &Geom::of(ISLANDS),
             &FLAT,
             &NO_SLOTS,
             &NO_LABEL,
+            BodyStyle::Islands,
         );
         // 4x → 2x → 1x, exactly as `blit_and_present` does it.
         let paint = tiny_skia::PixmapPaint {
@@ -1150,7 +1352,9 @@ mod tests {
         // The middle of each gap: between Copy and Dictate, and between
         // Dictate and Settings.
         for (i, b) in BUTTONS.iter().enumerate().take(BUTTONS.len() - 1) {
-            let mid_x = (island_centre(i) + b.w / 2.0 + crate::pill::core::BAR_GAP / 2.0)
+            let mid_x = (crate::pill::core::island_centre(i)
+                + b.w / 2.0
+                + crate::pill::core::BAR_GAP / 2.0)
                 + ENVELOPE_W as f32 / 2.0;
             let p = out.pixel(mid_x.round() as u32, cy).unwrap();
             assert!(p.alpha() > 0, "gap {i} is a hole: {p:?}");
@@ -1158,7 +1362,7 @@ mod tests {
             assert!(p.alpha() < 16, "gap {i} is visible: {p:?}");
         }
         // Past the last island, the end padding stays a hole.
-        let outside = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::bar_width() / 2.0 + 1.0) as u32;
+        let outside = (ENVELOPE_W as f32 / 2.0 + BodyStyle::Islands.bar_width() / 2.0 + 1.0) as u32;
         assert_eq!(out.pixel(outside, cy).unwrap().alpha(), 0);
     }
 
@@ -1176,10 +1380,11 @@ mod tests {
         draw(
             &mut pm,
             1.0,
-            &Geom::of(PillMode::Expanded),
+            &Geom::of(ISLANDS),
             &FLAT,
             &NO_SLOTS,
             fade,
+            BodyStyle::Islands,
         );
         pm
     }
@@ -1227,7 +1432,7 @@ mod tests {
         let rows = label_rows(&pm);
         assert!(!rows.is_empty(), "the label drew nothing");
         // It sits where the layout says, and does not touch the bar.
-        let want = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h);
+        let want = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(ISLANDS).h);
         let (top, bottom) = (rows[0] as f32, *rows.last().unwrap() as f32);
         assert!(
             (top - (want - LABEL_H / 2.0)).abs() <= 2.0
@@ -1257,8 +1462,7 @@ mod tests {
     fn the_chip_is_sized_to_its_text() {
         let width = |text: &'static str| {
             let pm = with_label(&showing(text));
-            let y = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h).round()
-                as u32;
+            let y = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(ISLANDS).h).round() as u32;
             runs(&pm, y)
                 .iter()
                 .map(|(a, b)| (*a, *b))
@@ -1289,8 +1493,7 @@ mod tests {
             t: 0.5,
         };
         let pm = with_label(&fade);
-        let y =
-            label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(PillMode::Expanded).h).round() as u32;
+        let y = label_centre_y(ENVELOPE_H as f32, 1.0, Geom::of(ISLANDS).h).round() as u32;
         // The chip's own row, above the text's ink: one continuous run.
         let edge = (y as f32 - LABEL_H / 2.0 + 2.0) as u32;
         assert_eq!(runs(&pm, edge).len(), 1, "{:?}", runs(&pm, edge));
@@ -1425,6 +1628,7 @@ mod tests {
             &[1.0; BAR_COUNT],
             &NO_SLOTS,
             &NO_LABEL,
+            BodyStyle::Islands,
         );
         let cy = cy(&pm, 1.0);
         let cx = ENVELOPE_W / 2;

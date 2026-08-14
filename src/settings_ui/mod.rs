@@ -21,7 +21,7 @@ mod theme;
 mod widgets;
 
 use crate::autostart;
-use crate::config::{Activation, Config, MonitorPolicy, PasteMode, Provider};
+use crate::config::{Activation, Config, MonitorPolicy, PasteMode, PillBodyStyle, Provider};
 use crate::secrets;
 use crate::transcribe::parakeet_download::{self, Progress as DlProgress};
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
@@ -510,8 +510,7 @@ impl SettingsApp {
         });
     }
 
-    /// The pill pane. The body-style toggle is the row still to join it, which
-    /// is why this is a pane of its own rather than a row on Recording.
+    /// The pill pane.
     ///
     /// Fullscreen suppression (#45) deliberately has no row: getting out of the
     /// way of a game is not a preference, and a pill kept over one would be
@@ -527,6 +526,14 @@ impl SettingsApp {
                  this off and the pill only appears while you're dictating — the \
                  hotkey works exactly the same either way.",
             );
+            // Gated on residency, where the monitor row below is deliberately
+            // not: the button bar only ever appears on hover, and there is
+            // nothing to hover with the pill off. Same test, opposite answer,
+            // because the question is whether the setting is still in force.
+            if self.cfg.pill.resident {
+                divider(ui);
+                self.body_style_row(ui);
+            }
             // Deliberately *not* gated on residency: the same policy places the
             // session-only pill, so hiding this row when the pill is off would
             // hide a setting that is still in force.
@@ -557,6 +564,34 @@ impl SettingsApp {
                 self.pinned_display_row(ui);
             }
         });
+    }
+
+    /// The body-style toggle: three shapes, or one bar.
+    ///
+    /// A toggle over a `PillBodyStyle`, via a local `bool` — `toggle_row` binds
+    /// a flag and this is a two-state choice, so the round trip is the whole of
+    /// the adaptation. The config keeps the named states because a file that
+    /// says `body_style = "unified"` reads better than one that says a flag is
+    /// true.
+    ///
+    /// Off is islands, and off is the default: the toggle adds the reduced
+    /// option rather than choosing between two peers.
+    fn body_style_row(&mut self, ui: &mut egui::Ui) {
+        let mut unified = self.cfg.pill.body_style == PillBodyStyle::Unified;
+        toggle_row(
+            ui,
+            &mut unified,
+            "Put the buttons in one bar",
+            "When you point at the pill it opens into buttons — normally three \
+             separate shapes with your desktop showing between them. Turn this \
+             on to put them in a single bar instead. Same buttons, same \
+             actions, just a different shape.",
+        );
+        self.cfg.pill.body_style = if unified {
+            PillBodyStyle::Unified
+        } else {
+            PillBodyStyle::Islands
+        };
     }
 
     /// The display picker, shown only when the policy is "a specific display".

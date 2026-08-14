@@ -205,57 +205,159 @@ pub const BUTTONS: [Button; BUTTON_COUNT] = [
     },
 ];
 
-/// The bar's total width: every island plus the desktop between them.
-pub fn bar_width() -> f32 {
-    BUTTONS.iter().map(|b| b.w).sum::<f32>() + BAR_GAP * (BUTTONS.len() - 1) as f32
-}
-
-/// Button `i`'s centre, as an offset from the pill's centre. Negative is left.
+/// Button `i`'s centre on the islands bar, as an offset from the pill's centre.
+/// Negative is left.
 ///
 /// The bar is centred on the pill, which — with an odd count — is what puts
 /// Dictate exactly under the cursor that opened it.
 pub fn island_centre(i: usize) -> f32 {
-    let mut x = -bar_width() / 2.0;
+    let mut x = -BodyStyle::Islands.bar_width() / 2.0;
     for b in &BUTTONS[..i] {
         x += b.w + BAR_GAP;
     }
     x + BUTTONS[i].w / 2.0
 }
 
-/// Button `i`'s hit region: **a slab, not a circle**. Full bar height, spanning
-/// the island plus half the gap on each side, so the desktop between two
-/// islands belongs to one of them rather than being a dead zone the hover
-/// flickers off in.
+// --- The expanded pill's body style --------------------------------------
+
+/// How the expanded pill puts [`BUTTONS`] on screen: three islands over bare
+/// desktop, or one body with three uniform slots.
 ///
-/// The outer ends get no half-gap: past the last island is the end padding,
-/// which is inert — it holds the pill expanded with nothing lit.
-pub fn slab(i: usize) -> (f32, f32) {
-    let c = island_centre(i);
-    let half = BUTTONS[i].w / 2.0;
-    let lo = if i == 0 { 0.0 } else { BAR_GAP / 2.0 };
-    let hi = if i + 1 == BUTTONS.len() {
-        0.0
-    } else {
-        BAR_GAP / 2.0
-    };
-    (c - half - lo, c + half + hi)
+/// **[`Islands`](Self::Islands) is the design; [`Unified`](Self::Unified) is
+/// the reduced option.** A toggle is defensible here where a picker for the
+/// button *set* was not: the set has invariants a user can break — the count
+/// must be odd, the centre must be Dictate — and a body style has none. Both
+/// states are complete and neither can be misconfigured.
+///
+/// The two are not peers. Unified expresses strictly less: one body means no
+/// stadium, so it cannot mark Dictate as primary by shape — and it does not do
+/// it by paint either, so a flat row of three equals is the whole of what it
+/// says. It also grows worse: adding a button under Islands is adding an
+/// island, where under Unified it re-derives one shared body's arithmetic.
+/// Future design effort owes it nothing.
+///
+/// It is kept because it is nearly free. The click-started pill is one body
+/// under *both* styles, so the unified drawing path survives regardless — the
+/// toggle costs a config key and the branches below, not a renderer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BodyStyle {
+    /// Three separate shapes with the desktop showing between them.
+    #[default]
+    Islands,
+    /// One body, divided into uniform slots.
+    Unified,
 }
 
-/// Which button `(x, y)` — an offset from the pill's centre, in logical pixels
-/// — is over, disregarding whether it is live.
+/// A unified slot's width: the uniform region one button gets inside the one
+/// body. Every button gets the same one, which *is* the style — there is no
+/// wider slab for Dictate to be found by.
 ///
-/// The vertical half is what "full bar height" actually means, and it is
-/// checked rather than assumed: until #46 the window *was* the bar's height and
-/// there was nowhere else to be, but the envelope now holds a label above the
-/// pill, and a cursor up there is over the window without being over a button.
-fn slab_at(x: f32, y: f32) -> Option<usize> {
-    if y.abs() > BAR_H / 2.0 {
-        return None;
+/// Not [`crate::pill::geom::Slot`], which is a button's hover state riding
+/// beside the Geom. This is a length.
+pub const UNIFIED_SLOT_W: f32 = 32.0;
+
+/// Clear space between the outermost slot and the unified body's edge. The
+/// bar's inert end padding, with a body drawn under it.
+pub const UNIFIED_PAD: f32 = 4.0;
+
+impl BodyStyle {
+    /// The expanded pill's total width. Both arms are derived from [`BUTTONS`],
+    /// so a fourth button widens either style without a second edit.
+    pub fn bar_width(self) -> f32 {
+        match self {
+            BodyStyle::Islands => {
+                BUTTONS.iter().map(|b| b.w).sum::<f32>() + BAR_GAP * (BUTTONS.len() - 1) as f32
+            }
+            BodyStyle::Unified => BUTTON_COUNT as f32 * UNIFIED_SLOT_W + 2.0 * UNIFIED_PAD,
+        }
     }
-    (0..BUTTONS.len()).find(|&i| {
-        let (lo, hi) = slab(i);
-        x >= lo && x < hi
-    })
+
+    /// How wide button `i` is drawn. Its own island under Islands; the uniform
+    /// [`UNIFIED_SLOT_W`] under Unified, whatever the island would have been.
+    pub fn button_w(self, i: usize) -> f32 {
+        match self {
+            BodyStyle::Islands => BUTTONS[i].w,
+            BodyStyle::Unified => UNIFIED_SLOT_W,
+        }
+    }
+
+    /// Button `i`'s centre inside a body `body_w` wide, `progress` through its
+    /// fold-out — the one derivation both the renderer and the hit regions ask,
+    /// so the two cannot drift.
+    pub fn centre(self, body_w: f32, progress: f32, i: usize) -> f32 {
+        match self {
+            // The flankers slide out from *behind* Dictate, so their offset is
+            // the growth progress times their settled one. The body they sit
+            // beside is not theirs to measure from — it is one island of three.
+            BodyStyle::Islands => island_centre(i) * progress.clamp(0.0, 1.0),
+            // One body, so the slots are measured inward from whatever edge it
+            // has this frame — the derivation [`check_centre`] makes, with the
+            // same consequence: on a body too narrow to hold them they stack at
+            // the centre and separate as it widens. Progress does not enter,
+            // because the body's own width already carries it.
+            BodyStyle::Unified => {
+                // A bar with one button has no spacing to derive and would
+                // divide by zero here. Stated as a compile-time assertion
+                // rather than a runtime guard: [`BUTTON_COUNT`] is a constant,
+                // so a branch for it would be a dead one — and the bar needs a
+                // centre and two flanks under either body anyway.
+                const { assert!(BUTTON_COUNT > 1) };
+                let outer = (body_w / 2.0 - UNIFIED_PAD - UNIFIED_SLOT_W / 2.0).max(0.0);
+                let step = 2.0 * outer / (BUTTON_COUNT - 1) as f32;
+                -outer + step * i as f32
+            }
+        }
+    }
+
+    /// Button `i`'s centre on the settled bar.
+    pub fn settled_centre(self, i: usize) -> f32 {
+        self.centre(self.bar_width(), 1.0, i)
+    }
+
+    /// Button `i`'s hit region: **a slab, not a circle**. Full bar height, and
+    /// end to end across the bar, so nothing between two buttons is a dead zone
+    /// the hover flickers off in.
+    ///
+    /// Under Islands that means the island plus half the desktop either side.
+    /// Under Unified the slots already abut, so each is exactly its own region.
+    /// Either way the outer ends stop at the last button: past it is the end
+    /// padding, which is inert — it holds the pill expanded with nothing lit.
+    /// The one difference the style makes is what a click there does *not* do:
+    /// bare desktop passes it through, a body swallows it.
+    pub fn slab(self, i: usize) -> (f32, f32) {
+        let c = self.settled_centre(i);
+        let half = self.button_w(i) / 2.0;
+        match self {
+            BodyStyle::Islands => {
+                let lo = if i == 0 { 0.0 } else { BAR_GAP / 2.0 };
+                let hi = if i + 1 == BUTTON_COUNT {
+                    0.0
+                } else {
+                    BAR_GAP / 2.0
+                };
+                (c - half - lo, c + half + hi)
+            }
+            BodyStyle::Unified => (c - half, c + half),
+        }
+    }
+
+    /// Which button `(x, y)` — an offset from the pill's centre, in logical
+    /// pixels — is over, disregarding whether it is live.
+    ///
+    /// The vertical half is what "full bar height" actually means, and it is
+    /// checked rather than assumed: until #46 the window *was* the bar's height
+    /// and there was nowhere else to be, but the envelope now holds a label
+    /// above the pill, and a cursor up there is over the window without being
+    /// over a button.
+    fn slab_at(self, x: f32, y: f32) -> Option<usize> {
+        if y.abs() > BAR_H / 2.0 {
+            return None;
+        }
+        (0..BUTTON_COUNT).find(|&i| {
+            let (lo, hi) = self.slab(i);
+            x >= lo && x < hi
+        })
+    }
 }
 
 // --- The click-started pill ---------------------------------------------
@@ -400,8 +502,11 @@ pub enum PillMode {
     Hidden,
     /// Resident and idle: the nub.
     Idle,
-    /// Resident and hovered.
-    Expanded,
+    /// Resident and hovered. `style` rides on the mode exactly as
+    /// [`Origin`] does on `Recording`, and for the same reason: it decides
+    /// presentation and nothing else, so every frame's geometry falls out of
+    /// the mode alone and no signature grows a second parameter to carry it.
+    Expanded { style: BodyStyle },
     /// Live capture: the adapter animates bars from the ring buffer.
     Recording { origin: Origin },
     /// Worker running: the bars fall flat over the handoff, then hold there
@@ -430,7 +535,7 @@ impl PillMode {
     /// clickable without being the bar, and everything derived from the bar's
     /// list — slabs, hover, the label's names — has to follow this one.
     pub fn shows_bar(self) -> bool {
-        self == PillMode::Expanded
+        matches!(self, PillMode::Expanded { .. })
     }
 
     /// Whether this mode carries cancel and confirm. **Recording only**: they
@@ -500,6 +605,10 @@ pub struct Pill {
     /// it is the same fact: with nothing recorded, Copy is disabled rather than
     /// silently no-op'ing.
     has_history: bool,
+    /// Which body the expanded pill wears. Fed by the adapter from config, at
+    /// launch and on every reload, exactly as presence is: it is a setting, not
+    /// something the core could work out.
+    body_style: BodyStyle,
 }
 
 impl Pill {
@@ -516,7 +625,16 @@ impl Pill {
             shown: false,
             mode: None,
             has_history: false,
+            body_style: BodyStyle::default(),
         }
+    }
+
+    /// Tell the core which body the expanded pill wears. Emits commands,
+    /// unlike [`Self::set_has_history`]: the style is part of `Expanded`, so
+    /// changing it while the bar is up is a new mode to hand over.
+    pub fn set_body_style(&mut self, style: BodyStyle) -> Vec<Command> {
+        self.body_style = style;
+        self.settle()
     }
 
     /// Tell the core whether anything has ever been transcribed. Emits no
@@ -563,7 +681,7 @@ impl Pill {
         if !self.showing_bar() {
             return None;
         }
-        slab_at(x, y).filter(|&i| self.enabled(i))
+        self.body_style.slab_at(x, y).filter(|&i| self.enabled(i))
     }
 
     /// What clicking at `(x, y)` does — the one question the adapter asks, so
@@ -627,7 +745,9 @@ impl Pill {
             Activity::None => match self.presence {
                 Presence::Off | Presence::Suppressed => PillMode::Hidden,
                 Presence::Resident { expanded: false } => PillMode::Idle,
-                Presence::Resident { expanded: true } => PillMode::Expanded,
+                Presence::Resident { expanded: true } => PillMode::Expanded {
+                    style: self.body_style,
+                },
             },
         }
     }
@@ -670,6 +790,8 @@ impl Pill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::pill::bodies::{ISLANDS, UNIFIED};
 
     fn t(ms: u64) -> Instant {
         static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -719,7 +841,7 @@ mod tests {
             (
                 Presence::Resident { expanded: true },
                 SessionActivity::None,
-                Some(PillMode::Expanded),
+                Some(ISLANDS),
             ),
             // Recording, from each presence.
             (
@@ -1176,7 +1298,7 @@ mod tests {
     /// written down twice.
     #[test]
     fn the_bar_derives_the_settled_islands_from_its_button_list() {
-        assert_eq!(bar_width(), 118.0);
+        assert_eq!(BodyStyle::Islands.bar_width(), 118.0);
         let islands: Vec<(f32, f32)> = (0..BUTTONS.len())
             .map(|i| {
                 let c = island_centre(i);
@@ -1196,14 +1318,173 @@ mod tests {
     /// side, and the ends stop at the island.
     #[test]
     fn the_slabs_cover_the_bar_end_to_end() {
-        assert_eq!(slab(0), (-59.0, -25.5));
-        assert_eq!(slab(1), (-25.5, 25.5));
-        assert_eq!(slab(2), (25.5, 59.0));
+        let islands = BodyStyle::Islands;
+        assert_eq!(islands.slab(0), (-59.0, -25.5));
+        assert_eq!(islands.slab(1), (-25.5, 25.5));
+        assert_eq!(islands.slab(2), (25.5, 59.0));
         // No overlaps and no seams: every point between the ends belongs to
         // exactly one button.
         for i in 1..BUTTONS.len() {
-            assert_eq!(slab(i - 1).1, slab(i).0);
+            assert_eq!(islands.slab(i - 1).1, islands.slab(i).0);
         }
+    }
+
+    /// The unified body, as the ticket states it: **104x32, three uniform 32
+    /// slots**, and a glyph box that is the bar's own 22.
+    ///
+    /// The sum is what has to keep adding up, so it is written as one:
+    /// `4 + 32 + 32 + 32 + 4 = 104`.
+    #[test]
+    fn the_unified_body_is_three_uniform_slots_in_one_body() {
+        let unified = BodyStyle::Unified;
+        assert_eq!(
+            UNIFIED_PAD + BUTTON_COUNT as f32 * UNIFIED_SLOT_W + UNIFIED_PAD,
+            unified.bar_width()
+        );
+        assert_eq!(unified.bar_width(), 104.0);
+        assert_eq!(UNIFIED_SLOT_W, 32.0);
+        // The glyph box is the bar's, unchanged: the style is about the body,
+        // not about the marks in it.
+        assert_eq!(GLYPH_BOX, 22.0);
+        // Three equals. Not one number written three times — the widths are
+        // asked per button, and Dictate is asked with the rest.
+        let widths: Vec<f32> = (0..BUTTON_COUNT).map(|i| unified.button_w(i)).collect();
+        assert_eq!(widths, vec![32.0; BUTTON_COUNT]);
+        assert_eq!(unified.button_w(CENTRE), unified.button_w(0));
+        // ...where the islands bar marks its centre by being half again wider.
+        assert!(BodyStyle::Islands.button_w(CENTRE) > BodyStyle::Islands.button_w(0));
+        // Evenly spaced, centred, and Dictate under the cursor that opened it.
+        let centres: Vec<f32> = (0..BUTTON_COUNT)
+            .map(|i| unified.settled_centre(i))
+            .collect();
+        assert_eq!(centres, vec![-32.0, 0.0, 32.0]);
+    }
+
+    /// The slots abut, so the whole body between the outer pair belongs to a
+    /// button — and the pad past them is inert, exactly as the bar's end
+    /// padding is.
+    #[test]
+    fn the_unified_slabs_abut_across_the_body() {
+        let unified = BodyStyle::Unified;
+        assert_eq!(unified.slab(0), (-48.0, -16.0));
+        assert_eq!(unified.slab(1), (-16.0, 16.0));
+        assert_eq!(unified.slab(2), (16.0, 48.0));
+        for i in 1..BUTTON_COUNT {
+            assert_eq!(unified.slab(i - 1).1, unified.slab(i).0);
+        }
+        // The outermost slabs stop at their slots, short of the body's edge.
+        let half = unified.bar_width() / 2.0;
+        assert!(unified.slab(0).0 > -half && unified.slab(BUTTON_COUNT - 1).1 < half);
+    }
+
+    /// Mid-fold-out the slots are measured inward from the body's own edge, so
+    /// they stack at the centre on a nub-sized body and separate as it widens —
+    /// the unified reading of "the flankers slide out from behind Dictate".
+    #[test]
+    fn the_unified_slots_separate_as_the_body_widens() {
+        let unified = BodyStyle::Unified;
+        // On the nub there is not even room for one slot: everything is at the
+        // centre, and nothing is drawn off the end of a 36px body.
+        for i in 0..BUTTON_COUNT {
+            assert_eq!(unified.centre(crate::pill::geom::NUB_W, 1.0, i), 0.0);
+        }
+        // And it is monotone the whole way out, at every button.
+        let mut prev = vec![0.0_f32; BUTTON_COUNT];
+        for step in 0..=100 {
+            let w = crate::pill::geom::NUB_W
+                + (unified.bar_width() - crate::pill::geom::NUB_W) * step as f32 / 100.0;
+            for (i, was) in prev.iter_mut().enumerate() {
+                let c = unified.centre(w, 1.0, i);
+                assert!(c.abs() >= was.abs(), "slot {i} came back in at width {w}");
+                assert!(c.abs() <= unified.settled_centre(i).abs() + 1e-3);
+                *was = c;
+            }
+        }
+        assert_eq!(prev, vec![-32.0, 0.0, 32.0]);
+    }
+
+    /// The bar under each body: same buttons, same actions, and the same rule
+    /// about what is between them. Only the numbers differ, because only the
+    /// body does.
+    #[test]
+    fn switching_the_body_changes_nothing_about_what_the_bar_can_do() {
+        for style in [BodyStyle::Islands, BodyStyle::Unified] {
+            let mut p = expanded();
+            p.set_body_style(style);
+            assert!(p.showing_bar(), "{style:?}");
+            // Every button is reachable, at its own centre, in the list's own
+            // order — which is the whole of "same buttons, same actions".
+            let actions: Vec<Option<Action>> = (0..BUTTON_COUNT)
+                .map(|i| p.action_at(style.settled_centre(i), 0.0))
+                .collect();
+            assert_eq!(
+                actions,
+                vec![
+                    Some(Action::Copy),
+                    Some(Action::Dictate),
+                    Some(Action::Settings)
+                ],
+                "{style:?}"
+            );
+            // Nothing between two buttons is a dead zone...
+            for i in 1..BUTTON_COUNT {
+                let seam = style.slab(i).0;
+                assert!(
+                    p.action_at(seam - 0.5, 0.0).is_some(),
+                    "{style:?} at {seam}"
+                );
+                assert!(
+                    p.action_at(seam + 0.5, 0.0).is_some(),
+                    "{style:?} at {seam}"
+                );
+            }
+            // ...the end padding is inert, whether it is bare desktop or the
+            // body's own last few pixels.
+            //
+            // The one place the two bodies genuinely differ, and it is here
+            // rather than hidden: no button is hit either way, but under
+            // islands the click lands on the desktop and reaches the app
+            // below, where a unified body swallows it. That is what one body
+            // *is* — the click-started pill's own pad has done the same since
+            // #47 — and it is not something the bar can do or stop doing.
+            for x in [style.slab(0).0 - 0.5, style.slab(BUTTON_COUNT - 1).1] {
+                assert_eq!(p.action_at(x, 0.0), None, "{style:?} at {x}");
+            }
+            // ...the label's band above is not a button...
+            assert_eq!(p.action_at(0.0, -BAR_H), None, "{style:?}");
+            // ...and a disabled Copy is inert rather than merely unclickable.
+            p.set_has_history(false);
+            assert_eq!(p.action_at(style.settled_centre(0), 0.0), None, "{style:?}");
+            assert_eq!(
+                p.action_at(style.settled_centre(CENTRE), 0.0),
+                Some(Action::Dictate),
+                "{style:?}"
+            );
+        }
+    }
+
+    /// The style reaches the adapter on the mode, the way an origin does — so
+    /// a save while the bar is up hands over a new `Expanded` rather than
+    /// leaving the wrong body on screen until the cursor moves.
+    #[test]
+    fn the_body_style_rides_on_the_expanded_mode() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: true });
+        assert_eq!(
+            p.set_body_style(BodyStyle::Unified),
+            vec![Command::SetMode(UNIFIED)]
+        );
+        // Idempotent, like every other setter here: a reload that changed
+        // nothing is not a reason to redraw.
+        assert_eq!(p.set_body_style(BodyStyle::Unified), vec![]);
+        assert_eq!(
+            p.set_body_style(BodyStyle::Islands),
+            vec![Command::SetMode(ISLANDS)]
+        );
+        // And with no bar on screen it is a setting nobody is looking at: the
+        // nub is the nub under either body.
+        p.set_presence(Presence::Resident { expanded: false });
+        assert_eq!(p.set_body_style(BodyStyle::Unified), vec![]);
     }
 
     /// A pill with buttons up, and something to copy.
@@ -1372,7 +1653,9 @@ mod tests {
         assert!(click.shows_buttons());
         assert!(click.shows_check() && !click.shows_bar());
         // And the bar is the bar: clickable, but never a check.
-        assert!(PillMode::Expanded.shows_bar() && !PillMode::Expanded.shows_check());
+        for bar in [ISLANDS, UNIFIED] {
+            assert!(bar.shows_bar() && !bar.shows_check(), "{bar:?}");
+        }
     }
 
     /// Cancel and confirm, at their centres and across the gap that separates

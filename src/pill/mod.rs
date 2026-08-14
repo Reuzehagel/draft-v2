@@ -33,3 +33,31 @@ pub mod window;
 /// a reason to move the pill.
 pub const PILL_BOTTOM_MARGIN: u32 = 20;
 pub const BAR_COUNT: usize = 7;
+
+/// What every test and preview that draws the expanded bar needs to name a
+/// body: the two modes, and the style to hand the renderer beside one.
+///
+/// Shared rather than repeated per module because the fallback below is a
+/// *test* convenience and must not be mistaken for the adapter's answer. The
+/// real adapter reads the style off config, and has to: a bar collapsing to the
+/// nub is `Idle` with buttons still drawn, so a mode is not always something a
+/// style can be read from. Here every drawing is settled, so it is.
+#[cfg(test)]
+pub mod bodies {
+    use crate::pill::core::{BodyStyle, PillMode};
+
+    pub const ISLANDS: PillMode = PillMode::Expanded {
+        style: BodyStyle::Islands,
+    };
+    pub const UNIFIED: PillMode = PillMode::Expanded {
+        style: BodyStyle::Unified,
+    };
+
+    /// The style `mode` is drawn in, for a mode that has settled.
+    pub fn style_of(mode: PillMode) -> BodyStyle {
+        match mode {
+            PillMode::Expanded { style } => style,
+            _ => BodyStyle::Islands,
+        }
+    }
+}
