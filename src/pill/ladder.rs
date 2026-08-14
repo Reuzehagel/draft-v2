@@ -10,14 +10,14 @@
 //
 // Five rungs, and the order between them is the whole design:
 //
-//   Wait      — nothing to look for: the pill is off screen, the display is
-//               off, or the session is locked. No timer at all.
-//   Animating — a frame is due; 33 ms is the pill's 30 Hz.
-//   Near      — the cursor is close enough to arrive on the pill within a
-//               poll or two; 50 ms, which is what hover used to cost always.
-//   Far       — the cursor is somewhere else entirely; 250 ms.
-//   Watching  — the pill is off screen but Draft is still watching for the
-//               fullscreen app that took it there to go away; 1 s.
+//   Wait       — nothing to look for: the pill is off screen, the display is
+//                off, or the session is locked. No timer at all.
+//   Animating  — a frame is due; 33 ms is the pill's 30 Hz.
+//   Near       — the cursor is close enough to arrive on the pill within a
+//                poll or two; 50 ms, which is what hover used to cost always.
+//   Far        — the cursor is somewhere else entirely; 250 ms.
+//   Suppressed — the pill is off screen behind a fullscreen app, and only the
+//                fullscreen watcher's own backstop can see it come back; 1 s.
 //
 // The periods are Microsoft's own list — "you should use timer periods of 50,
 // 100, 250, 500, and 1,000 ms" (Windows Timer Coalescing whitepaper) — with
@@ -36,8 +36,6 @@
 // exists: the pill is behind a game, which is where battery actually matters.
 
 use std::time::Duration;
-
-use crate::pill::monitor::Rect;
 
 /// How far outside the pill's window a cursor still counts as **near**, in
 /// logical pixels.
@@ -62,7 +60,7 @@ pub enum Rung {
     Far,
     /// The pill is off screen behind a fullscreen app, and the only thing that
     /// will ever notice it leaving is the watcher's own backstop.
-    Watching,
+    Suppressed,
 }
 
 impl Rung {
@@ -73,13 +71,13 @@ impl Rung {
             Rung::Animating => Some(Duration::from_millis(33)),
             Rung::Near => Some(Duration::from_millis(50)),
             Rung::Far => Some(Duration::from_millis(250)),
-            Rung::Watching => Some(crate::pill::fullscreen::POLL_INTERVAL),
+            Rung::Suppressed => Some(crate::pill::fullscreen::POLL_INTERVAL),
         }
     }
 }
 
-/// What the ladder is decided from. Four booleans, gathered by the adapter
-/// because only it can know any of them.
+/// What the ladder is decided from. Five facts, gathered by the adapter because
+/// only it can know any of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Signals {
     /// Whether anyone is looking: the display is on and the session unlocked.
@@ -95,7 +93,7 @@ pub struct Signals {
     pub near: bool,
     /// Whether the fullscreen watcher still has something to look for: the pill
     /// is suppressed, and no event will report the app leaving fullscreen.
-    pub watching: bool,
+    pub suppressed: bool,
 }
 
 /// The rung these signals put the loop on.
@@ -112,8 +110,8 @@ pub fn rung(s: Signals) -> Rung {
         return Rung::Animating;
     }
     if !s.reachable {
-        return if s.watching {
-            Rung::Watching
+        return if s.suppressed {
+            Rung::Suppressed
         } else {
             Rung::Wait
         };
@@ -123,16 +121,6 @@ pub fn rung(s: Signals) -> Rung {
     } else {
         Rung::Far
     }
-}
-
-/// Whether `cursor` is inside `rect` grown by `band` on every side. Physical
-/// virtual-screen pixels throughout — `GetCursorPos` and the window's placement
-/// are both in that space.
-pub fn near(rect: Rect, cursor: (i32, i32), band: i32) -> bool {
-    cursor.0 >= rect.left - band
-        && cursor.0 < rect.right + band
-        && cursor.1 >= rect.top - band
-        && cursor.1 < rect.bottom + band
 }
 
 #[cfg(test)]
@@ -176,7 +164,7 @@ mod tests {
                 animating: true,
                 reachable: true,
                 near,
-                watching: false,
+                suppressed: false,
             };
             assert_eq!(rung(s), Rung::Animating, "near {near}");
             assert_eq!(rung(s).period(), Some(Duration::from_millis(33)));
@@ -193,7 +181,7 @@ mod tests {
             animating: true,
             reachable: false,
             near: false,
-            watching: false,
+            suppressed: false,
         };
         assert_eq!(rung(s), Rung::Animating);
     }
@@ -206,17 +194,17 @@ mod tests {
         let s = Signals {
             awake: true,
             reachable: false,
-            watching: true,
+            suppressed: true,
             ..Default::default()
         };
-        assert_eq!(rung(s), Rung::Watching);
+        assert_eq!(rung(s), Rung::Suppressed);
         assert_eq!(
             rung(s).period(),
             Some(crate::pill::fullscreen::POLL_INTERVAL)
         );
         assert_eq!(
             rung(Signals {
-                watching: false,
+                suppressed: false,
                 ..s
             }),
             Rung::Wait
@@ -228,7 +216,7 @@ mod tests {
     /// either — the unlock and the display coming back are both events.
     #[test]
     fn a_dark_or_locked_session_outranks_everything() {
-        for (animating, reachable, near, watching) in [
+        for (animating, reachable, near, suppressed) in [
             (false, false, false, false),
             (true, true, true, true),
             (false, true, true, false),
@@ -239,12 +227,12 @@ mod tests {
                 animating,
                 reachable,
                 near,
-                watching,
+                suppressed,
             };
             assert_eq!(
                 rung(s),
                 Rung::Wait,
-                "{animating} {reachable} {near} {watching}"
+                "{animating} {reachable} {near} {suppressed}"
             );
         }
     }
@@ -254,31 +242,7 @@ mod tests {
     #[test]
     fn the_ladder_only_ever_slows_down() {
         let periods =
-            [Rung::Animating, Rung::Near, Rung::Far, Rung::Watching].map(|r| r.period().unwrap());
+            [Rung::Animating, Rung::Near, Rung::Far, Rung::Suppressed].map(|r| r.period().unwrap());
         assert!(periods.windows(2).all(|w| w[0] < w[1]), "{periods:?}");
-    }
-
-    #[test]
-    fn the_near_band_grows_the_pills_rect_on_every_side() {
-        let rect = Rect {
-            left: 100,
-            top: 100,
-            right: 200,
-            bottom: 200,
-        };
-        // Inside the rect itself.
-        assert!(near(rect, (150, 150), 10));
-        // Inside the band, on each side.
-        assert!(near(rect, (92, 150), 10));
-        assert!(near(rect, (208, 150), 10));
-        assert!(near(rect, (150, 92), 10));
-        assert!(near(rect, (150, 208), 10));
-        // Outside it, on each side.
-        assert!(!near(rect, (89, 150), 10));
-        assert!(!near(rect, (210, 150), 10));
-        assert!(!near(rect, (150, 89), 10));
-        assert!(!near(rect, (150, 210), 10));
-        // A cursor on another monitor entirely.
-        assert!(!near(rect, (-1900, 400), 180));
     }
 }

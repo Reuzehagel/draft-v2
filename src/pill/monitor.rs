@@ -63,6 +63,26 @@ impl Rect {
     pub fn height(&self) -> i32 {
         self.bottom - self.top
     }
+
+    /// Whether `point` is inside, right and bottom edges exclusive — the
+    /// half-open convention every Win32 rect is stated in.
+    ///
+    /// Both the hover reach and the proximity ladder's near band are this test
+    /// over a grown rect, so it is stated once here rather than spelled out at
+    /// each: four comparisons written twice is four chances to flip one.
+    pub fn contains(&self, point: (i32, i32)) -> bool {
+        point.0 >= self.left && point.0 < self.right && point.1 >= self.top && point.1 < self.bottom
+    }
+
+    /// The same rect with `band` added on every side.
+    pub fn grown(&self, band: i32) -> Rect {
+        Rect {
+            left: self.left - band,
+            top: self.top - band,
+            right: self.right + band,
+            bottom: self.bottom + band,
+        }
+    }
 }
 
 /// One connected monitor, as the policy needs to see it.
@@ -649,6 +669,35 @@ mod tests {
 
     const LAPTOP: MonitorId = 1;
     const EXTERNAL: MonitorId = 2;
+
+    /// Half-open, and grown on every side — the shape both the hover reach and
+    /// the proximity ladder's near band are stated as.
+    #[test]
+    fn a_rect_contains_its_own_pixels_and_a_grown_one_contains_the_band_too() {
+        let r = Rect {
+            left: 100,
+            top: 100,
+            right: 200,
+            bottom: 200,
+        };
+        assert!(r.contains((100, 100)), "the top-left pixel is inside");
+        assert!(r.contains((199, 199)));
+        // Right and bottom are exclusive.
+        assert!(!r.contains((200, 150)));
+        assert!(!r.contains((150, 200)));
+        assert!(!r.contains((99, 150)));
+        assert!(!r.contains((150, 99)));
+
+        let grown = r.grown(10);
+        for edge in [(90, 150), (209, 150), (150, 90), (150, 209)] {
+            assert!(grown.contains(edge), "{edge:?} is in the band");
+        }
+        for outside in [(89, 150), (210, 150), (150, 89), (150, 210)] {
+            assert!(!grown.contains(outside), "{outside:?} is past the band");
+        }
+        // A cursor on another monitor entirely.
+        assert!(!r.grown(180).contains((-1900, 400)));
+    }
 
     /// A 150% laptop panel left of a 100% external — the ordinary Windows
     /// mixed-DPI desk, where every crossing is also a scale change.

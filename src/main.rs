@@ -144,11 +144,7 @@ fn main() -> Result<()> {
         // takes. Nothing can be placed before there is an event loop anyway.
         displays: Displays::default(),
         hook_rx,
-        // Both true until something says otherwise: a display that is off, or
-        // a session that is locked, is a *change* Windows tells us about, and
-        // nothing reports the ordinary case at launch.
-        display_on: true,
-        locked: false,
+        attention: Attention::default(),
         near: false,
         transcriber,
         model_tx,
@@ -263,12 +259,8 @@ struct App {
     /// subclass. The home monitor consumes the display ones; the proximity
     /// ladder consumes display power and session lock.
     hook_rx: crossbeam_channel::Receiver<HookEvent>,
-    /// Whether the session's display is on, as the pill hook last said. Off
-    /// takes the ladder to `Wait`: the documented instruction for a dark
-    /// display is to stop rendering, and nobody can hover what they can't see.
-    display_on: bool,
-    /// Whether the session is locked, likewise.
-    locked: bool,
+    /// Whether anyone is looking at the screen, as the pill hook last said.
+    attention: Attention,
     /// Whether the cursor is within [`ladder::NEAR_BAND`] of the pill, as
     /// [`App::poll_hover`] last saw it. The ladder's own signal, beside the
     /// `hovered` the same cursor read produces.
@@ -363,6 +355,14 @@ impl App {
                 // beside opening a microphone — this is not the expensive part.
                 pill::core::Command::Create => {
                     self.rederive_home();
+                    // A window that does not exist yet has no hook, so the two
+                    // latched facts about who is looking belong to a window
+                    // that is gone — and their other edge was delivered to it.
+                    // Reset before the create, so the hook's own opening
+                    // statement about display power lands on a clean slate.
+                    if !self.pill.has_window() {
+                        self.attention.at_a_new_window();
+                    }
                     self.pill.create(el);
                 }
                 pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
@@ -836,12 +836,12 @@ impl ApplicationHandler<Wake> for App {
                 // true, not only on the message that said so.
                 HookEvent::DisplayPower { on } => {
                     tracing::info!(on, "session display power");
-                    self.display_on = on;
+                    self.attention.display_on = on;
                     on
                 }
                 HookEvent::SessionLock { locked } => {
                     tracing::info!(locked, "session lock");
-                    self.locked = locked;
+                    self.attention.locked = locked;
                     !locked
                 }
                 HookEvent::SessionReconnected => {
@@ -897,7 +897,7 @@ impl ApplicationHandler<Wake> for App {
         // is drained because something woke us; this is the only reason to ask
         // to be woken again.
         let rung = ladder::rung(ladder::Signals {
-            awake: self.display_on && !self.locked,
+            awake: self.attention.looking(),
             // The flash rides on the frame cadence rather than a deadline of
             // its own, because it *has* no frames: a Done is a still image once
             // the handoff has fallen, and the loop still has to be awake for
@@ -905,7 +905,7 @@ impl ApplicationHandler<Wake> for App {
             animating: animating || self.pill_core.lingering(),
             reachable: self.pill.is_active(),
             near: self.near,
-            watching: self.cfg.pill.resident && self.fullscreen.suppressed(),
+            suppressed: self.cfg.pill.resident && self.fullscreen.suppressed(),
         });
         el.set_control_flow(match rung.period() {
             Some(period) => ControlFlow::WaitUntil(now + period),
@@ -1324,6 +1324,51 @@ struct PillAdapter {
     body_style: pill::core::BodyStyle,
 }
 
+/// Whether anyone is looking at the screen: the two facts that take the
+/// proximity ladder to `Wait` however busy the pill is.
+///
+/// Both arrive only as **hook events**, and the hook lives and dies with the
+/// pill window — so these are latched, and a window built without them would
+/// inherit whatever the last one heard. That is what [`Self::at_a_new_window`]
+/// is for: display power re-announces itself the moment the hook registers, and
+/// a session can only start in front of someone, so the honest assumption at a
+/// new window is that somebody is there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Attention {
+    display_on: bool,
+    locked: bool,
+}
+
+impl Default for Attention {
+    /// Someone is looking, until Windows says otherwise: a display going off
+    /// and a session locking are both *changes* it reports, and nothing
+    /// announces the ordinary case at launch.
+    fn default() -> Self {
+        Self {
+            display_on: true,
+            locked: false,
+        }
+    }
+}
+
+impl Attention {
+    fn looking(self) -> bool {
+        self.display_on && !self.locked
+    }
+
+    /// Forget what the last window's hook heard.
+    ///
+    /// Without this a lock (or a display-off) that outlives its window latches
+    /// forever: the unlock is delivered to an HWND that no longer exists, and
+    /// the ladder waits for a message nobody will ever send. `display_on` is
+    /// then corrected within a message or two — registering for a power setting
+    /// delivers its current value straight away — and the lock is not, which is
+    /// why the reset is to *looking* rather than to a guess.
+    fn at_a_new_window(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// What to do with the window once the motion taking it off screen has run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Teardown {
@@ -1458,10 +1503,7 @@ impl PillAdapter {
         } else {
             self.reach(r, pill::geom::NUB_W, pill::geom::NUB_H)
         };
-        cursor.0 >= reach.left
-            && cursor.0 < reach.right
-            && cursor.1 >= reach.top
-            && cursor.1 < reach.bottom
+        reach.contains(cursor)
     }
 
     /// Whether the cursor is close enough that the pill should be watching for
@@ -1477,7 +1519,8 @@ impl PillAdapter {
             return false;
         };
         let scale = self.window.as_ref().map_or(1.0, |pw| pw.scale());
-        ladder::near(r, cursor, (ladder::NEAR_BAND * scale).round() as i32)
+        r.grown((ladder::NEAR_BAND * scale).round() as i32)
+            .contains(cursor)
     }
 
     /// A `w` x `h` logical shape centred on the pill, grown by [`HOVER_REACH`]
