@@ -118,10 +118,15 @@ pub fn build(status: &Status) -> Result<Tray> {
     })
 }
 
-pub fn menu_event_receiver() -> crossbeam_channel::Receiver<MenuEvent> {
+/// The menu's events, as a channel the app loop drains.
+///
+/// The `waker` is what makes that draining happen: the loop rests at
+/// `ControlFlow::Wait`, and a channel send is not a message it can wake for.
+pub fn menu_event_receiver(waker: crate::wake::Waker) -> crossbeam_channel::Receiver<MenuEvent> {
     let (tx, rx) = crossbeam_channel::unbounded();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         let _ = tx.send(e);
+        waker.wake();
     }));
     rx
 }

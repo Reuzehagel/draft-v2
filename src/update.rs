@@ -25,7 +25,7 @@ pub struct UpdateInfo {
 /// Start the check. The returned receiver yields at most one `UpdateInfo`, and
 /// only when a newer release exists; every other outcome (dormant, offline,
 /// already current) leaves it empty forever.
-pub fn spawn_check() -> crossbeam_channel::Receiver<UpdateInfo> {
+pub fn spawn_check(waker: crate::wake::Waker) -> crossbeam_channel::Receiver<UpdateInfo> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     if RELEASES_URL.is_empty() {
         return rx;
@@ -39,6 +39,9 @@ pub fn spawn_check() -> crossbeam_channel::Receiver<UpdateInfo> {
             );
             // A failed send only means the app is shutting down.
             let _ = tx.send(info);
+            // The loop is asleep with no timer armed, so the tooltip would
+            // otherwise name the new version at whatever the user next did.
+            waker.wake();
         }
         Ok(None) => tracing::debug!("update check: already on the latest release"),
         Err(e) => tracing::debug!(error = %e, "update check failed (silently ignored)"),

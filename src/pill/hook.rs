@@ -25,14 +25,14 @@
 // to the original wndproc unchanged.
 //
 // The home monitor consumes the two display messages (#43): both re-derive it,
-// and WM_DISPLAYCHANGE breaks its idle-only latch to do so. The fullscreen
-// watcher and the wakeup ladder hang off the rest in turn.
+// and WM_DISPLAYCHANGE breaks its idle-only latch to do so. The proximity
+// ladder (#49) consumes the other two: display-off and session-lock are what
+// take the loop to `ControlFlow::Wait` with no timer armed at all.
 //
-// The hook lives and dies with the pill window, so today — where the window
-// only exists for the length of a session — no event is surfaced between
-// dictations. That is the shape #40 asked for, and residency (#42) makes the
-// window permanent, which is what the wakeup ladder (#49) needs to hear
-// display-off and lock while nothing is happening.
+// The hook lives and dies with the pill window, so a session-only pill surfaces
+// nothing between dictations. Residency (#42) makes the window permanent, which
+// is what lets the ladder hear display-off and lock while nothing is happening
+// — the state it most needs to know about.
 
 /// A window message the app loop needs to know about, surfaced from the pill's
 /// wndproc. Deliberately plain data: no HWND, no LPARAM, nothing the receiver

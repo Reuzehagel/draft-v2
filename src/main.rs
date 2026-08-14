@@ -20,6 +20,7 @@ mod settings_ui;
 mod single_instance;
 mod tray;
 mod update;
+mod wake;
 
 // The shared core lives in the library so `draft-cli` can reach it too. Bound
 // into the crate root under their old names, so `crate::config` and friends
@@ -37,15 +38,15 @@ use crate::pill::core::{Pill, PillMode};
 use crate::pill::geom::{Hover, Motion};
 use crate::pill::hook::HookEvent;
 use crate::pill::label::Label;
+use crate::pill::ladder;
 use crate::pill::monitor::{Displays, Home, HomeMonitor};
 use crate::session::{Command, Session, SessionKind};
 use crate::transcribe::Transcriber;
+use crate::wake::{Wake, Waker};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
-
-const PILL_FRAME_RATE_HZ: u64 = 30;
 
 /// How far outside the nub a cursor counts as having reached it, in logical
 /// pixels. The nub is 36x10 and deliberately small; asking the cursor to land
@@ -55,6 +56,13 @@ const HOVER_REACH: f32 = 8.0;
 
 /// Release the on-device model from RAM after this much dictation inactivity.
 const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How often the reaper thread asks whether the model has gone idle.
+///
+/// A minute rather than a loop iteration: this used to ride the 20 Hz idle
+/// tick, and that tick is gone (#49). Asking 1200x less often costs at most a
+/// minute of resident model past the timeout, which nobody can perceive.
+const MODEL_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -78,13 +86,23 @@ fn main() -> Result<()> {
     let (cfg, first_run) = config::Config::load_with_first_run()?;
     tracing::info!(?cfg, first_run, "config loaded");
 
-    let update_rx = update::spawn_check();
+    // The event loop is built before anything that talks to it, because every
+    // one of those producers needs a [`Waker`] off its proxy. The loop rests at
+    // `ControlFlow::Wait` with no timer armed (#49), so a channel send that
+    // nobody posts a message for would sit unread until the next thing the user
+    // happened to do.
+    let event_loop = EventLoop::<Wake>::with_user_event().build()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let waker = Waker::new(event_loop.create_proxy());
+
+    let update_rx = update::spawn_check(waker.clone());
 
     let tray = tray::build(&tray_status(&cfg, None, !history::is_empty()))?;
-    let menu_rx = tray::menu_event_receiver();
+    let menu_rx = tray::menu_event_receiver(waker.clone());
 
     let command_spec = cfg.push_to_command.then(|| cfg.command_hotkey.clone());
-    let (hotkey_handle, hotkey_rx) = hotkey::register(&cfg.hotkey, command_spec.as_deref())?;
+    let (hotkey_handle, hotkey_rx) =
+        hotkey::register(&cfg.hotkey, command_spec.as_deref(), &waker)?;
     tracing::info!(hotkey = %cfg.hotkey, command = ?command_spec, "hotkeys registered");
 
     let fsm_mode = fsm_mode_from_config(&cfg);
@@ -97,10 +115,10 @@ fn main() -> Result<()> {
     let mut session = Session::new(fsm_mode);
     session.set_transcriber_available(transcriber.is_some());
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let model_tx = spawn_model_reaper(transcriber.clone());
 
     let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
+    let (settings_tx, settings_rx) = crossbeam_channel::unbounded();
     // Owned here rather than by the window, so the pill can be created and
     // destroyed under a receiver that outlives every one of them.
     let (hook_tx, hook_rx) = crossbeam_channel::unbounded();
@@ -126,13 +144,19 @@ fn main() -> Result<()> {
         // takes. Nothing can be placed before there is an event loop anyway.
         displays: Displays::default(),
         hook_rx,
+        attention: Attention::default(),
+        near: false,
         transcriber,
+        model_tx,
         cfg,
-        settings_child: None,
+        settings_running: false,
+        settings_tx,
+        settings_rx,
         outcome_tx,
         outcome_rx,
         update_rx,
         update_available: None,
+        waker,
     };
     if first_run {
         tracing::info!("first run detected; opening settings");
@@ -232,19 +256,39 @@ struct App {
     /// exactly the idle cost residency exists to avoid.
     displays: Displays,
     /// The messages winit doesn't surface, posted by the pill window's wndproc
-    /// subclass. The home monitor consumes the display ones; the wakeup ladder
-    /// (#49) is the remaining consumer.
+    /// subclass. The home monitor consumes the display ones; the proximity
+    /// ladder consumes display power and session lock.
     hook_rx: crossbeam_channel::Receiver<HookEvent>,
+    /// Whether anyone is looking at the screen, as the pill hook last said.
+    attention: Attention,
+    /// Whether the cursor is within [`ladder::NEAR_BAND`] of the pill, as
+    /// [`App::poll_hover`] last saw it. The ladder's own signal, beside the
+    /// `hovered` the same cursor read produces.
+    near: bool,
     transcriber: Option<Arc<dyn Transcriber>>,
+    /// Hands the reaper thread the transcriber to watch, at launch and on every
+    /// config reload. See [`spawn_model_reaper`].
+    model_tx: crossbeam_channel::Sender<Option<Arc<dyn Transcriber>>>,
     cfg: config::Config,
-    settings_child: Option<std::process::Child>,
-    /// Workers report their outcome here; polled each loop on the UI thread.
+    /// Whether a settings subprocess is up. Set when one is spawned and cleared
+    /// when its waiter thread reports it gone — there is no `try_wait` poll
+    /// left to ask.
+    settings_running: bool,
+    /// Cloned into each settings waiter thread, which sends once the child has
+    /// exited.
+    settings_tx: crossbeam_channel::Sender<()>,
+    settings_rx: crossbeam_channel::Receiver<()>,
+    /// Workers report their outcome here; drained on the UI thread when one of
+    /// them wakes the loop.
     outcome_tx: crossbeam_channel::Sender<(u64, session::Outcome)>,
     outcome_rx: crossbeam_channel::Receiver<(u64, session::Outcome)>,
     /// One-shot: the update check reports here if a newer release exists.
     update_rx: crossbeam_channel::Receiver<update::UpdateInfo>,
     /// Kept so the tooltip still mentions the update after later refreshes.
     update_available: Option<update::UpdateInfo>,
+    /// Handed to every producer that reports over a channel, so the loop can
+    /// rest with no timer armed and still hear them.
+    waker: Waker,
 }
 
 impl App {
@@ -311,6 +355,14 @@ impl App {
                 // beside opening a microphone — this is not the expensive part.
                 pill::core::Command::Create => {
                     self.rederive_home();
+                    // A window that does not exist yet has no hook, so the two
+                    // latched facts about who is looking belong to a window
+                    // that is gone — and their other edge was delivered to it.
+                    // Reset before the create, so the hook's own opening
+                    // statement about display power lands on a clean slate.
+                    if !self.pill.has_window() {
+                        self.attention.at_a_new_window();
+                    }
                     self.pill.create(el);
                 }
                 pill::core::Command::SetMode(mode) => self.pill.set_mode(mode, now),
@@ -333,9 +385,12 @@ impl App {
             // resolve the pill instead of parking it in Processing.
             tracing::warn!("no transcriber configured; skipping paste");
             let _ = self.outcome_tx.send((session_id, session::Outcome::Empty));
+            // Sent from the UI thread, so the loop is awake and will drain it
+            // in the `about_to_wait` this call is already inside.
             return;
         };
         let outcome_tx = self.outcome_tx.clone();
+        let waker = self.waker.clone();
         let append_space = self.cfg.append_trailing_space;
         let restore_clipboard = self.cfg.restore_clipboard;
         let pipeline = postprocess::Pipeline::for_session(&self.cfg);
@@ -366,6 +421,12 @@ impl App {
             // app is shutting down — nothing to recover.
             let report = |o: session::Outcome| {
                 let _ = outcome_tx.send((session_id, o));
+                // The pill is sitting in Processing with a breath running, so
+                // the loop is animating and would notice this within a frame.
+                // Woken anyway: the *last* worker to report is what lets the
+                // pill settle, and a `Failed` that arrives before any pill
+                // exists has nothing animating to carry it at all.
+                waker.wake();
             };
             let started = Instant::now();
             // Attribution rides with the result so history credits whichever
@@ -538,6 +599,46 @@ impl App {
     }
 }
 
+/// Start the thread that frees the on-device model once dictation has been idle
+/// long enough, and return the channel that keeps it pointed at the current
+/// transcriber.
+///
+/// A thread rather than a check on the event loop, since #49: the loop rests
+/// with no timer armed, and a five-minute deadline is not a reason to arm one
+/// 20 times a second. It is also not a reason to arm one *at all* on the loop,
+/// which is what the proximity ladder is for — so the deadline lives where it
+/// can be waited on directly.
+///
+/// The channel does double duty: it delivers a new transcriber after a config
+/// reload, and the timeout on waiting for one is the reaping cadence. So a
+/// reload is heard immediately and the reap costs one wakeup a minute on an
+/// ordinary parked thread, not on the loop's high-resolution timer.
+fn spawn_model_reaper(
+    initial: Option<Arc<dyn Transcriber>>,
+) -> crossbeam_channel::Sender<Option<Arc<dyn Transcriber>>> {
+    let (tx, rx) = crossbeam_channel::unbounded::<Option<Arc<dyn Transcriber>>>();
+    std::thread::spawn(move || {
+        let mut current = initial;
+        loop {
+            match rx.recv_timeout(MODEL_REAP_INTERVAL) {
+                Ok(next) => current = next,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Cheap (try_lock + elapsed), and a no-op for every cloud
+                    // provider. A transcription in flight holds the model lock,
+                    // which is what "not idle" means — that tick is skipped
+                    // rather than stalling anything.
+                    if let Some(t) = current.as_ref() {
+                        t.unload_if_idle(MODEL_IDLE_TIMEOUT);
+                    }
+                }
+                // The app is gone; so is the model.
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+    tx
+}
+
 fn wav_dump_path() -> PathBuf {
     std::env::temp_dir().join("draft-last.wav")
 }
@@ -548,7 +649,12 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
     Ok(())
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Wake> for App {
+    /// A producer said there is something to drain. Deliberately empty: winit
+    /// runs `about_to_wait` before going back to sleep, and that is where every
+    /// channel is read. The wake's whole job was getting us here.
+    fn user_event(&mut self, _el: &ActiveEventLoop, _wake: Wake) {}
+
     /// First point at which a window can be created, so this is where residency
     /// takes effect: the nub is on screen from launch, not from the first
     /// dictation.
@@ -611,8 +717,21 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Drain everything, then decide how long to sleep.
+    ///
+    /// winit runs this before every wait, so it is where all four channels are
+    /// read — and since #49 the loop only gets here because something *put*
+    /// something in one of them (or the ladder's timer expired). Nothing below
+    /// is a poll of a usually-empty channel 20 times a second any more; the
+    /// `try_recv`s are draining what the wake was about.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        self.poll_settings_child(el);
+        // The settings subprocess exiting, reported by its waiter thread.
+        while self.settings_rx.try_recv().is_ok() {
+            tracing::info!("settings subprocess exited; reloading config");
+            self.settings_running = false;
+            self.reload_config(el);
+        }
+
         while let Ok(ev) = self.menu_rx.try_recv() {
             if ev.id == self.tray.menu_ids.quit {
                 tracing::info!("quit requested from tray");
@@ -675,7 +794,13 @@ impl ApplicationHandler for App {
         //
         // Draining is not optional either way; an unread channel would grow for
         // the life of the process. The home monitor (#43) hangs further
-        // behaviour off these, and the wakeup ladder (#49) will in turn.
+        // behaviour off these, and the proximity ladder (#49) hangs the two
+        // that mean "nobody is looking" — which is why they are the *ladder's*
+        // signals rather than a hook of their own.
+        //
+        // These arrive on the UI thread, inside `DispatchMessage`, so the loop
+        // is by definition awake: a window message is exactly what an
+        // indefinite `MsgWaitForMultipleObjectsEx` wakes for. No waker needed.
         while let Ok(ev) = self.hook_rx.try_recv() {
             let repush = match ev {
                 // The one event that overrides the home monitor's idle-only
@@ -704,12 +829,19 @@ impl ApplicationHandler for App {
                 // surface does not reliably survive that. Coming back is cheap;
                 // coming back to an invisible pill is not recoverable without
                 // a dictation.
+                //
+                // Both of these are also the ladder's off switch, which is why
+                // they are latched rather than merely acted on: the loop has to
+                // keep answering "nobody is looking" for as long as that is
+                // true, not only on the message that said so.
                 HookEvent::DisplayPower { on } => {
                     tracing::info!(on, "session display power");
+                    self.attention.display_on = on;
                     on
                 }
                 HookEvent::SessionLock { locked } => {
                     tracing::info!(locked, "session lock");
+                    self.attention.locked = locked;
                     !locked
                 }
                 HookEvent::SessionReconnected => {
@@ -728,12 +860,6 @@ impl ApplicationHandler for App {
             self.refresh_status();
         }
 
-        // Free the on-device model if dictation has been idle long enough.
-        // Cheap (try_lock + elapsed check); a no-op for cloud providers.
-        if let Some(t) = self.transcriber.as_ref() {
-            t.unload_if_idle(MODEL_IDLE_TIMEOUT);
-        }
-
         // Retire the pill once its terminal flash has run its course.
         let now = Instant::now();
         let cmds = self.pill_core.tick(now);
@@ -748,9 +874,9 @@ impl ApplicationHandler for App {
         // that latch reads.
         self.poll_hover(el);
 
-        // Where the pill should be living, on the loop's own cadence. Latched
-        // unless the pill is idle, and free for the policies with no per-poll
-        // signal to read.
+        // Where the pill should be living, on whatever cadence the ladder last
+        // chose. Latched unless the pill is idle, and free for the policies
+        // with no per-poll signal to read.
         self.poll_home(now);
 
         // Has the label's flash run out? The only thing about the pill that
@@ -762,25 +888,44 @@ impl ApplicationHandler for App {
         // none at all — that is what makes residency free: one
         // `UpdateLayeredWindow` when it arrives, and then the system owns the
         // surface until something actually happens.
-        if self.pill.wants_frame(now) {
+        let animating = self.pill.wants_frame(now);
+        if animating {
             self.pill.redraw(now);
-            el.set_control_flow(ControlFlow::WaitUntil(
-                now + Duration::from_millis(1000 / PILL_FRAME_RATE_HZ),
-            ));
-        } else {
-            el.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
         }
+
+        // And the one decision that arms a timer at all. Everything else here
+        // is drained because something woke us; this is the only reason to ask
+        // to be woken again.
+        let rung = ladder::rung(ladder::Signals {
+            awake: self.attention.looking(),
+            // The flash rides on the frame cadence rather than a deadline of
+            // its own, because it *has* no frames: a Done is a still image once
+            // the handoff has fallen, and the loop still has to be awake for
+            // the tick that retires it on time.
+            animating: animating || self.pill_core.lingering(),
+            reachable: self.pill.is_active(),
+            near: self.near,
+            suppressed: self.cfg.pill.resident && self.fullscreen.suppressed(),
+        });
+        el.set_control_flow(match rung.period() {
+            Some(period) => ControlFlow::WaitUntil(now + period),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
 impl App {
+    /// Open the settings window, and arrange to hear about it closing.
+    ///
+    /// The child is *waited on*, by a thread of its own, rather than
+    /// `try_wait`-ed once a loop: the loop no longer runs on a timer, so a poll
+    /// would be a reason to arm one — for the one thing in the app that already
+    /// has a blocking API. The thread costs nothing while the window is open
+    /// and exits with it.
     fn open_settings(&mut self) {
-        if let Some(child) = self.settings_child.as_mut() {
-            // Already running — drop a log line and don't spawn a second.
-            if child.try_wait().ok().flatten().is_none() {
-                tracing::info!("settings window already open");
-                return;
-            }
+        if self.settings_running {
+            tracing::info!("settings window already open");
+            return;
         }
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -790,9 +935,21 @@ impl App {
             }
         };
         match std::process::Command::new(&exe).arg("--settings").spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 tracing::info!(pid = child.id(), "settings subprocess spawned");
-                self.settings_child = Some(child);
+                self.settings_running = true;
+                let tx = self.settings_tx.clone();
+                let waker = self.waker.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = child.wait() {
+                        tracing::error!(error = %e, "settings child wait failed");
+                    }
+                    // Sent either way: a wait that failed still leaves the app
+                    // owing a config reload and a settings window it must be
+                    // willing to open again.
+                    let _ = tx.send(());
+                    waker.wake();
+                });
             }
             Err(e) => tracing::error!(error = %e, "failed to spawn settings subprocess"),
         }
@@ -969,11 +1126,19 @@ impl App {
         // whose cost residency-off and a fullscreen game both have to escape.
         if !self.pill.has_window() || !self.cfg.pill.resident || self.fullscreen.suppressed() {
             self.hovered = false;
+            // Nothing to be near either. Left true, the ladder would keep the
+            // loop at 50 ms over a fullscreen game for as long as the cursor
+            // happened to have stopped near where the pill used to be.
+            self.near = false;
             return;
         }
         let Some(cursor) = pill::monitor::cursor_pos() else {
             return;
         };
+        // Off the same cursor read, because it is the same question asked at
+        // two distances: is the cursor *on* the pill, and is it close enough
+        // that it might be next poll.
+        self.near = self.pill.cursor_near(cursor);
         self.hovered = self.pill.cursor_over(cursor, self.pill_core.showing_bar());
         self.apply_presence(el);
     }
@@ -984,9 +1149,10 @@ impl App {
     ///
     /// Skipped entirely with no window on screen. With residency off and no
     /// session running there is nothing to move, and residency off means *no
-    /// idle work at all* — a `GetForegroundWindow` every 50 ms is exactly the
-    /// cost that promise rules out. The pill that a session then creates is
-    /// still placed by the policy: [`Self::run_pill_commands`] derives ahead of
+    /// idle work at all* — which since #49 is literal: with nothing on screen
+    /// the ladder arms no timer, so this is not reached at all. The pill that
+    /// a session then creates is still placed by the policy:
+    /// [`Self::run_pill_commands`] derives ahead of
     /// every `Create`.
     fn poll_home(&mut self, now: Instant) {
         if !self.pill.has_window() {
@@ -996,24 +1162,6 @@ impl App {
             idle: self.pill.is_idle(now),
         };
         self.derive_home(trigger, now);
-    }
-
-    fn poll_settings_child(&mut self, el: &ActiveEventLoop) {
-        let Some(child) = self.settings_child.as_mut() else {
-            return;
-        };
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                tracing::info!(?status, "settings subprocess exited; reloading config");
-                self.settings_child = None;
-                self.reload_config(el);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "settings child try_wait failed");
-                self.settings_child = None;
-            }
-        }
     }
 
     fn reload_config(&mut self, el: &ActiveEventLoop) {
@@ -1039,7 +1187,7 @@ impl App {
             let command_spec = new_cfg
                 .push_to_command
                 .then(|| new_cfg.command_hotkey.clone());
-            match hotkey::register(&new_cfg.hotkey, command_spec.as_deref()) {
+            match hotkey::register(&new_cfg.hotkey, command_spec.as_deref(), &self.waker) {
                 Ok((handle, rx)) => {
                     self.hotkey_handle = Some(handle);
                     self.hotkey_rx = rx;
@@ -1055,7 +1203,7 @@ impl App {
                         .cfg
                         .push_to_command
                         .then(|| self.cfg.command_hotkey.clone());
-                    match hotkey::register(&self.cfg.hotkey, old_spec.as_deref()) {
+                    match hotkey::register(&self.cfg.hotkey, old_spec.as_deref(), &self.waker) {
                         Ok((handle, rx)) => {
                             self.hotkey_handle = Some(handle);
                             self.hotkey_rx = rx;
@@ -1074,6 +1222,10 @@ impl App {
         self.transcriber = transcribe::build(&new_cfg);
         self.session
             .set_transcriber_available(self.transcriber.is_some());
+        // The reaper is watching the transcriber this one replaces — which may
+        // be a Parakeet still holding its model, and nothing else will ever ask
+        // it to let go.
+        let _ = self.model_tx.send(self.transcriber.clone());
         self.cfg = new_cfg;
         // A new monitor policy takes effect on the next ordinary poll, latch
         // and all: settings closing is not one of the events that may move the
@@ -1170,6 +1322,51 @@ struct PillAdapter {
     /// the Geom cannot carry a style, and a frame mid-morph belongs to no mode
     /// to read one off. Fed from config beside the core's own copy.
     body_style: pill::core::BodyStyle,
+}
+
+/// Whether anyone is looking at the screen: the two facts that take the
+/// proximity ladder to `Wait` however busy the pill is.
+///
+/// Both arrive only as **hook events**, and the hook lives and dies with the
+/// pill window — so these are latched, and a window built without them would
+/// inherit whatever the last one heard. That is what [`Self::at_a_new_window`]
+/// is for: display power re-announces itself the moment the hook registers, and
+/// a session can only start in front of someone, so the honest assumption at a
+/// new window is that somebody is there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Attention {
+    display_on: bool,
+    locked: bool,
+}
+
+impl Default for Attention {
+    /// Someone is looking, until Windows says otherwise: a display going off
+    /// and a session locking are both *changes* it reports, and nothing
+    /// announces the ordinary case at launch.
+    fn default() -> Self {
+        Self {
+            display_on: true,
+            locked: false,
+        }
+    }
+}
+
+impl Attention {
+    fn looking(self) -> bool {
+        self.display_on && !self.locked
+    }
+
+    /// Forget what the last window's hook heard.
+    ///
+    /// Without this a lock (or a display-off) that outlives its window latches
+    /// forever: the unlock is delivered to an HWND that no longer exists, and
+    /// the ladder waits for a message nobody will ever send. `display_on` is
+    /// then corrected within a message or two — registering for a power setting
+    /// delivers its current value straight away — and the lock is not, which is
+    /// why the reset is to *looking* rather than to a guess.
+    fn at_a_new_window(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// What to do with the window once the motion taking it off screen has run.
@@ -1306,10 +1503,24 @@ impl PillAdapter {
         } else {
             self.reach(r, pill::geom::NUB_W, pill::geom::NUB_H)
         };
-        cursor.0 >= reach.left
-            && cursor.0 < reach.right
-            && cursor.1 >= reach.top
-            && cursor.1 < reach.bottom
+        reach.contains(cursor)
+    }
+
+    /// Whether the cursor is close enough that the pill should be watching for
+    /// it properly — the proximity ladder's middle rung.
+    ///
+    /// Deliberately the *window's* rect grown by a wide band, rather than the
+    /// nub's reach grown by one: this is not a hover test and nothing happens
+    /// at its boundary. It only decides whether the next look is 50 ms away or
+    /// 250 ms away, so it wants to be cheap and generous, and it costs nothing
+    /// to be wrong about by a hundred pixels.
+    fn cursor_near(&self, cursor: (i32, i32)) -> bool {
+        let Some(r) = self.rect() else {
+            return false;
+        };
+        let scale = self.window.as_ref().map_or(1.0, |pw| pw.scale());
+        r.grown((ladder::NEAR_BAND * scale).round() as i32)
+            .contains(cursor)
     }
 
     /// A `w` x `h` logical shape centred on the pill, grown by [`HOVER_REACH`]
@@ -1368,6 +1579,22 @@ impl PillAdapter {
 
     fn has_window(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Whether the pill is on screen — something a cursor could arrive over.
+    ///
+    /// **Not `window.is_some()`.** Residency makes the window permanent, so a
+    /// window exists through every fullscreen suppression, every lock, and the
+    /// whole of a session-less life; a ladder reading that would pin the loop
+    /// to a hover poll forever for a pill that is not there (#49). What decides
+    /// it is the mode: `Hidden` means off screen, and `None` means no window at
+    /// all.
+    ///
+    /// A pill still *animating* its way off screen answers false, and the
+    /// ladder is written so that costs it nothing — animation outranks
+    /// reachability, so the conceal keeps its frames.
+    fn is_active(&self) -> bool {
+        self.window.is_some() && !matches!(self.mode, None | Some(PillMode::Hidden))
     }
 
     /// Whether the pill is doing nothing — the only stretch in which it may
