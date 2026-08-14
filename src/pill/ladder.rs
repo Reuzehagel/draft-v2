@@ -18,6 +18,8 @@
 //   Far        — the cursor is somewhere else entirely; 250 ms.
 //   Suppressed — the pill is off screen behind a fullscreen app, and only the
 //                fullscreen watcher's own backstop can see it come back; 1 s.
+//   Retrying   — a window failed to build and the core is waiting to ask
+//                again; 1 s, which is the core's own shortest wait (#54).
 //
 // The periods are Microsoft's own list — "you should use timer periods of 50,
 // 100, 250, 500, and 1,000 ms" (Windows Timer Coalescing whitepaper) — with
@@ -61,6 +63,19 @@ pub enum Rung {
     /// The pill is off screen behind a fullscreen app, and the only thing that
     /// will ever notice it leaving is the watcher's own backstop.
     Suppressed,
+    /// A `Create` failed and the Pill core is waiting to try again. Like
+    /// `Suppressed`, a backstop for a state nothing else will report — and
+    /// deliberately not `Animating`: the core's waits are seconds long, so
+    /// asking at the frame rate would burn thirty wakeups a second to reach
+    /// one create.
+    ///
+    /// One period rather than the core's current wait, which decays to 30 s:
+    /// a rung is a *maximum* sleep and the ladder's are Microsoft's coalescing
+    /// values, so the alternative is a rung carrying a deadline — a second
+    /// clock, in the module whose whole job is that there is one. A wakeup a
+    /// second is what a fullscreen app already costs, and this one only runs
+    /// while the pill is broken.
+    Retrying,
 }
 
 impl Rung {
@@ -72,6 +87,7 @@ impl Rung {
             Rung::Near => Some(Duration::from_millis(50)),
             Rung::Far => Some(Duration::from_millis(250)),
             Rung::Suppressed => Some(crate::pill::fullscreen::POLL_INTERVAL),
+            Rung::Retrying => Some(crate::pill::core::RETRY_FIRST),
         }
     }
 }
@@ -94,6 +110,10 @@ pub struct Signals {
     /// Whether the fullscreen watcher still has something to look for: the pill
     /// is suppressed, and no event will report the app leaving fullscreen.
     pub suppressed: bool,
+    /// Whether the Pill core is holding a `Create` that failed. Nothing will
+    /// report the reason for that failure clearing either, so the loop has to
+    /// come back and let the core ask again.
+    pub retrying: bool,
 }
 
 /// The rung these signals put the loop on.
@@ -113,6 +133,12 @@ pub fn rung(s: Signals) -> Rung {
     }
     if s.animating {
         return Rung::Animating;
+    }
+    // Above reachability rather than inside it: a pill with no window is not
+    // reachable by definition, so this would otherwise sit in the same branch
+    // saying the same thing twice.
+    if s.retrying {
+        return Rung::Retrying;
     }
     if !s.reachable {
         return if s.suppressed {
@@ -170,6 +196,7 @@ mod tests {
                 reachable: true,
                 near,
                 suppressed: false,
+                retrying: false,
             };
             assert_eq!(rung(s), Rung::Animating, "near {near}");
             assert_eq!(rung(s).period(), Some(Duration::from_millis(33)));
@@ -187,6 +214,7 @@ mod tests {
             reachable: false,
             near: false,
             suppressed: false,
+            retrying: false,
         };
         assert_eq!(rung(s), Rung::Animating);
     }
@@ -216,16 +244,47 @@ mod tests {
         );
     }
 
+    /// A window that failed to build is off screen and unreachable, which on
+    /// its own is `Wait` — and a pill waiting on `Wait` is a pill that never
+    /// retries. It gets the same second the fullscreen backstop does, and for
+    /// the same reason: nothing else will ever report the state changing.
+    #[test]
+    fn a_pill_waiting_to_retry_a_window_keeps_being_asked() {
+        let s = Signals {
+            awake: true,
+            reachable: false,
+            retrying: true,
+            ..Default::default()
+        };
+        assert_eq!(rung(s), Rung::Retrying);
+        assert_eq!(rung(s).period(), Some(crate::pill::core::RETRY_FIRST));
+        // Seconds, not frames — the core's shortest wait is a second, so the
+        // frame rate would be thirty wakeups to reach one create.
+        assert!(rung(s).period() > Rung::Animating.period());
+        assert_eq!(
+            rung(Signals {
+                retrying: false,
+                ..s
+            }),
+            Rung::Wait
+        );
+    }
+
     /// Nobody is looking: stop rendering, stop polling, wait for the event that
     /// says the display is back. A game on a dark screen is not worth watching
     /// either — the unlock and the display coming back are both events.
+    ///
+    /// A retry waits too, on the flash's own reasoning: building a pill onto a
+    /// dark screen is doing the work for nobody, and the pass that hears the
+    /// display is back settles the core with a deadline long since due.
     #[test]
     fn a_dark_or_locked_session_outranks_everything() {
-        for (animating, reachable, near, suppressed) in [
-            (false, false, false, false),
-            (true, true, true, true),
-            (false, true, true, false),
-            (false, false, false, true),
+        for (animating, reachable, near, suppressed, retrying) in [
+            (false, false, false, false, false),
+            (true, true, true, true, true),
+            (false, true, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
         ] {
             let s = Signals {
                 awake: false,
@@ -233,11 +292,12 @@ mod tests {
                 reachable,
                 near,
                 suppressed,
+                retrying,
             };
             assert_eq!(
                 rung(s),
                 Rung::Wait,
-                "{animating} {reachable} {near} {suppressed}"
+                "{animating} {reachable} {near} {suppressed} {retrying}"
             );
         }
     }
@@ -249,5 +309,8 @@ mod tests {
         let periods =
             [Rung::Animating, Rung::Near, Rung::Far, Rung::Suppressed].map(|r| r.period().unwrap());
         assert!(periods.windows(2).all(|w| w[0] < w[1]), "{periods:?}");
+        // The two backstops sit together at the bottom: neither is polling for
+        // the cursor, and both are waiting on something no event reports.
+        assert_eq!(Rung::Retrying.period(), Rung::Suppressed.period());
     }
 }

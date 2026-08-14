@@ -47,6 +47,28 @@ pub fn handoff_damping(elapsed: Duration) -> f32 {
     (1.0 - t).clamp(0.0, 1.0)
 }
 
+/// How long the core waits before trying a failed [`Command::Create`] again.
+///
+/// A second, so that a create which failed for a passing reason — a display
+/// topology change caught mid-call, a moment of resource pressure — costs the
+/// user one beat rather than the rest of the session. Short enough that a pill
+/// switched on and not appearing looks slow, not broken.
+pub const RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The ceiling the retry interval doubles up to.
+///
+/// A create can also fail for a reason that is not going away — no monitor,
+/// exhausted GDI handles — and there is no attempt count that tells the two
+/// apart. So the retry never gives up and instead decays: 1 s, 2 s, 4 s … 30 s,
+/// and 30 s from then on. Half a minute is cheap enough to run for the life of
+/// the process, and still fast enough that the pill returns on its own once
+/// whatever was in the way clears.
+///
+/// Giving up after N attempts was the alternative, and it loses the case the
+/// retry exists for: the state that wanted a window is still there, so a pill
+/// that stopped asking is a pill dead until the user next touches something.
+pub const RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// How long the terminal flash holds before the pill leaves. Shared with the
 /// pill adapter, which uses it to time the fade; the core uses it in `tick` to
 /// decide when the flash retires.
@@ -594,6 +616,27 @@ pub enum Command {
     Destroy,
 }
 
+/// A `Create` that failed and the schedule for asking again: when the next one
+/// may be emitted, and the interval that produced it.
+///
+/// Its presence is also the flag for "the core is between creates" — while it
+/// is set, [`Pill::settle`] emits no `Create` of its own, so **presence** that
+/// moves during the backoff cannot jump the queue. A fullscreen watcher
+/// flipping presence once a second would otherwise be a create once a second,
+/// which is the thing the cadence exists to prevent, and the core cannot tell
+/// that flip from the residency toggle: all three drivers arrive as one
+/// composed value.
+///
+/// A session can, and does — see [`Pill::on_session`]. Nothing else the core
+/// hears is a user asking for a pill *now*.
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    /// The earliest `now` at which the next `Create` goes out.
+    at: Instant,
+    /// The wait that produced `at`. Doubles, capped at [`RETRY_MAX`].
+    interval: Duration,
+}
+
 /// The pill's owner: presence × activity in, commands out.
 pub struct Pill {
     presence: Presence,
@@ -603,6 +646,8 @@ pub struct Pill {
     window: bool,
     /// Whether that window is on screen (mirrors Show/Hide).
     shown: bool,
+    /// The schedule for a `Create` that failed, or `None` while none has.
+    retry: Option<Retry>,
     /// The last mode handed over, so unchanged modes emit nothing.
     mode: Option<PillMode>,
     /// Whether there is a transcript to copy. Fed by the adapter at the same
@@ -628,6 +673,7 @@ impl Pill {
             activity: Activity::None,
             window: false,
             shown: false,
+            retry: None,
             mode: None,
             has_history: false,
             body_style: BodyStyle::default(),
@@ -708,7 +754,17 @@ impl Pill {
 
     /// Apply a session's report. `Finished` is stamped here, not by the session:
     /// the session ends the moment its outcome is known, and the flash outlives it.
+    ///
+    /// A session running is the one thing that retires a [`Retry`] unserved: a
+    /// chord press is a user asking for a pill *now*, and making them wait out
+    /// a backoff they cannot see is worse than the create it costs. The
+    /// schedule starts over from the failure that follows, so a session cannot
+    /// escalate anything either — it is at most one attempt per phase, which is
+    /// as often as a hand can press a key.
     pub fn on_session(&mut self, activity: SessionActivity, now: Instant) -> Vec<Command> {
+        if activity != SessionActivity::None {
+            self.retry = None;
+        }
         self.activity = match activity {
             SessionActivity::None => Activity::None,
             SessionActivity::Recording { origin } => Activity::Recording { origin },
@@ -728,10 +784,12 @@ impl Pill {
     /// every later `SetMode`, `Show`, `Hide` and `Destroy` off a window that
     /// was never built.
     ///
-    /// The next event that wants a pill will ask for a window again, since
-    /// nothing here remembers the failure. Retrying one *on purpose* — on a
-    /// timer, with a limit — is a separate decision (#53).
-    pub fn window_created(&mut self, created: bool) -> Vec<Command> {
+    /// A failure arms the retry schedule (#54), which from then on is the only
+    /// thing that emits a `Create` — see [`Retry`]. The schedule is *not*
+    /// restarted here: the create being reported on is one the schedule
+    /// already made, and a failure that reset its own backoff would never back
+    /// off at all.
+    pub fn window_created(&mut self, created: bool, now: Instant) -> Vec<Command> {
         // The answer to a `Create` the core is still waiting on — it emits one
         // and stops, and only ever when it holds neither a window nor a mode.
         // Asserted rather than re-established, so the failure arm has nothing
@@ -740,9 +798,14 @@ impl Pill {
         // matching on its phase; this core has no phase to match.
         debug_assert!(!self.window && self.mode.is_none());
         if !created {
+            self.retry.get_or_insert(Retry {
+                at: now + RETRY_FIRST,
+                interval: RETRY_FIRST,
+            });
             return Vec::new();
         }
         self.window = true;
+        self.retry = None;
         self.settle()
     }
 
@@ -767,17 +830,48 @@ impl Pill {
         matches!(self.activity, Activity::Done { .. })
     }
 
-    /// Retire the terminal flash once its linger has elapsed. Emits the
-    /// transition exactly once on the crossing, then nothing — the animation is
-    /// otherwise self-driven in the adapter.
+    /// Whether a failed `Create` is still waiting to be tried again — the
+    /// ladder's other reason to keep asking (#54).
+    ///
+    /// Separate from [`Self::lingering`] rather than folded into it, because
+    /// the two want different cadences: a flash has half a second to retire on
+    /// time, and a retry measures its wait in seconds.
+    pub fn retrying(&self) -> bool {
+        self.retry.is_some()
+    }
+
+    /// Retire the terminal flash once its linger has elapsed, and re-ask for a
+    /// window whose create failed. Both emit exactly on their crossing, then
+    /// nothing — the animation is otherwise self-driven in the adapter.
+    ///
+    /// The flash first: retiring it can be the thing that leaves the pill with
+    /// no reason to exist, and a retry outliving the state that wanted a
+    /// window is the one failure mode the schedule must not have.
     pub fn tick(&mut self, now: Instant) -> Vec<Command> {
+        let mut cmds = Vec::new();
         if let Activity::Done { ok, since } = self.activity {
             if now.saturating_duration_since(since) >= linger(ok) {
                 self.activity = Activity::None;
-                return self.settle();
+                cmds = self.settle();
             }
         }
-        Vec::new()
+        cmds.extend(self.retry_due(now));
+        cmds
+    }
+
+    /// The scheduled `Create`, if its wait has elapsed. The next wait is
+    /// doubled and stamped here rather than when the answer comes back, so a
+    /// report that never arrives cannot leave the schedule standing still.
+    fn retry_due(&mut self, now: Instant) -> Vec<Command> {
+        let Some(retry) = self.retry.as_mut() else {
+            return Vec::new();
+        };
+        if now < retry.at {
+            return Vec::new();
+        }
+        retry.interval = (retry.interval * 2).min(RETRY_MAX);
+        retry.at = now + retry.interval;
+        vec![Command::Create]
     }
 
     /// The pill mode for the current axes. Activity outranks presence: whenever
@@ -805,7 +899,21 @@ impl Pill {
         let want_window = self.presence != Presence::Off || self.activity != Activity::None;
         let want_shown = want_window && mode != PillMode::Hidden;
 
+        // A retry only ever stands for a window something still wants. The
+        // moment nothing does, the schedule goes with it — before the early
+        // return below, so that the pill leaving mid-backoff is the end of it.
+        if !want_window {
+            self.retry = None;
+        }
+
         let mut cmds = Vec::new();
+        if want_window && !self.window && self.retry.is_some() {
+            // Between scheduled creates: the pill wants a window and is going
+            // to ask for one, on the cadence, from `tick`. Nothing else here
+            // can run — every command below is addressed to a window — so an
+            // axis moving during the backoff is silent rather than a create.
+            return Vec::new();
+        }
         if want_window && !self.window {
             // On its own, and the core stops believing anything further until
             // it is answered: a layered window can fail to build, and every
@@ -858,13 +966,16 @@ mod tests {
 
         /// Perform the commands the way the adapter does, reporting every
         /// `Create` as a success and appending what that returns.
+        ///
+        /// The report's `now` never matters here: a create that succeeds
+        /// schedules nothing.
         fn run(&mut self, cmds: Vec<Command>) -> Vec<Command> {
             let mut out = Vec::new();
             let mut queue: std::collections::VecDeque<Command> = cmds.into();
             while let Some(cmd) = queue.pop_front() {
                 out.push(cmd);
                 if cmd == Command::Create {
-                    queue.extend(self.0.window_created(true));
+                    queue.extend(self.0.window_created(true, t(0)));
                 }
             }
             out
@@ -1640,40 +1751,189 @@ mod tests {
             vec![Command::Create]
         );
         // It fails. Nothing follows — no mode to hand over, nothing to show.
-        assert!(p.window_created(false).is_empty());
-        // A whole session runs against the pill that isn't there. Every one of
-        // those events asks for the window the core still wants, and not one of
-        // them is addressed to a window: no `SetMode`, `Show`, `Hide` or
-        // `Destroy` reaches an adapter holding nothing.
+        assert!(p.window_created(false, t(0)).is_empty());
+        // A whole session runs against the pill that isn't there. Not one of
+        // those events is addressed to a window: no `SetMode`, `Show`, `Hide`
+        // or `Destroy` reaches an adapter holding nothing — the only thing any
+        // of them can be is another ask.
         let mut asked = 0;
         for cmds in [
             p.on_session(SessionActivity::Finished { ok: true }, t(0)),
-            p.window_created(false),
+            p.window_created(false, t(0)),
             p.tick(t(0) + SUCCESS_LINGER),
-            p.window_created(false),
+            p.set_presence(Presence::Resident { expanded: true }),
         ] {
             for cmd in cmds {
                 assert_eq!(cmd, Command::Create, "addressed to no window");
                 asked += 1;
             }
         }
-        assert_eq!(asked, 2, "each event asks once");
-        // The next one builds, and starts from a clean slate — the mode the
-        // core never got to hand over is handed over now, rather than skipped
-        // as unchanged.
+        // And only the session is: the backoff owns the schedule from here,
+        // and presence moving during it does not jump the queue (#54).
+        assert_eq!(asked, 1);
+        // The scheduled one builds, and starts from a clean slate — the mode
+        // the core never got to hand over is handed over now, rather than
+        // skipped as unchanged. And it is the mode the axes derive *at the
+        // retry*: the create that failed was standing in front of `Idle`, and
+        // the hover that arrived while the pill was dead still counts.
+        assert_eq!(p.tick(t(0) + RETRY_FIRST), vec![Command::Create]);
         assert_eq!(
-            p.set_presence(Presence::Resident { expanded: true }),
-            vec![Command::Create]
-        );
-        assert_eq!(
-            p.window_created(true),
+            p.window_created(true, t(0) + RETRY_FIRST),
             vec![Command::SetMode(ISLANDS), Command::Show]
         );
+        assert!(!p.retrying());
         // And the pill it now owns is a working one.
         assert_eq!(
             p.set_presence(Presence::Resident { expanded: false }),
             vec![Command::SetMode(PillMode::Idle)]
         );
+    }
+
+    /// The cadence, driven at the rate the loop actually settles the core:
+    /// `Rung::Animating`'s 33 ms. Two minutes of frames, and seven creates —
+    /// which is the whole of "does not emit a `Create` on every frame".
+    ///
+    /// Every attempt fails, so this is also the assertion that a failure does
+    /// not restart its own schedule: the gaps double regardless.
+    #[test]
+    fn a_failed_create_backs_off_instead_of_asking_every_frame() {
+        let mut p = Pill::new();
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![Command::Create]
+        );
+        assert!(p.window_created(false, t(0)).is_empty());
+
+        let mut asked = Vec::new();
+        let mut ms = 0;
+        let mut frames = 0;
+        while ms <= 120_000 {
+            for cmd in p.tick(t(ms)) {
+                assert_eq!(cmd, Command::Create, "addressed to no window");
+                asked.push(ms);
+                assert!(p.window_created(false, t(ms)).is_empty());
+            }
+            frames += 1;
+            ms += 33;
+        }
+        assert!(frames > 3000, "{frames} frames");
+
+        // 1 s, doubling to the 30 s ceiling, and 30 s from then on. Each lands
+        // on the first frame at or after its deadline, so a gap is allowed to
+        // run one frame long and no further.
+        let want = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+        assert_eq!(asked.len(), want.len(), "{asked:?}");
+        let mut prev = 0;
+        for (i, want) in want.iter().enumerate() {
+            let gap = asked[i] - prev;
+            assert!(
+                (*want..want + 33).contains(&gap),
+                "attempt {i} came {gap} ms after the last, wanted {want}"
+            );
+            prev = asked[i];
+        }
+        // And it never gives up: there is no attempt count that tells a
+        // passing failure from a permanent one, so the schedule decays rather
+        // than stopping.
+        assert!(p.retrying());
+    }
+
+    /// The case the ticket names as already working, and the reason the gate
+    /// is on presence rather than on everything that moves: with residency on,
+    /// a chord press deep into the backoff is a user asking for a pill, and it
+    /// asks there and then rather than waiting out half a minute it cannot see.
+    #[test]
+    fn a_session_starting_mid_backoff_asks_again_there_and_then() {
+        let mut p = Pill::new();
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![Command::Create]
+        );
+        assert!(p.window_created(false, t(0)).is_empty());
+        // Four failed attempts in, the next one is fifteen seconds out.
+        for ms in [1_000, 3_000, 7_000, 15_000] {
+            assert_eq!(p.tick(t(ms)), vec![Command::Create], "at {ms} ms");
+            assert!(p.window_created(false, t(ms)).is_empty());
+        }
+        assert!(p.tick(t(20_000)).is_empty());
+        assert_eq!(
+            p.on_session(
+                SessionActivity::Recording {
+                    origin: Origin::Hotkey
+                },
+                t(20_000)
+            ),
+            vec![Command::Create]
+        );
+        // This one builds, and the session gets the pill it pressed for.
+        assert_eq!(
+            p.window_created(true, t(20_000)),
+            vec![
+                Command::SetMode(PillMode::Recording {
+                    origin: Origin::Hotkey
+                }),
+                Command::Show
+            ]
+        );
+    }
+
+    /// The retry stands for a window something still wants. The moment nothing
+    /// does, it goes — a schedule outliving its reason would build a pill onto
+    /// a desktop that asked for none.
+    #[test]
+    fn a_retry_never_outlives_the_state_that_wanted_a_window() {
+        let mut p = Pill::new();
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![Command::Create]
+        );
+        assert!(p.window_created(false, t(0)).is_empty());
+        assert!(p.retrying());
+        // Residency switched off mid-backoff.
+        assert!(p.set_presence(Presence::Off).is_empty());
+        assert!(!p.retrying());
+        assert!(p.tick(t(60_000)).is_empty());
+        // And the next thing that wants a pill asks immediately — nothing is
+        // left holding the queue open.
+        assert_eq!(
+            p.on_session(
+                SessionActivity::Recording {
+                    origin: Origin::Hotkey
+                },
+                t(60_000)
+            ),
+            vec![Command::Create]
+        );
+    }
+
+    /// The same rule from the other end, and the ordering that makes it bite:
+    /// a session-only pill whose window failed has a flash that runs out
+    /// *before* the first retry is due, so the schedule must be cleared by the
+    /// tick that retires it rather than by anything later.
+    #[test]
+    fn a_flash_that_retires_to_nothing_takes_the_retry_with_it() {
+        assert!(SUCCESS_LINGER < RETRY_FIRST);
+        let mut p = Pill::new();
+        assert_eq!(
+            p.on_session(SessionActivity::Finished { ok: true }, t(0)),
+            vec![Command::Create]
+        );
+        assert!(p.window_created(false, t(0)).is_empty());
+        assert!(p.retrying());
+        assert!(p.tick(t(0) + SUCCESS_LINGER).is_empty());
+        assert!(!p.retrying());
+        assert!(p.tick(t(0) + RETRY_FIRST).is_empty());
+    }
+
+    /// The two questions the ladder asks are separate because the two waits
+    /// are: a flash has half a second to retire on time, a retry measures its
+    /// in seconds.
+    #[test]
+    fn a_pending_retry_is_not_a_lingering_flash() {
+        let mut p = Pill::new();
+        p.set_presence(Presence::Resident { expanded: false });
+        p.window_created(false, t(0));
+        assert!(p.retrying() && !p.lingering());
     }
 
     /// A pill with buttons up, and something to copy.
