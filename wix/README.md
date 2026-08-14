@@ -25,9 +25,10 @@ The `.msi` lands in `target\wix\`.
 ## What gets installed
 
 - `draft.exe`
-- `onnxruntime.dll` (placed in `target\release` by the `ort` build script;
-  if it's not there after `cargo build --release`, run a clean build —
-  `ort` only copies it when the link step actually runs)
+- `DirectML.dll` (placed in `target\release` by the `ort` build script;
+  onnxruntime itself is statically linked into `draft.exe`. If the DLL
+  isn't there after `cargo build --release`, run a clean build — `ort`
+  only copies it when the link step actually runs)
 - Start Menu shortcut → `[APPLICATIONFOLDER]draft.exe`
 
 ## What is _not_ installed
