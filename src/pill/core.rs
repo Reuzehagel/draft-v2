@@ -579,7 +579,11 @@ pub enum SessionActivity {
 /// on every chord press and every hover, and hover polling wants a stable rect.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Command {
-    /// Create the pill window, hidden and unpainted.
+    /// Create the pill window, hidden and unpainted. **The only command that
+    /// can fail**, so it is the only one the adapter reports back — see
+    /// [`Pill::window_created`] — and the core emits it on its own, with the
+    /// mode and the show it was going to be followed by held until the answer
+    /// comes.
     Create,
     /// Hand over a new logical mode. Always precedes the `Show` that reveals it,
     /// so the first visible frame is already the right one.
@@ -594,7 +598,8 @@ pub enum Command {
 pub struct Pill {
     presence: Presence,
     activity: Activity,
-    /// Whether the adapter currently holds a window (mirrors Create/Destroy).
+    /// Whether the adapter holds a window. Set by the adapter's report on a
+    /// `Create` rather than by emitting one — [`Pill::window_created`].
     window: bool,
     /// Whether that window is on screen (mirrors Show/Hide).
     shown: bool,
@@ -713,6 +718,34 @@ impl Pill {
         self.settle()
     }
 
+    /// The adapter's report on a [`Command::Create`], and the answer to the
+    /// only pill command that can fail.
+    ///
+    /// `true` gives the core its window back, and returns the mode and the
+    /// show the `Create` was standing in front of. `false` leaves it owning
+    /// nothing: there is no state to take back, because the core does not
+    /// count the window as its until this call says so — which is what keeps
+    /// every later `SetMode`, `Show`, `Hide` and `Destroy` off a window that
+    /// was never built.
+    ///
+    /// The next event that wants a pill will ask for a window again, since
+    /// nothing here remembers the failure. Retrying one *on purpose* — on a
+    /// timer, with a limit — is a separate decision (#53).
+    pub fn window_created(&mut self, created: bool) -> Vec<Command> {
+        // The answer to a `Create` the core is still waiting on — it emits one
+        // and stops, and only ever when it holds neither a window nor a mode.
+        // Asserted rather than re-established, so the failure arm has nothing
+        // to take back and a report nobody asked for is caught rather than
+        // believed. `Session::capture_started` states the same precondition by
+        // matching on its phase; this core has no phase to match.
+        debug_assert!(!self.window && self.mode.is_none());
+        if !created {
+            return Vec::new();
+        }
+        self.window = true;
+        self.settle()
+    }
+
     /// Set the presence axis. Called with the one value the adapter composes
     /// from the residency toggle, the fullscreen watcher and the hover poll —
     /// at launch, on every config reload, and on every loop that moves one of
@@ -774,9 +807,13 @@ impl Pill {
 
         let mut cmds = Vec::new();
         if want_window && !self.window {
-            cmds.push(Command::Create);
-            self.window = true;
-            self.mode = None;
+            // On its own, and the core stops believing anything further until
+            // it is answered: a layered window can fail to build, and every
+            // command after this one is addressed to the window it would have
+            // been. `Session::capture_started` is the same seam — the adapter
+            // performs the effect, reports the result in, and runs whatever
+            // comes back (#53).
+            return vec![Command::Create];
         }
         if self.window && self.mode != Some(mode) {
             cmds.push(Command::SetMode(mode));
@@ -805,6 +842,74 @@ mod tests {
 
     use crate::pill::bodies::{ISLANDS, UNIFIED};
 
+    /// A [`Pill`] behind an adapter whose windows always build — the shape
+    /// `main.rs` runs, with the `Create` report folded straight back in.
+    ///
+    /// It exists so that a test about presence, activity or the flash asserts
+    /// on one flat command list instead of on the two-step handshake `Create`
+    /// costs. The handshake itself has its own test, which drives the core bare
+    /// — see `a_window_that_fails_to_build_leaves_the_core_owning_nothing`.
+    struct Driven(Pill);
+
+    impl Driven {
+        fn new() -> Self {
+            Driven(Pill::new())
+        }
+
+        /// Perform the commands the way the adapter does, reporting every
+        /// `Create` as a success and appending what that returns.
+        fn run(&mut self, cmds: Vec<Command>) -> Vec<Command> {
+            let mut out = Vec::new();
+            let mut queue: std::collections::VecDeque<Command> = cmds.into();
+            while let Some(cmd) = queue.pop_front() {
+                out.push(cmd);
+                if cmd == Command::Create {
+                    queue.extend(self.0.window_created(true));
+                }
+            }
+            out
+        }
+
+        fn set_presence(&mut self, presence: Presence) -> Vec<Command> {
+            let cmds = self.0.set_presence(presence);
+            self.run(cmds)
+        }
+
+        fn on_session(&mut self, activity: SessionActivity, now: Instant) -> Vec<Command> {
+            let cmds = self.0.on_session(activity, now);
+            self.run(cmds)
+        }
+
+        fn set_body_style(&mut self, style: BodyStyle) -> Vec<Command> {
+            let cmds = self.0.set_body_style(style);
+            self.run(cmds)
+        }
+
+        fn tick(&mut self, now: Instant) -> Vec<Command> {
+            let cmds = self.0.tick(now);
+            self.run(cmds)
+        }
+
+        /// The one mutator that returns nothing, so there is nothing to drive.
+        fn set_has_history(&mut self, has_history: bool) {
+            self.0.set_has_history(has_history);
+        }
+    }
+
+    /// Everything that only asks questions — `showing_bar`, `button_at`,
+    /// `action_at`, `enabled`, `lingering` — reaches the core unchanged.
+    ///
+    /// `Deref` and not `DerefMut`, deliberately: a command-returning method
+    /// takes `&mut self`, so a new one added to `Pill` and not wrapped above
+    /// fails to compile here rather than quietly reaching past the harness and
+    /// leaving its `Create` unanswered.
+    impl std::ops::Deref for Driven {
+        type Target = Pill;
+        fn deref(&self) -> &Pill {
+            &self.0
+        }
+    }
+
     fn t(ms: u64) -> Instant {
         static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let base = *BASE.get_or_init(Instant::now);
@@ -815,7 +920,7 @@ mod tests {
     /// from scratch, read off the command lists — never off private state.
     /// `None` means it never handed over a mode at all.
     fn mode_for(presence: Presence, activity: SessionActivity) -> Option<PillMode> {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         let mut cmds = p.set_presence(presence);
         cmds.extend(p.on_session(activity, t(0)));
         cmds.iter().rev().find_map(|c| match c {
@@ -979,7 +1084,7 @@ mod tests {
 
     #[test]
     fn a_session_is_visible_even_when_a_fullscreen_app_suppresses_the_pill() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         // Resident, then a fullscreen app takes focus: hidden, window kept.
         assert_eq!(
             p.set_presence(Presence::Resident { expanded: false }),
@@ -1032,7 +1137,7 @@ mod tests {
 
     #[test]
     fn hover_cannot_expand_a_recording_pill() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: false });
         p.on_session(
             SessionActivity::Recording {
@@ -1049,7 +1154,7 @@ mod tests {
 
     #[test]
     fn tick_past_linger_retires_the_flash_exactly_once() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.on_session(SessionActivity::Processing { since: t(0) }, t(0));
         assert_eq!(
             p.on_session(SessionActivity::Finished { ok: true }, t(2000)),
@@ -1081,7 +1186,7 @@ mod tests {
     /// and nothing else would be waking anyone to retire it.
     #[test]
     fn only_a_flash_says_it_is_lingering() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         assert!(!p.lingering());
         p.on_session(
             SessionActivity::Recording {
@@ -1101,7 +1206,7 @@ mod tests {
 
     #[test]
     fn a_failed_flash_holds_for_the_longer_linger() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.on_session(SessionActivity::Finished { ok: false }, t(0));
         // A success would already be gone by here.
         assert!(p.tick(t(0) + SUCCESS_LINGER).is_empty());
@@ -1110,7 +1215,7 @@ mod tests {
 
     #[test]
     fn the_state_after_a_session_is_derived_from_presence_not_remembered() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         // The session starts with the pill off...
         p.on_session(
             SessionActivity::Recording {
@@ -1134,7 +1239,7 @@ mod tests {
 
     #[test]
     fn residency_switched_off_mid_flash_takes_the_window_with_it() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: false });
         p.on_session(SessionActivity::Finished { ok: true }, t(0));
         // Toggled off during the flash: the flash still owns the pill.
@@ -1152,7 +1257,7 @@ mod tests {
 
     #[test]
     fn a_resident_window_is_created_once_and_survives_a_whole_session() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         let mut cmds = p.set_presence(Presence::Resident { expanded: false });
         cmds.extend(p.on_session(
             SessionActivity::Recording {
@@ -1173,7 +1278,7 @@ mod tests {
 
     #[test]
     fn a_session_that_never_shows_anything_leaves_no_window_behind() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         // Too short a capture, or nothing usable said: straight back to None.
         assert!(p.on_session(SessionActivity::None, t(0)).is_empty());
         assert!(p
@@ -1198,7 +1303,7 @@ mod tests {
     /// of what the toggle does from a standing start.
     #[test]
     fn switching_residency_on_puts_the_nub_up_and_leaves_it_there() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         assert_eq!(
             p.set_presence(Presence::Resident { expanded: false }),
             vec![
@@ -1222,7 +1327,7 @@ mod tests {
     /// left for it to do.
     #[test]
     fn switching_residency_off_while_idle_takes_the_pill_and_its_window() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: false });
         assert_eq!(
             p.set_presence(Presence::Off),
@@ -1239,7 +1344,7 @@ mod tests {
     /// Recording and Processing, holds the flash, and only then goes.
     #[test]
     fn residency_switched_off_mid_session_rides_the_session_out() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: false });
         p.on_session(
             SessionActivity::Recording {
@@ -1281,7 +1386,7 @@ mod tests {
     /// same rule — the return state is derived, never remembered.
     #[test]
     fn residency_switched_on_mid_session_shows_the_nub_once_the_flash_retires() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.on_session(
             SessionActivity::Recording {
                 origin: Origin::Hotkey,
@@ -1310,7 +1415,7 @@ mod tests {
     /// — not to any state it passed through on the way.
     #[test]
     fn only_the_presence_at_retirement_decides_where_the_flash_goes() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.on_session(SessionActivity::Finished { ok: true }, t(0));
         p.set_presence(Presence::Resident { expanded: false });
         p.set_presence(Presence::Off);
@@ -1503,7 +1608,7 @@ mod tests {
     /// leaving the wrong body on screen until the cursor moves.
     #[test]
     fn the_body_style_rides_on_the_expanded_mode() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: true });
         assert_eq!(
             p.set_body_style(BodyStyle::Unified),
@@ -1522,9 +1627,58 @@ mod tests {
         assert_eq!(p.set_body_style(BodyStyle::Unified), vec![]);
     }
 
-    /// A pill with buttons up, and something to copy.
-    fn expanded() -> Pill {
+    /// The one command that can fail, driven both ways. Everything else in this
+    /// module is asserted through [`Driven`], which always builds the window —
+    /// this is the test that does not.
+    #[test]
+    fn a_window_that_fails_to_build_leaves_the_core_owning_nothing() {
         let mut p = Pill::new();
+        // `Create` comes on its own: everything after it is addressed to a
+        // window that does not exist yet.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![Command::Create]
+        );
+        // It fails. Nothing follows — no mode to hand over, nothing to show.
+        assert!(p.window_created(false).is_empty());
+        // A whole session runs against the pill that isn't there. Every one of
+        // those events asks for the window the core still wants, and not one of
+        // them is addressed to a window: no `SetMode`, `Show`, `Hide` or
+        // `Destroy` reaches an adapter holding nothing.
+        let mut asked = 0;
+        for cmds in [
+            p.on_session(SessionActivity::Finished { ok: true }, t(0)),
+            p.window_created(false),
+            p.tick(t(0) + SUCCESS_LINGER),
+            p.window_created(false),
+        ] {
+            for cmd in cmds {
+                assert_eq!(cmd, Command::Create, "addressed to no window");
+                asked += 1;
+            }
+        }
+        assert_eq!(asked, 2, "each event asks once");
+        // The next one builds, and starts from a clean slate — the mode the
+        // core never got to hand over is handed over now, rather than skipped
+        // as unchanged.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: true }),
+            vec![Command::Create]
+        );
+        assert_eq!(
+            p.window_created(true),
+            vec![Command::SetMode(ISLANDS), Command::Show]
+        );
+        // And the pill it now owns is a working one.
+        assert_eq!(
+            p.set_presence(Presence::Resident { expanded: false }),
+            vec![Command::SetMode(PillMode::Idle)]
+        );
+    }
+
+    /// A pill with buttons up, and something to copy.
+    fn expanded() -> Driven {
+        let mut p = Driven::new();
         p.set_has_history(true);
         p.set_presence(Presence::Resident { expanded: true });
         p
@@ -1581,7 +1735,7 @@ mod tests {
     /// are unaffected.
     #[test]
     fn copy_is_inert_with_an_empty_history() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         p.set_presence(Presence::Resident { expanded: true });
         assert!(!p.enabled(0));
         assert_eq!(p.button_at(-43.0, 0.0), None);
@@ -1617,7 +1771,7 @@ mod tests {
 
     #[test]
     fn a_click_started_session_reaches_the_adapter_as_one() {
-        let mut p = Pill::new();
+        let mut p = Driven::new();
         assert!(p
             .on_session(
                 SessionActivity::Recording {
@@ -1631,7 +1785,7 @@ mod tests {
     }
 
     /// A pill recording something the user started with the mouse.
-    fn click_recording() -> Pill {
+    fn click_recording() -> Driven {
         let mut p = expanded();
         p.on_session(
             SessionActivity::Recording {
