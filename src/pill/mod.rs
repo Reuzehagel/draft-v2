@@ -4,6 +4,7 @@ pub mod geom;
 pub mod hook;
 pub mod icons;
 pub mod label;
+pub mod ladder;
 pub mod monitor;
 /// Renders the pill to PNGs for eyeballing. Test-only, and `#[ignore]`d — see
 /// the module header for how to run it.

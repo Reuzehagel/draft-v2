@@ -170,11 +170,16 @@ static EVENT_CHANNEL: OnceLock<(
     crossbeam_channel::Receiver<HotkeyEvent>,
 )> = OnceLock::new();
 
-fn install_handler_once() -> crossbeam_channel::Receiver<HotkeyEvent> {
+fn install_handler_once(waker: &crate::wake::Waker) -> crossbeam_channel::Receiver<HotkeyEvent> {
     let (tx, rx) = EVENT_CHANNEL.get_or_init(crossbeam_channel::unbounded);
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let tx = tx.clone();
+        // The chord is what a dictation starts from, so this is the wake that
+        // matters most for latency: the loop is asleep with no timer armed
+        // until this posts to it. Cloned into the handler, which outlives
+        // every re-registration — the waker is the loop's, not a binding's.
+        let waker = waker.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
             let now = Instant::now();
             let chord = {
@@ -192,6 +197,7 @@ fn install_handler_once() -> crossbeam_channel::Receiver<HotkeyEvent> {
                 HotKeyState::Released => HotkeyEvent::Released(chord, now),
             };
             let _ = tx.send(msg);
+            waker.wake();
         }));
     });
     rx.clone()
@@ -208,6 +214,7 @@ fn install_handler_once() -> crossbeam_channel::Receiver<HotkeyEvent> {
 pub fn register(
     dictate_spec: &str,
     command_spec: Option<&str>,
+    waker: &crate::wake::Waker,
 ) -> Result<(HotkeyHandle, crossbeam_channel::Receiver<HotkeyEvent>)> {
     let dictate = parse(dictate_spec)?;
     let manager =
@@ -241,7 +248,7 @@ pub fn register(
         command: command_id,
     };
 
-    let rx = install_handler_once();
+    let rx = install_handler_once(waker);
     Ok((
         HotkeyHandle {
             manager,

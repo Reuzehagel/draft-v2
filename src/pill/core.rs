@@ -722,6 +722,18 @@ impl Pill {
         self.settle()
     }
 
+    /// Whether a later [`Self::tick`] will change something with nothing having
+    /// happened. True exactly while the terminal flash is lingering, which is
+    /// the pill's one self-expiring state.
+    ///
+    /// The proximity ladder asks (#49). A flash is a still image once the
+    /// handoff has fallen, so nothing else would keep the loop waking — and a
+    /// flash retired whenever the user next moved the mouse would be a flash of
+    /// no fixed length.
+    pub fn lingering(&self) -> bool {
+        matches!(self.activity, Activity::Done { .. })
+    }
+
     /// Retire the terminal flash once its linger has elapsed. Emits the
     /// transition exactly once on the crossing, then nothing — the animation is
     /// otherwise self-driven in the adapter.
@@ -1062,6 +1074,29 @@ mod tests {
         );
         // ...and never again.
         assert!(p.tick(late + Duration::from_secs(1)).is_empty());
+    }
+
+    /// What the proximity ladder asks before deciding whether the loop may
+    /// sleep with no timer: a flash is the one thing that expires on its own,
+    /// and nothing else would be waking anyone to retire it.
+    #[test]
+    fn only_a_flash_says_it_is_lingering() {
+        let mut p = Pill::new();
+        assert!(!p.lingering());
+        p.on_session(
+            SessionActivity::Recording {
+                origin: Origin::Hotkey,
+            },
+            t(0),
+        );
+        assert!(!p.lingering());
+        p.on_session(SessionActivity::Processing { since: t(100) }, t(100));
+        assert!(!p.lingering());
+        p.on_session(SessionActivity::Finished { ok: true }, t(200));
+        assert!(p.lingering());
+        // And it stops the moment the tick that retires it lands.
+        assert!(!p.tick(t(200) + SUCCESS_LINGER).is_empty());
+        assert!(!p.lingering());
     }
 
     #[test]

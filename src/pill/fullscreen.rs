@@ -56,10 +56,13 @@
 use crate::pill::monitor::{MonitorId, Rect};
 use std::time::{Duration, Instant};
 
-/// How often the watcher re-probes with nothing having happened. One wakeup in
-/// twenty of the app loop's own 50 ms cadence, and about six user32/shell32
-/// calls when it fires — a passive overlay does not need to react faster than
-/// this to a transition no event reports.
+/// How often the watcher re-probes with nothing having happened. About six
+/// user32/shell32 calls when it fires — a passive overlay does not need to
+/// react faster than this to a transition no event reports.
+///
+/// It is also the proximity ladder's slowest rung (#49): while the pill *is*
+/// suppressed this is the only reason the loop wakes at all, so the ladder
+/// takes the period from here rather than restating it.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Slack per edge, in physical pixels, for the invisible resize borders
