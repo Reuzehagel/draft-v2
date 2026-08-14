@@ -22,7 +22,8 @@
 
 #![cfg(test)]
 
-use crate::pill::core::{Origin, PillMode};
+use crate::pill::bodies::{style_of, ISLANDS, UNIFIED};
+use crate::pill::core::{BodyStyle, Origin, PillMode};
 use crate::pill::geom::{
     breathe, Geom, Motion, Slot, Slots, Tween, CANCELLED, ENVELOPE_H, ENVELOPE_W, HOVER_IN,
     HOVER_OUT, MORPH, REVEAL, TO_IDLE, TO_RECORDING,
@@ -95,8 +96,8 @@ fn click_recording() -> PillMode {
 /// One frame at device resolution, through the same supersample-and-halve chain
 /// `PillWindow` uses — so the anti-aliasing here is the anti-aliasing on screen,
 /// not tiny-skia's raw output at 1x.
-fn frame(geom: &Geom, bars: &[f32]) -> Pixmap {
-    frame_with(geom, bars, &NO_SLOTS)
+fn frame(geom: &Geom, bars: &[f32], style: BodyStyle) -> Pixmap {
+    frame_with(geom, bars, &NO_SLOTS, style)
 }
 
 /// No hover and no acknowledgement — the label's usual state, and what every
@@ -109,16 +110,16 @@ const NO_LABEL: Fade = Fade {
 
 /// The same, with per-button hover state — for the expanded bar, where which
 /// button is lit is not part of the Geom.
-fn frame_with(geom: &Geom, bars: &[f32], slots: &Slots) -> Pixmap {
-    labelled(geom, bars, slots, &NO_LABEL)
+fn frame_with(geom: &Geom, bars: &[f32], slots: &Slots, style: BodyStyle) -> Pixmap {
+    labelled(geom, bars, slots, &NO_LABEL, style)
 }
 
 /// The same again, with the label saying something — the one sheet where it is
 /// the subject rather than the absence.
-fn labelled(geom: &Geom, bars: &[f32], slots: &Slots, label: &Fade) -> Pixmap {
+fn labelled(geom: &Geom, bars: &[f32], slots: &Slots, label: &Fade, style: BodyStyle) -> Pixmap {
     const SS: u32 = 4;
     let mut hi = Pixmap::new(ENVELOPE_W * SS, ENVELOPE_H * SS).unwrap();
-    draw(&mut hi, SS as f32, geom, bars, slots, label);
+    draw(&mut hi, SS as f32, geom, bars, slots, label, style);
     let mut out = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
     out.draw_pixmap(
         0,
@@ -200,12 +201,18 @@ fn write(name: &str, bg: (u8, u8, u8), rows: Vec<Vec<Pixmap>>) {
 /// Every frame of a transition, evenly spaced across its duration — including
 /// both endpoints, so the first and last cells are the modes themselves.
 fn filmstrip(from: PillMode, to: PillMode, tween: Tween, bars: &[f32]) -> Vec<Pixmap> {
+    // Either end may be the bar; whatever the other one is, it is drawn the
+    // same under both bodies.
+    let style = match (style_of(from), style_of(to)) {
+        (BodyStyle::Islands, other) => other,
+        (named, _) => named,
+    };
     let t0 = Instant::now();
     let motion = Motion::start(Geom::of(from), to, tween, t0);
     (0..STEPS)
         .map(|s| {
             let at = t0 + tween.dur.mul_f32(s as f32 / (STEPS - 1) as f32);
-            frame(&motion.at(at), bars)
+            frame(&motion.at(at), bars, style)
         })
         .collect()
 }
@@ -253,7 +260,7 @@ fn preview_modes() {
         }
     }
     for (r, (mode, bars)) in modes.iter().enumerate() {
-        let pill = frame(&Geom::of(*mode), bars);
+        let pill = frame(&Geom::of(*mode), bars, style_of(*mode));
         let y = r as u32 * cell.1 + PAD;
         blit(&mut out, &pill, PAD, y, LIGHT_DESKTOP);
         blit(&mut out, &pill, cell.0 + PAD, y, DARK_DESKTOP);
@@ -315,15 +322,24 @@ fn preview_conceals() {
     );
 }
 
-/// The button bar: nothing hovered, each button hovered in turn, and Copy
-/// disabled — the four states the expanded pill can be settled in.
+/// The button bar in each body, as two sheets to hold side by side.
 ///
-/// Over a light desktop and a black one, because the bare desktop *between* the
-/// islands is part of the design: there is no enclosing body, so what shows
-/// between them is whatever is behind the pill.
+/// `pill-buttons.png` is the design: three islands, over a light desktop and a
+/// black one, because the bare desktop *between* them is part of it — there is
+/// no enclosing body, so what shows between them is whatever is behind the
+/// pill. `pill-buttons-unified.png` is the reduced option, and what to look for
+/// there is an **absence**: no stadium, no brighter glyph, no wider slab.
+/// Nothing in it says which button matters, because it has no way to.
 #[test]
 #[ignore = "writes PNGs for eyeballing; run with --ignored"]
 fn preview_buttons() {
+    buttons_sheet(ISLANDS, "pill-buttons.png");
+    buttons_sheet(UNIFIED, "pill-buttons-unified.png");
+}
+
+/// One body's five settled states: nothing hovered, each button hovered in
+/// turn, and Copy disabled.
+fn buttons_sheet(mode: PillMode, name: &str) {
     let live = Slot {
         hover: 0.0,
         enabled: true,
@@ -345,7 +361,7 @@ fn preview_buttons() {
             ..live
         }),
     ];
-    let expanded = Geom::of(PillMode::Expanded);
+    let expanded = Geom::of(mode);
     let cell = cell();
     let mut out = canvas(2, rows.len() as u32, cell, LIGHT_DESKTOP);
     for y in 0..out.height() {
@@ -355,12 +371,12 @@ fn preview_buttons() {
         }
     }
     for (r, slots) in rows.iter().enumerate() {
-        let pill = frame_with(&expanded, &FLAT, slots);
+        let pill = frame_with(&expanded, &FLAT, slots, style_of(mode));
         let y = r as u32 * cell.1 + PAD;
         blit(&mut out, &pill, PAD, y, LIGHT_DESKTOP);
         blit(&mut out, &pill, cell.0 + PAD, y, DARK_DESKTOP);
     }
-    let path = out_dir().join("pill-buttons.png");
+    let path = out_dir().join(name);
     out.save_png(&path).expect("write preview png");
     println!("wrote {}", path.display());
 }
@@ -401,7 +417,7 @@ fn preview_labels() {
         })))
         .collect();
 
-    let expanded = Geom::of(PillMode::Expanded);
+    let expanded = Geom::of(ISLANDS);
     let cell = cell();
     let mut out = canvas(2, rows.len() as u32, cell, LIGHT_DESKTOP);
     for y in 0..out.height() {
@@ -411,7 +427,7 @@ fn preview_labels() {
         }
     }
     for (r, (fade, slots)) in rows.iter().enumerate() {
-        let pill = labelled(&expanded, &FLAT, slots, fade);
+        let pill = labelled(&expanded, &FLAT, slots, fade, BodyStyle::Islands);
         let y = r as u32 * cell.1 + PAD;
         blit(&mut out, &pill, PAD, y, LIGHT_DESKTOP);
         blit(&mut out, &pill, cell.0 + PAD, y, DARK_DESKTOP);
@@ -431,14 +447,14 @@ fn preview_label_crossfade() {
     let strip = |set: &dyn Fn(&mut Label)| -> Vec<Pixmap> {
         let mut l = Label::new(t0);
         set(&mut l);
-        let expanded = Geom::of(PillMode::Expanded);
+        let expanded = Geom::of(ISLANDS);
         (0..STEPS)
             .map(|s| {
                 let at = t0
                     + crate::pill::label::LABEL_FADE
                         .dur
                         .mul_f32(s as f32 / (STEPS - 1) as f32);
-                labelled(&expanded, &FLAT, &NO_SLOTS, &l.at(at))
+                labelled(&expanded, &FLAT, &NO_SLOTS, &l.at(at), BodyStyle::Islands)
             })
             .collect()
     };
@@ -472,19 +488,30 @@ fn preview_label_over_a_collapsing_pill() {
     let t0 = Instant::now();
     let mut label = Label::new(t0);
     label.flash(COPIED, t0);
-    let motion = Motion::start(Geom::of(PillMode::Expanded), PillMode::Idle, HOVER_OUT, t0);
+    let motion = Motion::start(Geom::of(ISLANDS), PillMode::Idle, HOVER_OUT, t0);
     let strip: Vec<Pixmap> = (0..STEPS)
         .map(|s| {
             let at = t0 + HOVER_OUT.dur.mul_f32(s as f32 / (STEPS - 1) as f32);
-            labelled(&motion.at(at), &FLAT, &NO_SLOTS, &label.at(at))
+            labelled(
+                &motion.at(at),
+                &FLAT,
+                &NO_SLOTS,
+                &label.at(at),
+                BodyStyle::Islands,
+            )
         })
         .collect();
     write("pill-label-collapse.png", STRIP_BG, vec![strip]);
 }
 
-/// The fold-out and the collapse: the flankers sliding out from behind Dictate
-/// and back. The point of the pair is that neither staggers — every button's
-/// offset is the same progress value.
+/// The fold-out and the collapse, in each body.
+///
+/// Rows one and two are the islands: the flankers sliding out from behind
+/// Dictate and back, neither staggering, because every button's offset is the
+/// same progress value. Rows three and four are the unified body doing the same
+/// thing with nothing to slide — the slots are measured inward from an edge
+/// that is itself growing, so they part as the body opens and there is still
+/// only one number moving.
 #[test]
 #[ignore = "writes PNGs for eyeballing; run with --ignored"]
 fn preview_expansion() {
@@ -492,8 +519,10 @@ fn preview_expansion() {
         "pill-expansion.png",
         STRIP_BG,
         vec![
-            filmstrip(PillMode::Idle, PillMode::Expanded, HOVER_IN, &FLAT),
-            filmstrip(PillMode::Expanded, PillMode::Idle, HOVER_OUT, &FLAT),
+            filmstrip(PillMode::Idle, ISLANDS, HOVER_IN, &FLAT),
+            filmstrip(ISLANDS, PillMode::Idle, HOVER_OUT, &FLAT),
+            filmstrip(PillMode::Idle, UNIFIED, HOVER_IN, &FLAT),
+            filmstrip(UNIFIED, PillMode::Idle, HOVER_OUT, &FLAT),
         ],
     );
 }
@@ -505,6 +534,11 @@ fn preview_expansion() {
 /// the check with it, so Processing looks the same however the session began.
 /// Row three: a cancel, which goes **straight back to the nub** — there is no
 /// reverse edge to the bar, so the handover is forward-only by construction.
+///
+/// Row four is row one under the unified body, and the pair is the ticket's
+/// claim on screen: the same MORPH, between two uniform-slot bodies eight
+/// pixels apart. Only the glyphs becoming discs move much, and nothing about
+/// the transition was written twice to get that.
 #[test]
 #[ignore = "writes PNGs for eyeballing; run with --ignored"]
 fn preview_click_session() {
@@ -512,7 +546,7 @@ fn preview_click_session() {
         "pill-click-session.png",
         STRIP_BG,
         vec![
-            filmstrip(PillMode::Expanded, click_recording(), MORPH, &LIVE),
+            filmstrip(ISLANDS, click_recording(), MORPH, &LIVE),
             filmstrip(
                 click_recording(),
                 PillMode::Processing {
@@ -522,6 +556,7 @@ fn preview_click_session() {
                 &LIVE,
             ),
             filmstrip(click_recording(), PillMode::Idle, CANCELLED, &LIVE),
+            filmstrip(UNIFIED, click_recording(), MORPH, &LIVE),
         ],
     );
 }
@@ -550,10 +585,16 @@ fn preview_breath() {
         STRIP_BG,
         vec![
             (0..STEPS)
-                .map(|s| frame(&breathe(settled, at(s)), &FLAT))
+                .map(|s| frame(&breathe(settled, at(s)), &FLAT, BodyStyle::Islands))
                 .collect(),
             (0..STEPS)
-                .map(|s| frame(&breathe(handoff.at(t0 + at(s)), at(s)), &LIVE))
+                .map(|s| {
+                    frame(
+                        &breathe(handoff.at(t0 + at(s)), at(s)),
+                        &LIVE,
+                        BodyStyle::Islands,
+                    )
+                })
                 .collect(),
         ],
     );

@@ -175,6 +175,17 @@ fn monitor_policy_from_config(cfg: &config::Config) -> (pill::monitor::Policy, O
     (policy, cfg.pill.monitor_pinned_path.clone())
 }
 
+/// The configured body style, as the Pill core names it. Two enums rather than
+/// one for the reason every pair here is two: `config` is library code and may
+/// not reach into the adapter, so the mapping lives at the boundary — beside
+/// [`monitor_policy_from_config`], which does the same job for the same reason.
+fn body_style_from_config(cfg: &config::Config) -> pill::core::BodyStyle {
+    match cfg.pill.body_style {
+        config::PillBodyStyle::Islands => pill::core::BodyStyle::Islands,
+        config::PillBodyStyle::Unified => pill::core::BodyStyle::Unified,
+    }
+}
+
 fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
     match cfg.activation {
         config::Activation::Toggle => activation::Mode::Toggle,
@@ -545,6 +556,8 @@ impl ApplicationHandler for App {
         // Before the presence, not after: `apply_presence` is what creates the
         // window, and a window has to be created *somewhere*.
         self.rederive_home();
+        // Before the presence too: the first mode handed over may be the bar.
+        self.apply_body_style(el);
         // This is also the first moment the foreground hook can be registered:
         // the docs require the registering thread to have a message loop.
         self.apply_residency(el);
@@ -806,6 +819,20 @@ impl App {
         }
     }
 
+    /// Hand the configured body style to both halves that need it: the Pill
+    /// core, which carries it inside `Expanded`, and the adapter, which draws
+    /// it. One config value, two consumers — exactly as the button enablement
+    /// is one fact fed to the core and to the tray.
+    ///
+    /// Called before residency at launch and on reload, so the first mode the
+    /// core hands over is already wearing the right body.
+    fn apply_body_style(&mut self, el: &ActiveEventLoop) {
+        let style = body_style_from_config(&self.cfg);
+        self.pill.set_body_style(style);
+        let cmds = self.pill_core.set_body_style(style);
+        self.run_pill_commands(cmds, el);
+    }
+
     /// Hand the current presence to the Pill core and perform whatever it
     /// decides that means. Note what this does *not* do: create or destroy a
     /// window. Presence is a fact about what the user asked for; whether a
@@ -1057,6 +1084,11 @@ impl App {
         self.home.configure(policy, pinned_path);
         self.displays = pill::monitor::enumerate();
         self.poll_home(Instant::now());
+        // A new body style is a new `Expanded`, so this goes in ahead of the
+        // presence that may hand one over. Changed while the bar is up, it is
+        // a snap: the two bodies are not a transition, and a settings save is
+        // not a gesture to animate.
+        self.apply_body_style(el);
         // Residency rides beside the activation reset: hand the new value to
         // the Pill core and let it decide. Toggled off mid-session it changes
         // nothing on screen until the flash retires, because activity outranks
@@ -1134,6 +1166,10 @@ struct PillAdapter {
     /// pixels. `MouseInput` carries no position, so this is what a click is
     /// tested against.
     cursor: Option<(f32, f32)>,
+    /// Which body the expanded pill wears. A drawing input, like `enabled`:
+    /// the Geom cannot carry a style, and a frame mid-morph belongs to no mode
+    /// to read one off. Fed from config beside the core's own copy.
+    body_style: pill::core::BodyStyle,
 }
 
 /// What to do with the window once the motion taking it off screen has run.
@@ -1164,7 +1200,16 @@ impl PillAdapter {
             enabled: [true; pill::core::BUTTON_COUNT],
             label: Label::new(Instant::now()),
             cursor: None,
+            body_style: pill::core::BodyStyle::default(),
         }
+    }
+
+    /// Adopt the configured body style. Owes a frame: the bar on screen right
+    /// now is the wrong shape from here on.
+    fn set_body_style(&mut self, style: pill::core::BodyStyle) {
+        let changed = self.body_style != style;
+        self.body_style = style;
+        self.owe(changed);
     }
 
     /// Note that something the renderer reads has moved, so the loop draws
@@ -1257,7 +1302,7 @@ impl PillAdapter {
             return false;
         };
         let reach = if expanded {
-            self.reach(r, pill::core::bar_width(), pill::core::BAR_H)
+            self.reach(r, self.body_style.bar_width(), pill::core::BAR_H)
         } else {
             self.reach(r, pill::geom::NUB_W, pill::geom::NUB_H)
         };
@@ -1573,7 +1618,7 @@ impl PillAdapter {
         // And the label, likewise: what it says is a surface of its own with
         // its own clock, not something a Geom could carry.
         let label = self.label.at(now);
-        if let Err(e) = pill.render(&geom, &bars, &slots, &label) {
+        if let Err(e) = pill.render(&geom, &bars, &slots, &label, self.body_style) {
             tracing::error!(error = %e, "pill render failed");
         }
         // One more frame is owed while a transition is still running, so the

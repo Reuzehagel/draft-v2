@@ -21,6 +21,7 @@
 // window's wndproc subclass closes by answering WM_MOUSEACTIVATE itself — see
 // `pill::hook`.
 
+use crate::pill::core::BodyStyle;
 use crate::pill::geom::{Geom, Slots};
 use crate::pill::hook::HookEvent;
 use crate::pill::label::Fade;
@@ -57,6 +58,7 @@ struct Frame {
     bars: Vec<f32>,
     slots: Slots,
     label: Fade,
+    style: BodyStyle,
 }
 
 pub struct PillWindow {
@@ -225,6 +227,7 @@ impl PillWindow {
         bar_heights: &[f32],
         slots: &Slots,
         label: &Fade,
+        style: BodyStyle,
     ) -> Result<()> {
         self.ensure_size()?;
         crate::pill::render::draw(
@@ -234,12 +237,14 @@ impl PillWindow {
             bar_heights,
             slots,
             label,
+            style,
         );
         self.last = Some(Frame {
             geom: *geom,
             bars: bar_heights.to_vec(),
             slots: *slots,
             label: *label,
+            style,
         });
         self.blit_and_present()
     }
@@ -322,7 +327,13 @@ impl PillWindow {
         let Some(frame) = self.last.take() else {
             return Ok(());
         };
-        let res = self.render(&frame.geom, &frame.bars, &frame.slots, &frame.label);
+        let res = self.render(
+            &frame.geom,
+            &frame.bars,
+            &frame.slots,
+            &frame.label,
+            frame.style,
+        );
         // `render` restores `last` on success; put it back if it didn't get
         // that far, so a failed re-push doesn't cost us the next one.
         if self.last.is_none() {

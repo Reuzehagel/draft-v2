@@ -62,6 +62,9 @@ pub struct PillConfig {
     /// slot is a setting that silently rots. A path that no longer resolves
     /// falls back to the primary monitor.
     pub monitor_pinned_path: Option<String>,
+    /// What the expanded pill's body looks like. Islands is the design;
+    /// unified is the reduced option, kept because it is nearly free.
+    pub body_style: PillBodyStyle,
 }
 
 impl Default for PillConfig {
@@ -70,8 +73,25 @@ impl Default for PillConfig {
             resident: true,
             monitor: MonitorPolicy::Focused,
             monitor_pinned_path: None,
+            body_style: PillBodyStyle::Islands,
         }
     }
+}
+
+/// How the expanded pill draws its button bar.
+///
+/// A setting rather than a decision because neither state can be misconfigured
+/// — unlike the button *set*, which has invariants a user could break. Named
+/// states rather than a `unified = true` flag: the file says which body is in
+/// force, and "islands" is a thing with a name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PillBodyStyle {
+    /// Three separate shapes with the desktop showing between them.
+    #[default]
+    Islands,
+    /// One body with three uniform slots.
+    Unified,
 }
 
 /// How the pill's home monitor is derived.

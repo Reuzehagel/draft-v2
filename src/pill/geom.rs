@@ -24,7 +24,7 @@
 // Pure: no winit, no Win32, no `Instant::now()`. `Motion::at` takes the `now`
 // it is asked about, exactly like the cores do.
 
-use crate::pill::core::{Origin, PillMode, CLICK_H, CLICK_W};
+use crate::pill::core::{BodyStyle, Origin, PillMode, BAR_H, CLICK_H, CLICK_W};
 use std::time::{Duration, Instant};
 
 /// The pill's resting silhouette — what `Idle` renders and what `Hidden` keeps
@@ -243,17 +243,41 @@ impl Geom {
                 buttons: 0.0,
                 check: 0.0,
             },
-            // The expanded pill is the *centre* island — the bar's other two
-            // are drawn beside it by the renderer, sliding out from behind it
-            // as `buttons` comes up. So the Geom that morphs is Dictate's, and
-            // the nub grows into the button under the cursor rather than into
-            // a body that is about to be three shapes.
-            PillMode::Expanded => {
-                let dictate = &crate::pill::core::BUTTONS[crate::pill::core::BUTTONS.len() / 2];
+            // Under islands the expanded pill is the *centre* island — the
+            // bar's other two are drawn beside it by the renderer, sliding out
+            // from behind it as `buttons` comes up. So the Geom that morphs is
+            // Dictate's, and the nub grows into the button under the cursor
+            // rather than into a body that is about to be three shapes.
+            PillMode::Expanded {
+                style: BodyStyle::Islands,
+            } => {
+                let dictate = &crate::pill::core::BUTTONS[crate::pill::core::CENTRE];
                 Geom {
                     w: dictate.w,
                     h: dictate.height(),
                     radius: dictate.radius(),
+                    fill_a: PILL_FILL_A,
+                    border_a: HAIRLINE_A,
+                    buttons: 1.0,
+                    ..Geom::of(PillMode::Idle)
+                }
+            }
+            // Under unified there is nothing beside it: the Geom is the whole
+            // body, and the slots are regions the renderer measures inside it.
+            //
+            // 104x32, on the click-started pill's own radius rule rather than a
+            // full round — which is what makes the handover to it a MORPH
+            // between two uniform-slot bodies of nearly equal width, and not a
+            // second treatment. The stadium is unavailable here by
+            // construction: one body cannot mark one of three slots by shape.
+            PillMode::Expanded {
+                style: style @ BodyStyle::Unified,
+            } => {
+                let w = style.bar_width();
+                Geom {
+                    w,
+                    h: BAR_H,
+                    radius: shape_radius(w, BAR_H),
                     fill_a: PILL_FILL_A,
                     border_a: HAIRLINE_A,
                     buttons: 1.0,
@@ -559,8 +583,13 @@ pub fn transition(from: PillMode, to: PillMode) -> Tween {
         // The bar handing itself over to a session the user started from it.
         // Ahead of the `Hidden` rows below because there is no way to reach it
         // from nothing: the button that starts it only exists on the bar.
+        //
+        // One row for both body styles, deliberately. Under islands it is
+        // three islands becoming one body; under unified it is one body
+        // widening by eight pixels while its slots become discs. Same tween,
+        // same crossfade, no second handover treatment.
         (
-            Expanded,
+            Expanded { .. },
             Recording {
                 origin: Origin::Click,
             },
@@ -589,8 +618,8 @@ pub fn transition(from: PillMode, to: PillMode) -> Tween {
         (Processing { .. }, Done { .. }) => Tween::SNAP,
         // Hover before the general return-to-idle: collapsing the button bar
         // is the same gesture as opening it, not the flash's slower resolve.
-        (Idle, Expanded) => HOVER_IN,
-        (Expanded, Idle) => HOVER_OUT,
+        (Idle, Expanded { .. }) => HOVER_IN,
+        (Expanded { .. }, Idle) => HOVER_OUT,
         (_, Idle) => TO_IDLE,
         // Everything else is a mode the pill was not in a moment ago arriving
         // without a settled treatment — a worker resolving before Recording's
@@ -703,6 +732,8 @@ mod tests {
         origin: Origin::Click,
     };
 
+    use crate::pill::bodies::{ISLANDS, UNIFIED};
+
     fn t(ms: u64) -> Instant {
         static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         *BASE.get_or_init(Instant::now) + Duration::from_millis(ms)
@@ -762,7 +793,8 @@ mod tests {
         for mode in [
             PillMode::Hidden,
             PillMode::Idle,
-            PillMode::Expanded,
+            ISLANDS,
+            UNIFIED,
             REC,
             CLICK_REC,
             proc(),
@@ -782,8 +814,9 @@ mod tests {
     /// anti-aliased edge.
     #[test]
     fn the_pill_band_holds_the_whole_button_bar() {
-        use crate::pill::core::{bar_width, BAR_H};
-        assert!(bar_width() < ENVELOPE_W as f32, "{}", bar_width());
+        for style in [BodyStyle::Islands, BodyStyle::Unified] {
+            assert!(style.bar_width() < ENVELOPE_W as f32, "{style:?}");
+        }
         const { assert!(BAR_H < PILL_BAND_H) };
         // And the session pill, which stopped being the envelope when the bar
         // grew past it.
@@ -845,7 +878,7 @@ mod tests {
     #[test]
     fn the_expanded_geom_is_the_centre_island() {
         use crate::pill::core::BUTTONS;
-        let g = Geom::of(PillMode::Expanded);
+        let g = Geom::of(ISLANDS);
         let dictate = &BUTTONS[BUTTONS.len() / 2];
         assert_eq!((g.w, g.h, g.radius), (48.0, 32.0, 16.0));
         assert_eq!((g.w, g.h), (dictate.w, dictate.height()));
@@ -853,6 +886,80 @@ mod tests {
         // And it carries the session pill's surface, not the nub's marker
         // alphas — it is a thing to click, not a thing to notice.
         assert!(g.fill_a > Geom::of(PillMode::Idle).fill_a);
+    }
+
+    /// Under unified there is nothing beside the body, so the Geom is the whole
+    /// bar: 104x32, at the click-started pill's radius rather than a full round.
+    ///
+    /// That radius is the point. A stadium marks Dictate, and one body cannot
+    /// mark one of three slots by shape — so the shared rule applies, and the
+    /// handover lands on a body it is already nearly the shape of.
+    #[test]
+    fn the_unified_geom_is_the_whole_bar_as_one_body() {
+        let g = Geom::of(UNIFIED);
+        assert_eq!((g.w, g.h), (104.0, 32.0));
+        assert_eq!(g.radius, shape_radius(CLICK_W, CLICK_H));
+        assert_eq!(g.buttons, 1.0);
+        // The surface is the bar's, unchanged — the style is the body, not a
+        // second material.
+        let islands = Geom::of(ISLANDS);
+        assert_eq!(
+            (g.fill, g.fill_a, g.border, g.border_a, g.bars, g.check),
+            (
+                islands.fill,
+                islands.fill_a,
+                islands.border,
+                islands.border_a,
+                islands.bars,
+                islands.check
+            )
+        );
+    }
+
+    /// **Unified marks nothing.** The islands bar makes Dictate primary by
+    /// shape — a 48 stadium among two 32 circles — and the unified body has no
+    /// way to say that and does not try: a flat row of three equals.
+    ///
+    /// Stated here as the *absence* of the mark, because that is what has to
+    /// keep being true. There is no brighter glyph and no wider slab because
+    /// there is no per-button dial in the Geom to set one with, and no resting
+    /// disc because the only disc the pill draws is the click-started session's
+    /// confirm — which lives on `check`, and `check` is 0 here.
+    #[test]
+    fn the_unified_body_marks_no_button_as_primary() {
+        let unified = BodyStyle::Unified;
+        let widths: Vec<f32> = (0..crate::pill::core::BUTTON_COUNT)
+            .map(|i| unified.button_w(i))
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
+        assert_eq!(Geom::of(UNIFIED).check, 0.0, "a disc at rest");
+        // ...where the islands bar's centre is exactly the wider slab.
+        let islands = BodyStyle::Islands;
+        assert!(islands.button_w(crate::pill::core::CENTRE) > islands.button_w(0));
+    }
+
+    /// The handover under unified: **the same MORPH**, between two uniform-slot
+    /// bodies eight pixels apart. No second treatment and no second tween — the
+    /// only thing the style changed is where the body started.
+    #[test]
+    fn the_unified_handover_is_the_same_morph_between_two_near_equal_bodies() {
+        assert_eq!(transition(UNIFIED, CLICK_REC), MORPH);
+        assert_eq!(transition(ISLANDS, CLICK_REC), MORPH);
+        // And the edge between the two bodies is a snap, which is what a
+        // settings save should be: they are two states, not a gesture.
+        assert_eq!(transition(ISLANDS, UNIFIED), Tween::SNAP);
+        assert_eq!(transition(UNIFIED, ISLANDS), Tween::SNAP);
+        let (from, to) = (Geom::of(UNIFIED), Geom::of(CLICK_REC));
+        assert_eq!((from.w, from.h), (104.0, 32.0));
+        assert_eq!((to.w, to.h), (112.0, 32.0));
+        // The body barely moves: it is the glyphs becoming discs that the eye
+        // follows, which is the whole reason this is worth having.
+        assert!(to.w - from.w == 8.0 && to.h == from.h);
+        assert_eq!(from.radius, to.radius, "the corner does not move either");
+        // And it is still one crossfade, exactly as it is under islands.
+        let m = Motion::start(from, CLICK_REC, MORPH, t(0));
+        assert_eq!((m.at(t(0)).buttons, m.at(t(0)).check), (1.0, 0.0));
+        assert_eq!((m.at(t(170)).buttons, m.at(t(170)).check), (0.0, 1.0));
     }
 
     /// The click-started pill's numbers, and the one thing that makes it *not*
@@ -883,7 +990,7 @@ mod tests {
     /// Two fields rather than one, because they move in opposite directions.
     #[test]
     fn the_bar_hands_over_to_the_check_in_one_lerp() {
-        let m = Motion::start(Geom::of(PillMode::Expanded), CLICK_REC, MORPH, t(0));
+        let m = Motion::start(Geom::of(ISLANDS), CLICK_REC, MORPH, t(0));
         assert_eq!((m.at(t(0)).buttons, m.at(t(0)).check), (1.0, 0.0));
         assert_eq!((m.at(t(170)).buttons, m.at(t(170)).check), (0.0, 1.0));
         assert!(!m.is_running(t(170)));
@@ -923,7 +1030,7 @@ mod tests {
     /// snap, which is what an unintended edge looks like.
     #[test]
     fn a_click_started_session_has_no_way_back_to_the_bar() {
-        assert_eq!(transition(CLICK_REC, PillMode::Expanded), Tween::SNAP);
+        assert_eq!(transition(CLICK_REC, ISLANDS), Tween::SNAP);
         // The one exit that is neither: residency switched off, or a
         // fullscreen app taking the screen, mid-session. There is no nub to
         // return to, so it leaves the way every mode leaves — a conceal, in
@@ -951,7 +1058,7 @@ mod tests {
     /// derived-frame model instead of being a second animation beside it.
     #[test]
     fn the_fold_out_rides_the_same_lerp_as_the_growth() {
-        let m = Motion::start(Geom::of(PillMode::Idle), PillMode::Expanded, HOVER_IN, t(0));
+        let m = Motion::start(Geom::of(PillMode::Idle), ISLANDS, HOVER_IN, t(0));
         assert_eq!(m.at(t(0)).buttons, 0.0);
         assert_eq!(m.at(t(110)).buttons, 1.0);
         // Monotone all the way, so nothing slides back on the way out.
@@ -1010,15 +1117,18 @@ mod tests {
             (PillMode::Idle, PillMode::Hidden, CONCEAL),
             (done(true), PillMode::Hidden, CONCEAL),
             (PillMode::Idle, REC, TO_RECORDING),
-            (PillMode::Expanded, REC, TO_RECORDING),
+            (ISLANDS, REC, TO_RECORDING),
             (REC, proc(), HANDOFF),
             (proc(), done(true), Tween::SNAP),
             (done(true), PillMode::Idle, TO_IDLE),
-            (PillMode::Idle, PillMode::Expanded, HOVER_IN),
-            (PillMode::Expanded, PillMode::Idle, HOVER_OUT),
+            (PillMode::Idle, ISLANDS, HOVER_IN),
+            (ISLANDS, PillMode::Idle, HOVER_OUT),
             // The click-started session's two edges, and no third: it is
             // reached from the bar and left for the nub or the handoff.
-            (PillMode::Expanded, CLICK_REC, MORPH),
+            (ISLANDS, CLICK_REC, MORPH),
+            (UNIFIED, CLICK_REC, MORPH),
+            (PillMode::Idle, UNIFIED, HOVER_IN),
+            (UNIFIED, PillMode::Idle, HOVER_OUT),
             (CLICK_REC, PillMode::Idle, CANCELLED),
             (CLICK_REC, proc(), HANDOFF),
         ];
