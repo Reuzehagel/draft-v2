@@ -14,7 +14,9 @@
 //   painted into, so text whose length isn't ours to control (device names)
 //   is laid out with `elided_galley` against the width actually free for it.
 //   The dropdown popup keeps the button's CONTROL_W at every window size;
-//   it is never widened to fit content.
+//   it is never widened to fit content. Option rows cut the *middle* out
+//   (`middle_elided_galley`) — device names differ at the end, so a trailing
+//   cut is what makes two rows look alike.
 
 use super::theme::*;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -42,6 +44,84 @@ fn elided_galley(
     );
     job.wrap = TextWrapping::truncate_at_width(max_width.max(0.0));
     ctx.fonts(|f| f.layout_job(job))
+}
+
+/// How the kept characters are split when the middle is cut: the head rounds
+/// up, so an odd budget gives the extra character to the start.
+fn head_len(kept: usize) -> usize {
+    kept.div_ceil(2)
+}
+
+/// Lay text out on one line, taking the *middle* out with a `…` when it doesn't
+/// fit `max_width`. Returns the galley and whether anything was cut — callers
+/// use the flag to decide whether the full text is worth a tooltip.
+///
+/// The cut is in the middle rather than at the tail because device names differ
+/// at the end: "Microphone Array (Realtek(R) Audio)" and the same name with a
+/// trailing "2" are one row apart in the list, and a trailing cut lands before
+/// the digit and draws them identically. The head alone is rarely the
+/// distinguishing part.
+///
+/// The galley never measures wider than `max_width`. That is stronger than what
+/// `elided_galley` alone gives: `truncate_at_width` bounds where text is cut,
+/// not how wide the result measures, and it lays the `…` out even in a 0px row.
+/// A row with no room for the ellipsis draws nothing rather than overflowing.
+fn middle_elided_galley(
+    ctx: &egui::Context,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_width: f32,
+) -> (std::sync::Arc<egui::Galley>, bool) {
+    let whole = elided_galley(ctx, text, font.clone(), color, max_width);
+    if !whole.elided {
+        return (whole, false);
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let joined = |kept: usize| -> String {
+        let head = head_len(kept);
+        let tail = kept - head;
+        chars[..head]
+            .iter()
+            .chain(std::iter::once(&'…'))
+            .chain(chars[chars.len() - tail..].iter())
+            .collect()
+    };
+
+    // Largest number of kept characters that still fits. A candidate fits only
+    // if it survives layout whole *and* measures inside the row — neither test
+    // alone is enough. `elided` misses a bare `…` in a row too narrow for it
+    // (nothing was cut, so the flag reads false while the galley overflows),
+    // and the measurement misses a candidate egui re-truncated, which fits
+    // precisely because it just lost the tail this function exists to keep.
+    let (mut lo, mut hi) = (0_usize, chars.len().saturating_sub(1));
+    let mut best: Option<std::sync::Arc<egui::Galley>> = None;
+    while lo <= hi {
+        let kept = (lo + hi) / 2;
+        let g = elided_galley(ctx, &joined(kept), font.clone(), color, max_width);
+        if !g.elided && g.size().x <= max_width {
+            best = Some(g);
+            lo = kept + 1;
+        } else {
+            match kept.checked_sub(1) {
+                Some(next) => hi = next,
+                None => break,
+            }
+        }
+    }
+
+    if let Some(g) = best {
+        return (g, true);
+    }
+    // Not even a bare `…` fits. `truncate_at_width` still lays the ellipsis out
+    // — it bounds where text is *cut*, not how wide the result measures — so
+    // falling back to it would paint outside the row, which is the whole bug
+    // this function exists to prevent. Draw nothing instead. No row a popup
+    // actually allocates comes near this; it is here so the bound holds at
+    // every width rather than only at plausible ones.
+    let empty = elided_galley(ctx, "", font, color, max_width);
+    (empty, true)
 }
 
 /// A flush group of rows constrained to a readable column width.
@@ -144,10 +224,11 @@ fn combo_item_text_w(row_w: f32) -> f32 {
 /// the current value.
 ///
 /// Layout invariant: the popup is CONTROL_W wide whatever the labels are, so a
-/// label that doesn't fit is elided — device names arrive from Windows at any
-/// length and used to draw straight past the popup edge. An elided row carries
-/// the full label as a hover tooltip; a row that fits carries none, so the
-/// tooltip itself is the signal that there is more text.
+/// label that doesn't fit has its middle cut — device names arrive from Windows
+/// at any length and used to draw straight past the popup edge, and they differ
+/// at the end, so the tail is the half worth keeping. A cut row carries the full
+/// label as a hover tooltip; a row that fits carries none, so the tooltip itself
+/// is the signal that there is more text.
 pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
@@ -157,8 +238,8 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
             .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
     }
     let text_w = combo_item_text_w(rect.width());
-    let galley = elided_galley(ui.ctx(), text, egui::FontId::proportional(13.0), FG, text_w);
-    let elided = galley.elided;
+    let (galley, elided) =
+        middle_elided_galley(ui.ctx(), text, egui::FontId::proportional(13.0), FG, text_w);
     let pos = egui::pos2(
         rect.left() + COMBO_ITEM_INSET,
         rect.center().y - galley.size().y / 2.0,
@@ -696,7 +777,7 @@ mod tests {
     fn a_label_stops_short_of_the_check_column() {
         let ctx = font_ctx();
         for row_w in ROW_WIDTHS {
-            let g = elided_galley(
+            let (g, _) = middle_elided_galley(
                 &ctx,
                 "Microfoonmatrix (Intel® Smart Sound Technologie)",
                 egui::FontId::proportional(13.0),
@@ -714,5 +795,89 @@ mod tests {
                 "in a {row_w}px row the label ends at {label_right}, check starts at {check_left}"
             );
         }
+    }
+
+    /// What a user actually reads: the glyphs laid out, not the source text.
+    /// A truncated galley keeps the whole string in `text()`, so asserting on
+    /// that would pass no matter where the cut landed.
+    fn visible(g: &egui::Galley) -> String {
+        g.rows[0].glyphs.iter().map(|gl| gl.chr).collect()
+    }
+
+    const LONG: &str = "Microfoonmatrix (Intel® Smart Sound Technologie voor digitale microfoons)";
+
+    /// A name too long for its row keeps both ends — the opening says what kind
+    /// of device it is, the closing is what tells it from its neighbour.
+    #[test]
+    fn a_cut_label_keeps_both_ends() {
+        let ctx = font_ctx();
+        for row_w in ROW_WIDTHS {
+            let max = combo_item_text_w(row_w);
+            let (g, cut) =
+                middle_elided_galley(&ctx, LONG, egui::FontId::proportional(13.0), FG, max);
+            let seen = visible(&g);
+            assert!(cut, "a 72-char device name must not fit {max}px");
+            assert!(g.size().x <= max, "{seen:?} is wider than its {max}px row");
+            assert!(
+                seen.starts_with("Micro"),
+                "{seen:?} should open with the real name"
+            );
+            assert!(
+                seen.ends_with("microfoons)"),
+                "{seen:?} should close with the real name's tail"
+            );
+            let cuts = seen.chars().filter(|c| *c == '…').count();
+            assert_eq!(
+                cuts, 1,
+                "{seen:?} should lose exactly one run, in the middle"
+            );
+        }
+    }
+
+    /// The reason the cut is in the middle at all. Two Realtek entries differing
+    /// only in a trailing "2" are one row apart in the popup; a trailing cut
+    /// lands before the digit and draws them identically.
+    #[test]
+    fn two_names_differing_only_at_the_end_stay_apart() {
+        let ctx = font_ctx();
+        let font = egui::FontId::proportional(13.0);
+        for row_w in ROW_WIDTHS {
+            let max = combo_item_text_w(row_w);
+            let one = "Microphone Array (Realtek(R) Audio)";
+            let two = "Microphone Array (Realtek(R) Audio 2)";
+            let (g1, _) = middle_elided_galley(&ctx, one, font.clone(), FG, max);
+            let (g2, _) = middle_elided_galley(&ctx, two, font.clone(), FG, max);
+            assert_ne!(
+                visible(&g1),
+                visible(&g2),
+                "two devices a digit apart must not draw the same in a {row_w}px row"
+            );
+        }
+    }
+
+    /// A row too narrow for even a bare `…` degrades to the trailing cut rather
+    /// than painting outside itself — the property the popup depends on.
+    #[test]
+    fn a_hopeless_row_still_stays_inside_itself() {
+        let ctx = font_ctx();
+        for max in [0.0, 1.0, 4.0, 9.0] {
+            let (g, cut) =
+                middle_elided_galley(&ctx, LONG, egui::FontId::proportional(13.0), FG, max);
+            assert!(cut, "nothing of a 72-char name fits {max}px whole");
+            assert!(
+                g.size().x <= max,
+                "galley {} escaped its {max}px row",
+                g.size().x
+            );
+        }
+    }
+
+    /// The head rounds up, so an odd budget favours the start.
+    #[test]
+    fn the_kept_characters_split_down_the_middle() {
+        assert_eq!(head_len(0), 0);
+        assert_eq!(head_len(1), 1);
+        assert_eq!(head_len(8), 4);
+        assert_eq!(head_len(9), 5);
     }
 }
