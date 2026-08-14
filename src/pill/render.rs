@@ -38,23 +38,52 @@ use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
 
-// The bar row's proportions, authored against an 86x42 draft and kept as
-// fractions of the *body* so the same drawing code holds at any size the morph
-// passes through.
+// The waveform has a metric of its own (#75), in logical pixels, scaled by DPI
+// like every other length here.
+//
+// It used to be fractions of whatever body the Geom carried, which meant every
+// body width got its own bar width: the hotkey pill's 62 drew ~1.8px bars and
+// the click-started pill's 112 drew ~2.6px ones, and the two recording pills
+// read as different features. Nothing about how a session was *started* is
+// supposed to change how loud the room looks. The body now decides only how
+// much room the row gets, never how thick a bar is.
+//
+// The numbers are the hotkey pill's, which is the shape #18 and #41 were tuned
+// against and the one most sessions wear.
 
-/// Bar width and the gap between bars, as fractions of the body width: the row
-/// keeps its share of the pill's span rather than a fixed size.
-const BAR_W_RATIO: f32 = 2.5 / 86.0;
-const BAR_GAP_RATIO: f32 = 2.5 / 86.0;
-/// Clear space above and below the tallest bar, as a fraction of body height.
-const BAR_PAD_RATIO: f32 = 5.0 / 42.0;
+/// A bar's width and the gap between two of them.
+const BAR_W: f32 = 1.75;
+const BAR_GAP: f32 = 1.75;
+/// A silent bar's height, and a bar's height at full amplitude.
+///
+/// Resting height > bar width: idle bars read as short pills instead of dots,
+/// so the resting silhouette is clearly a row of bars. And well below the
+/// tallest, or quiet and loud speech stop being tellable apart.
+const BAR_MIN_H: f32 = 4.5;
+const BAR_MAX_H: f32 = 19.0;
+/// Clear space between the tallest bar and the body's inner edge, which is what
+/// stops a bar poking through the hairline on a body shorter than the row was
+/// authored for — every mid-morph frame between the nub and a session, and
+/// between the button bar and a click-started pill.
+const BAR_CLEAR: f32 = 2.5;
+
+/// ...and the most of a body it may ever take, which is what keeps it from
+/// eating one. On a nub-tall body an absolute 2.5 either side leaves 2 of 7 and
+/// the row all but vanishes for the first frames of a reveal; a share of the
+/// body degrades instead, and never binds at any size a mode actually rests at.
+const BAR_CLEAR_MAX: f32 = 0.2;
 
 /// Control-point distance, as a fraction of the radius, that makes a cubic
 /// bezier approximate a quarter circle.
 const KAPPA: f32 = 0.552_284_8;
 
-/// Every length the bar row is drawn from, derived from the body the Geom
-/// describes — not from the pixmap, which is the envelope and stays put.
+/// Every length the bar row is drawn from: the row's own metric at this frame's
+/// `scale`, held inside the body the Geom describes.
+///
+/// The body is an input twice over and a *dimension* neither time — it says how
+/// tall a bar may be before it fouls the hairline, and (through
+/// [`Bars::fitted`]) how wide the row may be before it leaves the body. What a
+/// bar actually measures is the same at every size.
 struct Bars {
     bar_w: f32,
     bar_gap: f32,
@@ -63,20 +92,15 @@ struct Bars {
 }
 
 impl Bars {
-    fn new(body_w: f32, body_h: f32) -> Self {
-        let bar_w = body_w * BAR_W_RATIO;
-        // The padding is a share of the body, but on a body short enough that
-        // it no longer clears its own inset the body wins: bars never poke
-        // through the hairline.
-        let bar_max_h = (body_h - 2.0 * (body_h * BAR_PAD_RATIO)).max(0.0);
+    fn new(scale: f32, body_h: f32) -> Self {
+        // On a body short enough that the authored height no longer clears its
+        // own inset, the body wins: bars never poke through the hairline.
+        let clear = (BAR_CLEAR * scale).min(body_h * BAR_CLEAR_MAX);
+        let bar_max_h = (BAR_MAX_H * scale).min((body_h - 2.0 * clear).max(0.0));
         Self {
-            bar_w,
-            bar_gap: body_w * BAR_GAP_RATIO,
-            // Min height > width: idle bars read as short pills instead of
-            // dots, so the resting silhouette is clearly a row of bars. On a
-            // body far wider than it is tall that would exceed the height
-            // budget, so it yields to the maximum.
-            bar_min_h: (bar_w * 2.5).min(bar_max_h),
+            bar_w: BAR_W * scale,
+            bar_gap: BAR_GAP * scale,
+            bar_min_h: (BAR_MIN_H * scale).min(bar_max_h),
             bar_max_h,
         }
     }
@@ -88,12 +112,14 @@ impl Bars {
 
     /// The same row squeezed into `span`, if it does not already fit.
     ///
-    /// The click-started pill is the one body that does not give the whole of
-    /// its width to the waveform — cancel and confirm take an end each — so
-    /// the proportions of the body would otherwise put a 42px row inside a
-    /// 34px gap. Scaled uniformly rather than clipped or re-gapped: what makes
-    /// the row read as a waveform at every size the morph passes through is
-    /// that its bars and gaps keep their ratio to each other.
+    /// A **clamp for pathological sizes**, not the thing that sets the look.
+    /// Seven bars at the authored metric span ~23, which is inside every span
+    /// the pill ever leaves the row — the click-started pill's 34 between the
+    /// discs is the narrowest of them. It binds only on a body far smaller than
+    /// any mode, which the morph does not pass through but which a future one
+    /// could. Scaled uniformly rather than clipped or re-gapped: what makes the
+    /// row read as a waveform at any size at all is that its bars and gaps keep
+    /// their ratio to each other.
     fn fitted(self, span: f32, count: usize) -> Self {
         let have = self.span(count);
         if have <= span || have <= 0.0 {
@@ -232,7 +258,7 @@ pub fn draw(
     );
 
     if geom.bars > 0.0 {
-        let bars = Bars::new(body_w, body_h).fitted(row_span(geom, scale), bar_heights.len());
+        let bars = bars_of(geom, scale, bar_heights.len());
         draw_bars(pm, cy, &bars, bar_heights, geom.bars);
     }
 
@@ -283,6 +309,20 @@ fn check_x(geom: &Geom, i: usize, scale: f32) -> f32 {
 fn row_span(geom: &Geom, scale: f32) -> f32 {
     let claimed = CHECK_CLAIM * geom.check.clamp(0.0, 1.0);
     ((geom.w - 2.0 * claimed) * scale).max(0.0)
+}
+
+/// The row `geom` draws at `scale`: the authored metric, held inside the body
+/// this frame has and the span the check leaves it.
+///
+/// **The one place the row is worked out.** The two limits are different
+/// questions — [`row_span`] is what the check has left, `body_w` is the *drawn*
+/// body, inset from the Geom's width by the border and its margin — and the
+/// narrower of them binds. Derived here rather than at each call site so the
+/// tests ask exactly the question `draw` does; a hand-copy of the pair would
+/// drift, which is the same reason [`body_of`] exists.
+fn bars_of(geom: &Geom, scale: f32, count: usize) -> Bars {
+    let (_, body_w, body_h) = body_of(geom, scale);
+    Bars::new(scale, body_h).fitted(row_span(geom, scale).min(body_w), count)
 }
 
 /// Cancel and confirm, inside the body they belong to.
@@ -987,16 +1027,59 @@ mod tests {
     fn quiet_and_loud_stay_distinguishable_at_the_shipped_size() {
         // Off the same body derivation `draw` uses, not a hand-copy of its
         // inset arithmetic — the two would drift.
-        let (_, body_w, body_h) = body_of(&Geom::of(REC), 1.0);
-        let bars = Bars::new(body_w, body_h);
+        let (_, _, body_h) = body_of(&Geom::of(REC), 1.0);
+        let bars = Bars::new(1.0, body_h);
         let at = |amp: f32| bars.bar_min_h + amp * (bars.bar_max_h - bars.bar_min_h);
         assert!(bars.bar_min_h < bars.bar_max_h * 0.25);
         assert!(at(0.3) - at(0.0) > 1.0);
         assert!(at(1.0) - at(0.3) > 1.0);
+        // And a resting bar is a short pill rather than a dot: the row reads as
+        // bars before a single sound has been made.
+        assert!(bars.bar_min_h > 2.0 * bars.bar_w);
+        // The shipped row is the authored metric, un-clamped by the body it
+        // sits in — the clamp is for shapes the morph passes through.
+        assert_eq!((bars.bar_w, bars.bar_gap), (BAR_W, BAR_GAP));
+        assert_eq!((bars.bar_min_h, bars.bar_max_h), (BAR_MIN_H, BAR_MAX_H));
+    }
+
+    /// The bar row's drawn extent on the pill's centre line: first and last
+    /// bright column, over a window wide enough to hold the row and narrow
+    /// enough to miss the check's discs.
+    fn lit_span(pm: &Pixmap) -> (u32, u32) {
+        let cy = cy(pm, 1.0);
+        let cx = ENVELOPE_W / 2;
+        let lit: Vec<u32> = (cx - 20..cx + 20)
+            .filter(|&x| brightest(pm.pixel(x, cy).unwrap()) > 150)
+            .collect();
+        (lit[0], *lit.last().unwrap())
+    }
+
+    /// **The waveform is the waveform.** A recording frame at a given amplitude
+    /// carries the same bar width, gap and heights whether the session was
+    /// started by the hotkey or by a click on Dictate — origin decides
+    /// presentation, and the row is not presentation (#75).
+    #[test]
+    fn both_recording_pills_carry_the_same_row() {
+        let row = |mode: PillMode| {
+            let bars = bars_of(&Geom::of(mode), 1.0, BAR_COUNT);
+            let at = |amp: f32| bars.bar_min_h + amp * (bars.bar_max_h - bars.bar_min_h);
+            (
+                bars.bar_w,
+                bars.bar_gap,
+                [at(0.0), at(0.3), at(0.7), at(1.0)],
+            )
+        };
+        assert_eq!(row(REC), row(CLICK_REC));
+        // Measured off the drawn pixels too: the two rows are the same run of
+        // bright columns, centred, however wide the body around them is.
+        let drawn = |mode: PillMode| lit_span(&frame(mode, &[1.0; BAR_COUNT]));
+        assert_eq!(drawn(REC), drawn(CLICK_REC));
     }
 
     /// Bars must sit inside the body at every size the morph passes through,
-    /// not just the one the literals were picked for.
+    /// not just the one the metric was authored for — including the frames
+    /// between the button bar and the click-started pill, where the body
+    /// belongs to no mode at all.
     #[test]
     fn bars_stay_inside_the_body_at_any_size() {
         for (w, h) in [
@@ -1007,8 +1090,11 @@ mod tests {
             (24.0, 24.0),
             (120.0, 30.0),
             (30.0, 8.0),
+            // Narrower than the row's own span: the clamp, doing the one job it
+            // is still here for.
+            (16.0, 12.0),
         ] {
-            let g = Bars::new(w, h);
+            let g = Bars::new(1.0, h).fitted(w, BAR_COUNT);
             let side = (w - g.span(BAR_COUNT)) / 2.0;
             assert!(side >= 0.0, "{w}x{h}: bars overflow the body horizontally");
             assert!(
@@ -1019,6 +1105,53 @@ mod tests {
                 g.bar_w > 0.0 && g.bar_min_h <= g.bar_max_h,
                 "{w}x{h}: bar heights invert"
             );
+        }
+    }
+
+    /// Every frame of every morph that draws a row, checked the way the eye
+    /// checks it: nothing pokes through the hairline, and nothing leaves the
+    /// body sideways.
+    #[test]
+    fn no_bar_escapes_its_body_through_a_whole_morph() {
+        let proc = PillMode::Processing {
+            since: std::time::Instant::now(),
+        };
+        let legs = [
+            (PillMode::Idle, REC),
+            (PillMode::Idle, CLICK_REC),
+            (ISLANDS, CLICK_REC),
+            (UNIFIED, CLICK_REC),
+            (CLICK_REC, PillMode::Idle),
+            (REC, PillMode::Idle),
+            // The handoff, both ways in: the click-started leg is the one the
+            // ticket names, 112 down to 62 with the check leaving under it.
+            (REC, proc),
+            (CLICK_REC, proc),
+        ];
+        for (from, to) in legs {
+            for step in 0..=100 {
+                let g = Geom::of(from).lerp(Geom::of(to), step as f32 / 100.0);
+                if g.bars <= 0.0 {
+                    continue;
+                }
+                for scale in [1.0, 1.5, 2.0] {
+                    let (_, body_w, body_h) = body_of(&g, scale);
+                    if body_w <= 0.0 || body_h <= 0.0 {
+                        continue;
+                    }
+                    let bars = bars_of(&g, scale, BAR_COUNT);
+                    let what = format!("{from:?}->{to:?} at {step}% {scale}x");
+                    assert!(
+                        bars.bar_max_h <= body_h,
+                        "{what}: a bar poked through the hairline"
+                    );
+                    assert!(
+                        bars.span(BAR_COUNT) <= body_w + 1e-3,
+                        "{what}: the row left the body"
+                    );
+                    assert!(bars.bar_min_h <= bars.bar_max_h, "{what}: heights invert");
+                }
+            }
         }
     }
 
@@ -1599,9 +1732,12 @@ mod tests {
         }
     }
 
-    /// The waveform is squeezed into the gap the check leaves it, rather than
-    /// running under the buttons — the body's own proportions would put a 42px
-    /// row inside a 34px gap.
+    /// The waveform is **centred in the gap the check leaves it**, rather than
+    /// running under the buttons or filling the gap for the sake of it.
+    ///
+    /// Since #75 the row is its own size and the 34 is only the room it has:
+    /// seven bars span ~23, which fits, so the fit has nothing to do here and
+    /// the row sits centred with clear body either side of it.
     ///
     /// The claim is against the *settled* shape. Mid-morph the pair pass
     /// through each other as the buttons separate out of the centre, which is
@@ -1609,34 +1745,32 @@ mod tests {
     /// gesture is that both are derived from the same lerp, not that they
     /// never overlap.
     #[test]
-    fn the_row_is_fitted_between_the_two_buttons() {
+    fn the_row_sits_centred_between_the_two_buttons() {
         let settled = Geom::of(CLICK_REC);
         let (_, body_w, body_h) = body_of(&settled, 1.0);
-        let natural = Bars::new(body_w, body_h).span(BAR_COUNT);
-        assert!(natural > 34.0, "the fit had nothing to do ({natural})");
-        let row = Bars::new(body_w, body_h)
-            .fitted(row_span(&settled, 1.0), BAR_COUNT)
-            .span(BAR_COUNT);
-        let inner = check_x(&settled, 1, 1.0) - CHECK_BUTTON / 2.0;
-        assert!(row / 2.0 <= inner, "the row reached the check");
-        // And that is what is drawn: 34, not the 42 the body would have given.
-        let mut pm = envelope();
-        draw(
-            &mut pm,
-            1.0,
-            &settled,
-            &[1.0; BAR_COUNT],
-            &NO_SLOTS,
-            &NO_LABEL,
-            BodyStyle::Islands,
+        let free = row_span(&settled, 1.0).min(body_w);
+        assert_eq!(free, 34.0);
+        let natural = Bars::new(1.0, body_h).span(BAR_COUNT);
+        assert!(natural < free, "the row no longer fits its gap ({natural})");
+        assert_eq!(
+            bars_of(&settled, 1.0, BAR_COUNT).span(BAR_COUNT),
+            natural,
+            "the fit squeezed a row that fits"
         );
-        let cy = cy(&pm, 1.0);
+        let inner = check_x(&settled, 1, 1.0) - CHECK_BUTTON / 2.0;
+        assert!(natural / 2.0 < inner, "the row reached the check");
+        // And that is what is drawn, centred on the pill's own middle.
         let cx = ENVELOPE_W / 2;
-        let bright: Vec<u32> = (cx - 20..cx + 20)
-            .filter(|&x| brightest(pm.pixel(x, cy).unwrap()) > 150)
-            .collect();
-        let drawn = bright.last().unwrap() - bright[0] + 1;
-        assert!((30..=34).contains(&drawn), "the row spans {drawn}");
+        let (first, last) = lit_span(&frame(CLICK_REC, &[1.0; BAR_COUNT]));
+        let drawn = last - first + 1;
+        assert!(
+            (natural as u32).abs_diff(drawn) <= 2,
+            "the row spans {drawn}, not {natural}"
+        );
+        assert!(
+            (first + last).abs_diff(2 * cx) <= 1,
+            "the row is off centre: {first}..{last} about {cx}"
+        );
     }
 
     /// A fully-rounded corner has to be a real circular arc. The old quadratic
