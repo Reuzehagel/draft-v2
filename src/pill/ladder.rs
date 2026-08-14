@@ -102,6 +102,11 @@ pub struct Signals {
 /// display that has gone off is to stop rendering, and a locked session has
 /// nobody in front of it. Coming back is an event — the pill hook surfaces both
 /// — so nothing has to be polling to notice.
+///
+/// It follows that a terminal flash cannot expire while the screen is off, and
+/// that is the right answer rather than a cost: the flash is a *report*, and
+/// one that ran out to nobody would be a report nobody received. It retires on
+/// the same pass that hears the display is back.
 pub fn rung(s: Signals) -> Rung {
     if !s.awake {
         return Rung::Wait;
