@@ -7,10 +7,11 @@
 // JSON has a top-level "text" field with the transcript.
 //
 // The `prompt` field is the weak tier of custom-vocabulary biasing (issue
-// #2): both providers condition the Whisper decoder on up to ~224 tokens of
-// free text, so feeding it the user's vocabulary nudges spelling toward
-// those terms. Strong keyterm biasing (Reson8) is separate, per-provider
-// work.
+// #2): both providers condition the decoder on a short run of free text
+// (~224 tokens on Whisper), so feeding it the user's vocabulary nudges
+// spelling toward those terms. OpenAI's `gpt-transcribe` also takes a
+// `keywords[]` list; the hint stays in `prompt` until the vocabulary work
+// moves it. Strong keyterm biasing (Reson8) is separate, per-provider work.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -33,7 +34,7 @@ impl OpenAiCompatTranscriber {
         Self::build(
             "openai",
             "https://api.openai.com/v1/audio/transcriptions",
-            "gpt-4o-mini-transcribe",
+            "gpt-transcribe",
             api_key,
             timeout,
             prompt,
@@ -69,6 +70,20 @@ impl OpenAiCompatTranscriber {
             client,
         })
     }
+
+    /// Every text field of the upload, beside the audio itself.
+    ///
+    /// No `language` (nor OpenAI's newer `languages[]`) on purpose: omitted
+    /// means auto-detect per clip, which is what a bilingual user needs. No
+    /// `response_format` either — both services answer JSON by default, and
+    /// JSON is the only output OpenAI documents for `gpt-transcribe`.
+    fn text_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![("model", self.model.to_string())];
+        if let Some(prompt) = &self.prompt {
+            fields.push(("prompt", prompt.clone()));
+        }
+        fields
+    }
 }
 
 impl Transcriber for OpenAiCompatTranscriber {
@@ -83,13 +98,16 @@ impl Transcriber for OpenAiCompatTranscriber {
             .file_name("clip.wav")
             .mime_str("audio/wav")
             .context("set wav mime")?;
-        // No `language` field on purpose: omitted means auto-detect per clip,
-        // which is what a bilingual user needs.
-        let mut form = reqwest::blocking::multipart::Form::new()
-            .text("model", self.model)
-            .part("file", part);
-        if let Some(prompt) = &self.prompt {
-            form = form.text("prompt", prompt.clone());
+        // `model`, then the audio, then the rest — the order this adapter has
+        // always sent, kept so neither service sees a different request.
+        let mut fields = self.text_fields().into_iter();
+        let mut form = reqwest::blocking::multipart::Form::new();
+        if let Some((field, value)) = fields.next() {
+            form = form.text(field, value);
+        }
+        form = form.part("file", part);
+        for (field, value) in fields {
+            form = form.text(field, value);
         }
 
         let resp = self
@@ -101,5 +119,64 @@ impl Transcriber for OpenAiCompatTranscriber {
             .with_context(|| format!("POST to {}", self.name))?;
 
         super::parse_text_response(self.name, resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn openai(prompt: Option<&str>) -> OpenAiCompatTranscriber {
+        let timeout = Duration::from_secs(5);
+        OpenAiCompatTranscriber::openai("key".into(), timeout, prompt.map(str::to_string)).unwrap()
+    }
+
+    fn groq(prompt: Option<&str>) -> OpenAiCompatTranscriber {
+        let timeout = Duration::from_secs(5);
+        OpenAiCompatTranscriber::groq("key".into(), timeout, prompt.map(str::to_string)).unwrap()
+    }
+
+    #[test]
+    fn openai_requests_gpt_transcribe() {
+        let t = openai(None);
+        assert_eq!(t.endpoint, "https://api.openai.com/v1/audio/transcriptions");
+        assert_eq!(t.text_fields(), [("model", "gpt-transcribe".to_string())]);
+    }
+
+    #[test]
+    fn openai_carries_the_vocabulary_hint_in_prompt() {
+        assert_eq!(
+            openai(Some("Draft, Parakeet")).text_fields(),
+            [
+                ("model", "gpt-transcribe".to_string()),
+                ("prompt", "Draft, Parakeet".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn groq_requests_whisper_large_v3_turbo() {
+        let t = groq(Some("Draft"));
+        assert_eq!(
+            t.endpoint,
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            t.text_fields(),
+            [
+                ("model", "whisper-large-v3-turbo".to_string()),
+                ("prompt", "Draft".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_language_is_ever_sent() {
+        for t in [openai(Some("Draft")), groq(Some("Draft"))] {
+            assert!(t
+                .text_fields()
+                .iter()
+                .all(|(field, _)| !field.starts_with("language")));
+        }
     }
 }
