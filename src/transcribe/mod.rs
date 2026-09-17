@@ -2,6 +2,7 @@
 // payload (cloud uploaders). Local providers can take the raw f32 slice
 // directly via the trait's `transcribe` entry point.
 
+pub mod elevenlabs;
 pub mod mistral;
 pub mod openai_compat;
 pub mod parakeet;
@@ -176,9 +177,12 @@ fn build_primary(cfg: &crate::config::Config, timeout: Duration) -> Option<Arc<d
                 "OpenAI",
             )
         }
-        other => {
-            tracing::warn!(?other, "provider not yet implemented; no transcriber");
-            None
+        Provider::Elevenlabs => {
+            let key = crate::secrets::load_key(Provider::Elevenlabs)?;
+            arc(
+                elevenlabs::ElevenLabsTranscriber::new(key, timeout),
+                "ElevenLabs",
+            )
         }
     }
 }
