@@ -121,7 +121,6 @@ const ALL_PROVIDERS: &[Provider] = &[
     Provider::Mistral,
     Provider::Groq,
     Provider::Openai,
-    Provider::Xai,
     Provider::Elevenlabs,
     Provider::Reson8,
 ];
@@ -180,7 +179,6 @@ struct ProviderKeys {
     mistral: String,
     groq: String,
     openai: String,
-    xai: String,
     elevenlabs: String,
     reson8: String,
 }
@@ -191,7 +189,6 @@ impl ProviderKeys {
             Provider::Mistral => &self.mistral,
             Provider::Groq => &self.groq,
             Provider::Openai => &self.openai,
-            Provider::Xai => &self.xai,
             Provider::Elevenlabs => &self.elevenlabs,
             Provider::Reson8 => &self.reson8,
             Provider::LocalParakeet => "",
@@ -202,7 +199,6 @@ impl ProviderKeys {
             Provider::Mistral => &mut self.mistral,
             Provider::Groq => &mut self.groq,
             Provider::Openai => &mut self.openai,
-            Provider::Xai => &mut self.xai,
             Provider::Elevenlabs => &mut self.elevenlabs,
             Provider::Reson8 => &mut self.reson8,
             Provider::LocalParakeet => return None,

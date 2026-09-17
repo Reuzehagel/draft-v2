@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub hotkey: String,
     pub activation: Activation,
+    /// A name this build doesn't know loads as local Parakeet — see
+    /// `provider_or_local`.
+    #[serde(deserialize_with = "provider_or_local")]
     pub provider: Provider,
     pub append_trailing_space: bool,
     pub restore_clipboard: bool,
@@ -180,7 +183,6 @@ pub enum Provider {
     LocalParakeet,
     Groq,
     Openai,
-    Xai,
     Elevenlabs,
     Mistral,
     Reson8,
@@ -195,11 +197,35 @@ impl Provider {
             Provider::Mistral => "Mistral (Voxtral)",
             Provider::Groq => "Groq",
             Provider::Openai => "OpenAI",
-            Provider::Xai => "xAI",
             Provider::Elevenlabs => "ElevenLabs",
             Provider::Reson8 => "Reson8",
         }
     }
+}
+
+/// An unrecognised provider name is not a corrupt config. It is either a
+/// **Provider** that has since been removed, or one a newer build wrote before
+/// a rollback; failing the parse would back the whole file up and cost the
+/// user their hotkey, Replacements and vocabulary over one stale value. So it
+/// loads as local Parakeet, with a warning, and the next save writes that down
+/// — a rollback keeps the settings, not the newer Provider. A value that isn't
+/// a string at all is still an error.
+fn provider_or_local<'de, D>(deserializer: D) -> std::result::Result<Provider, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+
+    let name = String::deserialize(deserializer)?;
+    let known: std::result::Result<Provider, serde::de::value::Error> =
+        Provider::deserialize(name.as_str().into_deserializer());
+    Ok(known.unwrap_or_else(|_| {
+        tracing::warn!(
+            provider = %name,
+            "unrecognised provider in config, using local Parakeet"
+        );
+        Provider::LocalParakeet
+    }))
 }
 
 impl Default for Config {
@@ -285,6 +311,68 @@ mod tests {
         // Residency is on by default — the nub is what this ticket is for.
         assert!(cfg.pill.resident);
         assert_eq!(cfg.pill, PillConfig::default());
+    }
+
+    /// Parses `text` with a subscriber attached, returning the config and
+    /// everything logged while parsing.
+    fn parse_capturing_logs(text: &str) -> (Config, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        let cfg = tracing::subscriber::with_default(subscriber, || {
+            toml::from_str(text).expect("a config naming an unknown provider parses")
+        });
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (cfg, logs)
+    }
+
+    /// A **Provider** that has been removed, or one a newer build wrote before
+    /// a rollback, is not a corrupt file: it loads as local Parakeet, says so
+    /// in the log, and keeps every other key.
+    #[test]
+    fn a_config_naming_an_unrecognised_provider_keeps_everything_else() {
+        for name in ["xai", "something_new"] {
+            let text = format!(
+                "hotkey = \"Ctrl+Alt+D\"\n\
+                 provider = \"{name}\"\n\
+                 vocabulary = [\"Reuzehagel\"]\n\
+                 [[replacements]]\n\
+                 from = \"draft\"\n\
+                 to = \"Draft\"\n"
+            );
+            let (cfg, logs) = parse_capturing_logs(&text);
+            assert_eq!(cfg.provider, Provider::LocalParakeet, "{name}");
+            assert_eq!(cfg.hotkey, "Ctrl+Alt+D", "{name}");
+            assert_eq!(cfg.vocabulary, vec!["Reuzehagel".to_string()], "{name}");
+            assert_eq!(cfg.replacements.len(), 1, "{name}");
+            assert_eq!(cfg.replacements[0].to, "Draft", "{name}");
+            assert!(logs.contains("WARN"), "{name}: {logs}");
+            assert!(logs.contains(name), "{name}: {logs}");
+        }
+    }
+
+    /// Tolerating an unknown provider *name* must not make a provider that
+    /// isn't a name parse: that is still a broken file, and takes the backup path.
+    #[test]
+    fn a_provider_that_is_not_a_string_is_still_an_error() {
+        assert!(toml::from_str::<Config>("provider = 3\n").is_err());
     }
 
     /// The table itself is `#[serde(default)]` too, so a `[pill]` section that
