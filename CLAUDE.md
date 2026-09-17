@@ -29,7 +29,7 @@ Transcription run (`transcription_run.rs`): file → `decode.rs` (symphonia demu
 
 Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat model as an instruction and pastes the answer; it skips the postprocess pipeline.
 
-The `Xai` and `Elevenlabs` config variants are not implemented.
+The `Elevenlabs` config variant is not implemented. An unrecognised `provider` in `config.toml` loads as local Parakeet (with a warning) rather than failing the parse, so removing a Provider costs nobody their settings.
 
 ## Facts that bite
 
