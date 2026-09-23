@@ -9,6 +9,8 @@
 // - All inputs share CONTROL_W x CONTROL_H so they line up column-perfect.
 // - The window is dark whatever Windows is set to: the theme preference is
 //   pinned and both of egui's style slots carry this theme (`install_style`).
+// - Every text colour clears 4.5:1 (WCAG AA) on each surface it is drawn on;
+//   `text_meets_aa_contrast` holds the pairs — add a row with a new one.
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2};
 // shadcn "neutral + lime" DARK theme, oklch → sRGB.
@@ -22,13 +24,18 @@ pub(super) const MUTED_FG: Color32 = Color32::from_rgb(161, 161, 161); // --mute
 /// Placeholder text inside empty inputs. Dimmer than MUTED_FG and italic at
 /// the call sites, so examples can't be mistaken for typed content — the
 /// global `override_text_color` would otherwise paint hints full-brightness.
-pub(super) const HINT_FG: Color32 = Color32::from_rgb(112, 112, 115);
+/// Still at least 4.5:1 on the input fill (`text_meets_aa_contrast`).
+pub(super) const HINT_FG: Color32 = Color32::from_rgb(136, 136, 140);
 pub(super) const RING: Color32 = Color32::from_rgb(115, 115, 115); // --ring  0.556 (neutral focus)
 pub(super) const PRIMARY: Color32 = Color32::from_rgb(132, 204, 22); // --primary (lime)
 pub(super) const PRIMARY_HOVER: Color32 = Color32::from_rgb(146, 214, 40);
 pub(super) const PRIMARY_PRESSED: Color32 = Color32::from_rgb(110, 172, 18);
-pub(super) const PRIMARY_FG: Color32 = Color32::from_rgb(53, 84, 14); // --primary-foreground (text on lime)
+pub(super) const PRIMARY_FG: Color32 = Color32::from_rgb(26, 46, 5); // --primary-foreground (text on lime)
 pub(super) const DESTRUCTIVE: Color32 = Color32::from_rgb(235, 107, 107); // --destructive
+pub(super) const DESTRUCTIVE_HOVER: Color32 = Color32::from_rgb(237, 119, 119);
+pub(super) const DESTRUCTIVE_PRESSED: Color32 = Color32::from_rgb(212, 96, 96);
+/// Text on the red. Dark ink, as on the lime: white on this red is ~2.9:1.
+pub(super) const DESTRUCTIVE_FG: Color32 = Color32::from_rgb(50, 8, 8);
 pub(super) const TOGGLE_OFF: Color32 = Color32::from_rgb(54, 54, 58);
 
 // Borders are SOLID greys, not semi-transparent strokes. A 1px stroke of a
@@ -197,5 +204,67 @@ mod tests {
         );
         assert_eq!(ctx.theme(), Theme::Dark);
         assert_eq!(ctx.style().visuals.panel_fill, BG);
+    }
+
+    /// WCAG 2 contrast ratio between two opaque colours, 1.0..=21.0.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        fn luminance(c: Color32) -> f32 {
+            let lin = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+        }
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// Every text colour against every surface it is drawn on — button
+    /// states included — clears WCAG AA for normal text (4.5:1), in both
+    /// style slots, so a colour tweak can't quietly regress one.
+    #[test]
+    fn text_meets_aa_contrast() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+
+        for theme in [Theme::Dark, Theme::Light] {
+            let v = &ctx.style_of(theme).visuals;
+            let text = v.override_text_color.expect("theme sets text colour");
+            let pairs = [
+                ("text on page", text, v.panel_fill),
+                ("text on sidebar/popup", text, v.window_fill),
+                ("text on control", text, v.widgets.inactive.bg_fill),
+                ("text on hovered control", text, CONTROL_HOVER),
+                ("selected text", text, v.selection.bg_fill),
+                ("text on selected nav", text, SELECTED_BG),
+                ("text in a field", text, v.extreme_bg_color),
+                ("muted on page", MUTED_FG, BG),
+                ("muted on sidebar", MUTED_FG, SIDEBAR_BG),
+                ("muted on disabled button", MUTED_FG, CONTROL_FILL),
+                ("muted on hovered control", MUTED_FG, CONTROL_HOVER),
+                ("hint in a field", HINT_FG, v.extreme_bg_color),
+                ("hint on control fill", HINT_FG, CONTROL_FILL),
+                ("link on page", v.hyperlink_color, BG),
+                ("error on page", DESTRUCTIVE, BG),
+                ("error on sidebar/dialog", DESTRUCTIVE, SIDEBAR_BG),
+                ("primary button", PRIMARY_FG, PRIMARY),
+                ("primary hovered", PRIMARY_FG, PRIMARY_HOVER),
+                ("primary pressed", PRIMARY_FG, PRIMARY_PRESSED),
+                ("destructive button", DESTRUCTIVE_FG, DESTRUCTIVE),
+                ("destructive hovered", DESTRUCTIVE_FG, DESTRUCTIVE_HOVER),
+                ("destructive pressed", DESTRUCTIVE_FG, DESTRUCTIVE_PRESSED),
+            ];
+            let failing: Vec<String> = pairs
+                .iter()
+                .map(|&(name, fg, bg)| (name, contrast(fg, bg)))
+                .filter(|&(_, ratio)| ratio < 4.5)
+                .map(|(name, ratio)| format!("{name}: {ratio:.2}:1"))
+                .collect();
+            assert!(failing.is_empty(), "{theme:?} below 4.5:1 — {failing:#?}");
+        }
     }
 }

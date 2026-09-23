@@ -664,17 +664,19 @@ pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
         let draw_rect = rect.shrink(press_t * 1.2);
 
         let fill = if pressed {
-            lerp_color(DESTRUCTIVE, Color32::BLACK, 0.18)
+            DESTRUCTIVE_PRESSED
         } else if resp.hovered() {
-            lighten(DESTRUCTIVE, 0.08)
+            DESTRUCTIVE_HOVER
         } else {
             DESTRUCTIVE
         };
         ui.painter()
             .rect_filled(draw_rect, Rounding::same(RADIUS), fill);
-        let galley =
-            ui.painter()
-                .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.5), FG);
+        let galley = ui.painter().layout_no_wrap(
+            text.to_string(),
+            egui::FontId::proportional(13.5),
+            DESTRUCTIVE_FG,
+        );
         let pos = draw_rect.center() - galley.size() / 2.0;
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
