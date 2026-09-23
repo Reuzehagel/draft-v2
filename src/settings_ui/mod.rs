@@ -76,6 +76,8 @@ pub fn run() -> anyhow::Result<()> {
         history: crate::history::load(),
         history_filter: String::new(),
         confirm_clear_history: false,
+        unsaved_prompt: false,
+        close_confirmed: false,
         input_devices: crate::audio::capture::input_device_names(),
         displays: pinnable_displays(),
     };
@@ -290,6 +292,9 @@ impl HotkeyErrors {
     }
 }
 
+/// Why Save is off while there are edits, said wherever Save is offered.
+const HOTKEY_BLOCKS_SAVE: &str = "A hotkey needs fixing before you can save.";
+
 /// What one Esc closes: the topmost surface only — a **popup**, else a
 /// **modal card**, else the window.
 #[derive(Debug, PartialEq, Eq)]
@@ -297,22 +302,44 @@ enum EscCloses {
     Popup,
     KeyDialog,
     ConfirmClear,
+    UnsavedPrompt,
     Window,
 }
 
 /// egui 0.29's popup closes itself on Esc but reads the key without consuming
 /// it, so the popup has to be asked about here or the same press closes the
 /// window too (#94).
-fn esc_closes(popup_open: bool, key_dialog_open: bool, confirm_clear_open: bool) -> EscCloses {
+fn esc_closes(
+    popup_open: bool,
+    key_dialog_open: bool,
+    confirm_clear_open: bool,
+    unsaved_prompt_open: bool,
+) -> EscCloses {
     if popup_open {
         EscCloses::Popup
     } else if key_dialog_open {
         EscCloses::KeyDialog
     } else if confirm_clear_open {
         EscCloses::ConfirmClear
+    } else if unsaved_prompt_open {
+        EscCloses::UnsavedPrompt
     } else {
         EscCloses::Window
     }
+}
+
+/// The one gate every way out of the window passes: the title bar's close
+/// button raises a close request, and so do Esc and the footer's Close, which
+/// send `ViewportCommand::Close` rather than exiting. A request made with
+/// unsaved changes is cancelled, and `true` says to ask about them first —
+/// unless `close_confirmed`, which is the prompt already answered.
+fn hold_close(ctx: &egui::Context, dirty: bool, close_confirmed: bool) -> bool {
+    let requested = ctx.input(|i| i.viewport().close_requested());
+    let hold = requested && dirty && !close_confirmed;
+    if hold {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    }
+    hold
 }
 
 /// Open API-key editor. Follows the write-only pattern: we never prefill or
@@ -349,6 +376,12 @@ struct SettingsApp {
     /// True while the "Clear history?" confirmation modal is open. The wipe only
     /// happens once the user confirms — clearing is irreversible.
     confirm_clear_history: bool,
+    /// True while the "Save changes?" modal is open: a close was asked for
+    /// with edits that would be lost, and is held until the user picks.
+    unsaved_prompt: bool,
+    /// Set once that prompt is answered with Save or Discard, so the close it
+    /// sends is let through rather than held again.
+    close_confirmed: bool,
     /// Input device names enumerated at window open, for the microphone picker.
     input_devices: Vec<String>,
     /// Connected displays as (device path, label), enumerated at window open,
@@ -417,6 +450,7 @@ impl eframe::App for SettingsApp {
         if save_shortcut
             && self.key_dialog.is_none()
             && !self.confirm_clear_history
+            && !self.unsaved_prompt
             && self.can_save()
         {
             self.save();
@@ -427,12 +461,21 @@ impl eframe::App for SettingsApp {
                 popup_open,
                 self.key_dialog.is_some(),
                 self.confirm_clear_history,
+                self.unsaved_prompt,
             ) {
                 EscCloses::Popup => ctx.memory_mut(|m| m.close_popup()),
                 EscCloses::KeyDialog => self.key_dialog = None,
                 EscCloses::ConfirmClear => self.confirm_clear_history = false,
+                EscCloses::UnsavedPrompt => self.unsaved_prompt = false,
                 EscCloses::Window => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
+        }
+        if hold_close(ctx, self.is_dirty(), self.close_confirmed) {
+            // The prompt replaces whatever modal was up: the window is on its
+            // way out, and one question at a time.
+            self.key_dialog = None;
+            self.confirm_clear_history = false;
+            self.unsaved_prompt = true;
         }
 
         egui::SidePanel::left("rail")
@@ -488,6 +531,7 @@ impl eframe::App for SettingsApp {
         // Modals sit above everything when open.
         self.key_dialog_view(ctx);
         self.confirm_clear_view(ctx);
+        self.unsaved_prompt_view(ctx);
     }
 }
 
@@ -1137,7 +1181,7 @@ impl SettingsApp {
                     // pane the user has since left, so say why Save is off.
                     (_, true) if !can_save => {
                         ui.label(
-                            RichText::new("A hotkey needs fixing before you can save.")
+                            RichText::new(HOTKEY_BLOCKS_SAVE)
                                 .size(12.0)
                                 .color(DESTRUCTIVE),
                         );
@@ -1308,6 +1352,80 @@ impl SettingsApp {
             Act::None => {}
         }
     }
+
+    /// "Save changes?" on the way out: save and close, discard and close, or
+    /// stay. The scrim, Cancel, and Esc all stay. Save is off for the same
+    /// reason the footer's is, and the message says so.
+    fn unsaved_prompt_view(&mut self, ctx: &egui::Context) {
+        if !self.unsaved_prompt {
+            return;
+        }
+        enum Act {
+            None,
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut act = Act::None;
+        let can_save = self.can_save();
+        let scrim_clicked = modal_card(ctx, "unsaved_prompt", |ui| {
+            ui.label(
+                RichText::new("Save changes before closing?")
+                    .size(15.0)
+                    .strong()
+                    .color(FG),
+            );
+            ui.add_space(4.0);
+            let msg = if can_save {
+                "Your changes will be lost if you don't save them.".to_string()
+            } else {
+                format!("{HOTKEY_BLOCKS_SAVE} Discard closes without your changes.")
+            };
+            ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
+            ui.add_space(18.0);
+            // Pin the row height, as in the clear-history confirmation.
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 34.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui.add(primary_button("Save", can_save)).clicked() && can_save {
+                        act = Act::Save;
+                    }
+                    ui.add_space(8.0);
+                    if ui.add(ghost_button("Discard", 84.0, 34.0)).clicked() {
+                        act = Act::Discard;
+                    }
+                    ui.add_space(8.0);
+                    if ui.add(ghost_button("Cancel", 84.0, 34.0)).clicked() {
+                        act = Act::Cancel;
+                    }
+                },
+            );
+        });
+        if scrim_clicked && matches!(act, Act::None) {
+            act = Act::Cancel;
+        }
+
+        match act {
+            Act::Save => {
+                self.unsaved_prompt = false;
+                self.save();
+                // A failed save stays open with the footer saying why, rather
+                // than closing on edits that never reached disk.
+                if !self.is_dirty() {
+                    self.close_confirmed = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Act::Discard => {
+                self.unsaved_prompt = false;
+                self.close_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Act::Cancel => self.unsaved_prompt = false,
+            Act::None => {}
+        }
+    }
 }
 
 // ---- pane chrome -------------------------------------------------------
@@ -1435,18 +1553,85 @@ mod tests {
 
     #[test]
     fn esc_with_a_popup_open_closes_only_the_popup() {
-        assert_eq!(esc_closes(true, false, false), EscCloses::Popup);
+        assert_eq!(esc_closes(true, false, false, false), EscCloses::Popup);
     }
 
     #[test]
     fn esc_with_a_modal_card_open_closes_only_the_modal() {
-        assert_eq!(esc_closes(false, true, false), EscCloses::KeyDialog);
-        assert_eq!(esc_closes(false, false, true), EscCloses::ConfirmClear);
+        assert_eq!(esc_closes(false, true, false, false), EscCloses::KeyDialog);
+        assert_eq!(
+            esc_closes(false, false, true, false),
+            EscCloses::ConfirmClear
+        );
     }
 
     #[test]
     fn esc_with_nothing_open_closes_the_window() {
-        assert_eq!(esc_closes(false, false, false), EscCloses::Window);
+        assert_eq!(esc_closes(false, false, false, false), EscCloses::Window);
+    }
+
+    #[test]
+    fn esc_with_the_unsaved_changes_prompt_open_stays() {
+        assert_eq!(
+            esc_closes(false, false, false, true),
+            EscCloses::UnsavedPrompt
+        );
+    }
+
+    /// A frame whose input carries a close request for the window — what both
+    /// the title bar's close button and our own `ViewportCommand::Close` produce.
+    fn close_request() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                events: vec![egui::ViewportEvent::Close],
+                ..Default::default()
+            },
+        );
+        input
+    }
+
+    /// Runs one frame of `hold_close` and reports whether it held, and whether
+    /// the window was told to stay open.
+    fn run_hold_close(input: egui::RawInput, dirty: bool, close_confirmed: bool) -> (bool, bool) {
+        let ctx = egui::Context::default();
+        let mut held = false;
+        let out = ctx.run(input, |ctx| held = hold_close(ctx, dirty, close_confirmed));
+        let cancelled = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose));
+        (held, cancelled)
+    }
+
+    #[test]
+    fn closing_with_no_unsaved_changes_closes_immediately() {
+        assert_eq!(
+            run_hold_close(close_request(), false, false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn closing_with_unsaved_changes_is_held_for_the_prompt() {
+        assert_eq!(run_hold_close(close_request(), true, false), (true, true));
+    }
+
+    /// Save-and-close and Discard both answer the prompt by closing again; that
+    /// second request must go through even though the edits are still there
+    /// (Discard) or a save failed to clear them.
+    #[test]
+    fn closing_after_the_prompt_is_answered_is_not_held_again() {
+        assert_eq!(run_hold_close(close_request(), true, true), (false, false));
+    }
+
+    #[test]
+    fn no_close_request_holds_nothing() {
+        assert_eq!(
+            run_hold_close(egui::RawInput::default(), true, false),
+            (false, false)
+        );
     }
 
     /// The bug behind #94: egui 0.29's popup reads Esc without consuming it,
@@ -1473,7 +1658,7 @@ mod tests {
         let mut seen = None;
         let _ = ctx.run(esc, |ctx| {
             let popup_open = ctx.memory(|m| m.any_popup_open());
-            seen = Some(esc_closes(popup_open, false, false));
+            seen = Some(esc_closes(popup_open, false, false, false));
         });
         assert_eq!(seen, Some(EscCloses::Popup));
     }
