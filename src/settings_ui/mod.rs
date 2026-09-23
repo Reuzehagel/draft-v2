@@ -1,9 +1,9 @@
 // egui-based settings window. Runs as a subprocess (`draft.exe --settings`)
 // so it lives in its own event loop and can't deadlock the main pill /
-// hotkey loop. On Save: writes config.toml, stashes API keys in the OS
-// keyring, toggles autostart in the registry. The main process polls the
-// subprocess; when it exits, it reloads config + re-registers the hotkey if
-// it changed.
+// hotkey loop. On Save: writes config.toml, writes the API keys edited in
+// this window to the OS keyring, toggles autostart in the registry. The main
+// process polls the subprocess; when it exits, it reloads config +
+// re-registers the hotkey if it changed.
 //
 // Layout is a two-pane "app settings" shell: a left rail navigates between
 // panes (`Tab::ALL` is the rail order) and the right pane shows that pane's
@@ -34,8 +34,11 @@ pub fn run() -> anyhow::Result<()> {
     let autostart_enabled = autostart::is_enabled();
 
     let mut keys = ProviderKeys::default();
+    let mut key_sources = Vec::new();
     for &p in ALL_PROVIDERS {
-        keys.set(p, secrets::load_key(p).unwrap_or_default());
+        let (key, source) = secrets::load_key_with_source(p);
+        keys.set(p, key.unwrap_or_default());
+        key_sources.push((p, source));
     }
 
     let baseline = Snapshot {
@@ -50,6 +53,7 @@ pub fn run() -> anyhow::Result<()> {
         cfg,
         vocab_buffer,
         keys,
+        key_sources,
         autostart_enabled,
         key_dialog: None,
         baseline,
@@ -236,6 +240,10 @@ struct SettingsApp {
     /// user is still typing around.
     vocab_buffer: String,
     keys: ProviderKeys,
+    /// Where each key in `keys` came from, as of open or the last save. Save
+    /// consults it through `secrets::key_write` so an environment key is never
+    /// persisted and a key that failed to load is never deleted.
+    key_sources: Vec<(Provider, secrets::KeySource)>,
     autostart_enabled: bool,
     key_dialog: Option<KeyDialog>,
     baseline: Snapshot,
@@ -293,14 +301,21 @@ impl SettingsApp {
             self.save_status = Some((false, format!("Config save failed: {e}")));
             return;
         }
-        for &p in ALL_PROVIDERS {
-            if secrets::slot_name(p).is_none() {
+        for (p, source) in self.key_sources.iter_mut() {
+            let Some(write) =
+                secrets::key_write(self.baseline.keys.get(*p), self.keys.get(*p), *source)
+            else {
                 continue;
-            }
-            if let Err(e) = secrets::save_key(p, self.keys.get(p)) {
+            };
+            if let Err(e) = secrets::apply_write(*p, &write) {
                 self.save_status = Some((false, format!("Keyring save failed ({p:?}): {e}")));
                 return;
             }
+            // Advance this key's baseline now, not with the rest: if a later
+            // step fails, the next save must compare against what the keyring
+            // holds, or a Remove made in between would read as "no edit".
+            *source = write.leaves();
+            self.baseline.keys.set(*p, self.keys.get(*p).to_string());
         }
         if let Err(e) = autostart::set_enabled(self.autostart_enabled) {
             self.save_status = Some((false, format!("Autostart toggle failed: {e}")));
