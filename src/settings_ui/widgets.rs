@@ -1,5 +1,5 @@
 // Reusable widgets for the settings window. Pure functions over egui — no
-// app state in here; anything stateful stays in mod.rs.
+// app state in here; anything stateful stays out (in mod.rs, or download.rs).
 //
 // Layout invariants that keep this UI from regressing:
 // - Measure, then allocate. Text that wraps next to other content is laid

@@ -10,13 +10,15 @@
 // rows as flush groups separated by hairline rules.
 //
 // The module splits along what-changes-together lines:
-// - `theme`   — every colour, metric, and the egui style install.
-// - `widgets` — reusable stateless widgets (rows, toggles, buttons, modal).
-// - here      — the app: state, tabs, dialogs, save/dirty logic.
+// - `theme`    — every colour, metric, and the egui style install.
+// - `widgets`  — reusable stateless widgets (rows, toggles, buttons, modal).
+// - `download` — the model download's shared state and worker body.
+// - here       — the app: state, tabs, dialogs, save/dirty logic.
 // Read the header comments of `theme` and `widgets` before adding UI; they
 // document the layout invariants (measure-then-allocate, bounded
 // right_to_left, shared control metrics) this window depends on.
 
+mod download;
 mod theme;
 mod widgets;
 
@@ -24,6 +26,7 @@ use crate::autostart;
 use crate::config::{Activation, Config, MonitorPolicy, PasteMode, PillBodyStyle, Provider};
 use crate::secrets;
 use crate::transcribe::parakeet_download::{self, Progress as DlProgress};
+use download::DownloadState;
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
 use std::sync::{Arc, Mutex};
 use theme::*;
@@ -58,7 +61,9 @@ pub fn run() -> anyhow::Result<()> {
         key_dialog: None,
         baseline,
         save_status: None,
-        download_state: Arc::new(Mutex::new(DownloadState::initial())),
+        download_state: Arc::new(Mutex::new(DownloadState::new(
+            parakeet_download::is_present(),
+        ))),
         history: crate::history::load(),
         history_filter: String::new(),
         confirm_clear_history: false,
@@ -263,24 +268,6 @@ struct SettingsApp {
     /// for the pinned-display picker. The path is what gets stored; the label
     /// is only ever shown.
     displays: Vec<(String, String)>,
-}
-
-struct DownloadState {
-    model_present: bool,
-    running: bool,
-    progress: Option<DlProgress>,
-    finished: Option<Result<(), String>>,
-}
-
-impl DownloadState {
-    fn initial() -> Self {
-        Self {
-            model_present: parakeet_download::is_present(),
-            running: false,
-            progress: None,
-            finished: None,
-        }
-    }
 }
 
 impl SettingsApp {
@@ -689,12 +676,7 @@ impl SettingsApp {
     }
 
     fn parakeet_row(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Recover rather than panic if the download worker poisoned the lock —
-        // a failed download shouldn't take down the whole settings window.
-        let mut state = self
-            .download_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = download::lock(&self.download_state);
         split_row(
             ui,
             |ui| {
@@ -733,27 +715,20 @@ impl SettingsApp {
                         ))
                         .clicked()
                     {
-                        state.running = true;
-                        state.finished = None;
-                        state.progress = None;
+                        state.start();
                         let handle = self.download_state.clone();
                         let repaint_ctx = ctx.clone();
                         std::thread::spawn(move || {
-                            let cb = {
-                                let handle = handle.clone();
-                                let repaint_ctx = repaint_ctx.clone();
-                                move |p: DlProgress| {
-                                    let mut s = handle.lock().unwrap();
-                                    s.progress = Some(p);
-                                    repaint_ctx.request_repaint();
-                                }
-                            };
-                            let result = parakeet_download::download(cb);
-                            let mut s = handle.lock().unwrap();
-                            s.running = false;
-                            s.model_present = parakeet_download::is_present();
-                            s.finished = Some(result.map_err(|e| e.to_string()));
-                            drop(s);
+                            download::run(
+                                &handle,
+                                |report| {
+                                    parakeet_download::download(|p: DlProgress| {
+                                        report(p);
+                                        repaint_ctx.request_repaint();
+                                    })
+                                },
+                                parakeet_download::is_present,
+                            );
                             // The progress repaint loop stops once running=false;
                             // wake the UI once more so the final state shows.
                             repaint_ctx.request_repaint();
