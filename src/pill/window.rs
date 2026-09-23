@@ -183,14 +183,20 @@ impl PillWindow {
         if self.home == home {
             return Ok(());
         }
-        self.home = home;
+        // Size the buffers before moving anything: if they can't be had, the
+        // pill stays whole on the monitor it was on rather than placed for one
+        // surface and holding another.
+        let prev = std::mem::replace(&mut self.home, home);
+        if let Err(e) = self.ensure_size() {
+            self.home = prev;
+            return Err(e);
+        }
         #[cfg(windows)]
         unsafe {
             place(self.layered.hwnd, &home)
         };
-        // The rect just changed, so the buffers may be the wrong size and the
-        // surface is certainly at the wrong resolution. Re-rendering the frame
-        // already on screen does both — `render` runs `ensure_size` first.
+        // The surface is at the wrong resolution for the new rect; re-rendering
+        // the frame already on screen fixes that.
         self.repush()
     }
 
@@ -347,18 +353,26 @@ impl PillWindow {
     ///
     /// So the window follows the buffers rather than the other way round: when
     /// the placement moves, the rect is re-asserted with it.
+    ///
+    /// All or nothing: every new buffer is built before any old one is
+    /// released, so a failure leaves the previous surface whole — and, since
+    /// the pixmaps still don't match, the next render tries again.
     fn ensure_size(&mut self) -> Result<()> {
         let (w, h) = surface_size(&self.home);
         if self.pixmap.width() != w || self.pixmap.height() != h {
-            self.pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
-            self.hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
+            let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
+            let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
                 .ok_or_else(|| anyhow!("hires pixmap"))?;
-            self.mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
+            let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
             #[cfg(windows)]
-            {
-                self.layered.resize(&self.window, w, h)?;
-                unsafe { place(self.layered.hwnd, &self.home) };
-            }
+            self.layered.dib.resize(w, h)?;
+            self.pixmap = pixmap;
+            self.hires = hires;
+            self.mid = mid;
+            #[cfg(windows)]
+            unsafe {
+                place(self.layered.hwnd, &self.home)
+            };
         }
         Ok(())
     }
@@ -395,11 +409,7 @@ impl PillWindow {
 #[cfg(windows)]
 struct LayeredSurface {
     hwnd: windows::Win32::Foundation::HWND,
-    mem_dc: windows::Win32::Graphics::Gdi::HDC,
-    dib: windows::Win32::Graphics::Gdi::HBITMAP,
-    bits: *mut u8,
-    w: u32,
-    h: u32,
+    dib: Dib,
     /// What WS_EX_TRANSPARENT is *meant* to be right now — the last thing
     /// [`PillWindow::set_click_through`] was told. Kept because the bit itself
     /// is not a reliable record: winit's clobber wipes it, and the re-arm that
@@ -414,14 +424,9 @@ impl LayeredSurface {
         // Born click-through: a new pill shows no buttons.
         let click_through = true;
         unsafe { apply_pill_ex_styles(hwnd, click_through) };
-        let (mem_dc, dib, bits) = create_dib(w, h)?;
         Ok(Self {
             hwnd,
-            mem_dc,
-            dib,
-            bits,
-            w,
-            h,
+            dib: Dib::new(w, h)?,
             click_through,
         })
     }
@@ -443,25 +448,8 @@ impl LayeredSurface {
         }
     }
 
-    fn resize(&mut self, window: &Window, w: u32, h: u32) -> Result<()> {
-        if self.w == w && self.h == h {
-            return Ok(());
-        }
-        unsafe { self.destroy_gdi() };
-        let _ = window;
-        let (mem_dc, dib, bits) = create_dib(w, h)?;
-        self.mem_dc = mem_dc;
-        self.dib = dib;
-        self.bits = bits;
-        self.w = w;
-        self.h = h;
-        Ok(())
-    }
-
     fn present(&mut self, pm: &Pixmap) -> Result<()> {
-        let byte_count = self.w as usize * self.h as usize * 4;
-        let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, byte_count) };
-        crate::pill::render::pixmap_to_premul_bgra(pm, dst);
+        crate::pill::render::pixmap_to_premul_bgra(pm, self.dib.pixels());
 
         // Normally we just blit. Re-arming WS_EX_LAYERED briefly drops the
         // window out of per-pixel-alpha mode, so Windows flashes it as a plain
@@ -498,8 +486,8 @@ impl LayeredSurface {
 
         let screen_dc = GetDC(None);
         let size = windows::Win32::Foundation::SIZE {
-            cx: self.w as i32,
-            cy: self.h as i32,
+            cx: self.dib.w as i32,
+            cy: self.dib.h as i32,
         };
         let src_pt = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
@@ -513,7 +501,7 @@ impl LayeredSurface {
             screen_dc,
             None,
             Some(&size),
-            self.mem_dc,
+            self.dib.dc.0,
             Some(&src_pt),
             windows::Win32::Foundation::COLORREF(0),
             Some(&blend),
@@ -521,27 +509,6 @@ impl LayeredSurface {
         );
         ReleaseDC(None, screen_dc);
         res.map_err(|e| anyhow!("UpdateLayeredWindow: {e}"))
-    }
-
-    unsafe fn destroy_gdi(&mut self) {
-        use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
-        // Delete the DC first: the DIB is still selected into it, and GDI
-        // refuses to delete a selected bitmap. DeleteDC deselects it, so the
-        // subsequent DeleteObject actually frees the DIB's backing memory
-        // instead of leaking it on every resize.
-        if !self.mem_dc.is_invalid() {
-            let _ = DeleteDC(self.mem_dc);
-        }
-        if !self.dib.is_invalid() {
-            let _ = DeleteObject(self.dib);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for LayeredSurface {
-    fn drop(&mut self) {
-        unsafe { self.destroy_gdi() }
     }
 }
 
@@ -688,56 +655,112 @@ unsafe fn show_no_activate(hwnd: windows::Win32::Foundation::HWND) {
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 }
 
+/// A memory DC, deleted on drop.
 #[cfg(windows)]
-fn create_dib(
+struct MemDc(windows::Win32::Graphics::Gdi::HDC);
+
+#[cfg(windows)]
+impl Drop for MemDc {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(self.0);
+        }
+    }
+}
+
+/// A GDI bitmap, deleted on drop.
+#[cfg(windows)]
+struct Bitmap(windows::Win32::Graphics::Gdi::HBITMAP);
+
+#[cfg(windows)]
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.0);
+        }
+    }
+}
+
+/// The layered surface's pixels: a top-down 32-bit DIB section selected into
+/// its own memory DC. It owns both handles, so the DC, the bitmap and `bits`
+/// cannot come apart, and no early return can leak one.
+#[cfg(windows)]
+struct Dib {
+    /// Declared before `bitmap` so it drops first: the bitmap is selected into
+    /// it, and GDI refuses to delete a selected bitmap. Deleting the DC
+    /// deselects it, so the bitmap's backing memory is actually freed.
+    dc: MemDc,
+    /// Held only for its `Drop`; `bits` points into it.
+    #[allow(dead_code)]
+    bitmap: Bitmap,
+    bits: *mut u8,
     w: u32,
     h: u32,
-) -> Result<(
-    windows::Win32::Graphics::Gdi::HDC,
-    windows::Win32::Graphics::Gdi::HBITMAP,
-    *mut u8,
-)> {
-    use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
-        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    };
-    unsafe {
-        let screen_dc = GetDC(None);
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        ReleaseDC(None, screen_dc);
-        if mem_dc.is_invalid() {
-            return Err(anyhow!("CreateCompatibleDC failed"));
-        }
+}
 
-        let mut bi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w as i32,
-                // Negative height = top-down DIB so byte order matches our tiny-skia row order.
-                biHeight: -(h as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
+#[cfg(windows)]
+impl Dib {
+    fn new(w: u32, h: u32) -> Result<Self> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         };
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(
-            mem_dc,
-            &bi as *const _,
-            DIB_RGB_COLORS,
-            &mut bits as *mut _,
-            None,
-            0,
-        )
-        .map_err(|e| anyhow!("CreateDIBSection: {e}"))?;
-        let _ = &mut bi;
-        if dib.is_invalid() || bits.is_null() {
-            return Err(anyhow!("CreateDIBSection returned null"));
+        unsafe {
+            let screen_dc = GetDC(None);
+            let dc = CreateCompatibleDC(screen_dc);
+            ReleaseDC(None, screen_dc);
+            if dc.is_invalid() {
+                return Err(anyhow!("CreateCompatibleDC failed"));
+            }
+            let dc = MemDc(dc);
+
+            let bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w as i32,
+                    // Negative height = top-down DIB so byte order matches our tiny-skia row order.
+                    biHeight: -(h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(dc.0, &bi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .map_err(|e| anyhow!("CreateDIBSection: {e}"))?;
+            if bitmap.is_invalid() {
+                return Err(anyhow!("CreateDIBSection returned null"));
+            }
+            let bitmap = Bitmap(bitmap);
+            if bits.is_null() {
+                return Err(anyhow!("CreateDIBSection returned no pixels"));
+            }
+            SelectObject(dc.0, bitmap.0);
+            Ok(Self {
+                dc,
+                bitmap,
+                bits: bits as *mut u8,
+                w,
+                h,
+            })
         }
-        SelectObject(mem_dc, dib);
-        Ok((mem_dc, dib, bits as *mut u8))
+    }
+
+    /// All or nothing: the new DIB is built before the old one is released,
+    /// so a failure leaves `self` exactly as it was — same size, same live
+    /// buffer.
+    fn resize(&mut self, w: u32, h: u32) -> Result<()> {
+        if self.w != w || self.h != h {
+            *self = Dib::new(w, h)?;
+        }
+        Ok(())
+    }
+
+    fn pixels(&mut self) -> &mut [u8] {
+        let len = self.w as usize * self.h as usize * 4;
+        unsafe { std::slice::from_raw_parts_mut(self.bits, len) }
     }
 }
 
@@ -821,5 +844,70 @@ mod tests {
             assert_eq!(cleared, cur & !WS_EX_LAYERED.0);
             assert_eq!(with_pill_ex_style(cleared, click_through), cur);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod dib_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS};
+
+    /// GDI objects are counted per process, so the tests that count them take
+    /// turns — one test's live DIB is another's apparent leak.
+    static GDI: Mutex<()> = Mutex::new(());
+
+    fn gdi_objects() -> u32 {
+        unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
+    }
+
+    /// Far past anything CreateDIBSection will back: 64k × 64k × 4 bytes.
+    const HUGE: u32 = 65_535;
+
+    #[test]
+    fn dropping_a_dib_releases_its_dc_and_bitmap() {
+        let _g = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        let before = gdi_objects();
+        let dib = Dib::new(10, 10).unwrap();
+        assert!(gdi_objects() > before);
+        drop(dib);
+        assert_eq!(gdi_objects(), before);
+    }
+
+    #[test]
+    fn a_dib_that_cannot_be_allocated_releases_what_it_created() {
+        let _g = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        let before = gdi_objects();
+        assert!(Dib::new(HUGE, HUGE).is_err());
+        assert_eq!(gdi_objects(), before);
+    }
+
+    #[test]
+    fn a_failed_resize_leaves_the_previous_dib_whole() {
+        let _g = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dib = Dib::new(10, 10).unwrap();
+        let (dc, bits) = (dib.dc.0, dib.bits);
+        let before = gdi_objects();
+
+        assert!(dib.resize(HUGE, HUGE).is_err());
+
+        assert_eq!((dib.w, dib.h), (10, 10));
+        assert_eq!((dib.dc.0, dib.bits), (dc, bits));
+        assert_eq!(gdi_objects(), before);
+        // Still writable: the buffer is the old one, not a freed one.
+        dib.pixels().fill(0xAB);
+    }
+
+    #[test]
+    fn a_resize_replaces_the_dib_and_frees_the_old_one() {
+        let _g = GDI.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dib = Dib::new(10, 10).unwrap();
+        let before = gdi_objects();
+
+        dib.resize(20, 30).unwrap();
+
+        assert_eq!((dib.w, dib.h), (20, 30));
+        assert_eq!(dib.pixels().len(), 20 * 30 * 4);
+        assert_eq!(gdi_objects(), before);
     }
 }
