@@ -429,18 +429,19 @@ pub(super) fn split_row(
 
 /// One editable find/replace rule: an enable switch, the from/to fields, the
 /// two match flags, and a remove button. Returns true when removal is asked.
-pub(super) fn replacement_editor(
-    ui: &mut egui::Ui,
-    idx: usize,
-    rule: &mut crate::config::Replacement,
-) -> bool {
+///
+/// The switch and fields take explicit ids under `ui.id()`, so the caller
+/// scopes them to the rule with `push_id`. They must be explicit: egui derives
+/// an auto id from a running per-frame counter, which shifts when an earlier
+/// row goes away.
+pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Replacement) -> bool {
     let mut remove = false;
     let field_w = 140.0;
     ui.horizontal(|ui| {
         // Drive gaps with explicit spacing so the row width is predictable
         // and doesn't wrap in the narrow window.
         ui.spacing_mut().item_spacing.x = 0.0;
-        let id = ui.make_persistent_id(("repl_enabled", idx));
+        let id = ui.make_persistent_id("repl_enabled");
         if mini_switch(ui, rule.enabled, id) {
             rule.enabled = !rule.enabled;
         }
@@ -448,6 +449,7 @@ pub(super) fn replacement_editor(
         ui.add_sized(
             [field_w, CONTROL_H],
             egui::TextEdit::singleline(&mut rule.from)
+                .id_salt("repl_from")
                 .hint_text(hint("hears…"))
                 .vertical_align(egui::Align::Center),
         );
@@ -457,6 +459,7 @@ pub(super) fn replacement_editor(
         ui.add_sized(
             [field_w, CONTROL_H],
             egui::TextEdit::singleline(&mut rule.to)
+                .id_salt("repl_to")
                 .hint_text(hint("writes…"))
                 .vertical_align(egui::Align::Center),
         );

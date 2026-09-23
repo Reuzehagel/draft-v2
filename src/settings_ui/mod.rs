@@ -80,6 +80,7 @@ pub fn run() -> anyhow::Result<()> {
         close_confirmed: false,
         input_devices: crate::audio::capture::input_device_names(),
         displays: pinnable_displays(),
+        rule_keys: RuleKeys::default(),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -388,6 +389,66 @@ struct SettingsApp {
     /// for the pinned-display picker. The path is what gets stored; the label
     /// is only ever shown.
     displays: Vec<(String, String)>,
+    rule_keys: RuleKeys,
+}
+
+/// A stable key for each replacement rule's row, parallel to
+/// `cfg.replacements`. The row's widgets take their ids from its key, not its
+/// index, so removing a rule doesn't hand the rules below it their
+/// predecessors' switch animations and text-edit state (#96). A key is never
+/// reused, so a new rule can't inherit a removed one's state either.
+#[derive(Debug, Default)]
+struct RuleKeys {
+    keys: Vec<u64>,
+    next: u64,
+}
+
+impl RuleKeys {
+    /// Match `len` rules: rules appended since the last call get fresh keys.
+    fn fit(&mut self, len: usize) {
+        while self.keys.len() < len {
+            self.keys.push(self.next);
+            self.next += 1;
+        }
+        self.keys.truncate(len);
+    }
+
+    fn key(&self, i: usize) -> u64 {
+        self.keys[i]
+    }
+
+    /// Call alongside removing rule `i`.
+    fn remove(&mut self, i: usize) {
+        self.keys.remove(i);
+    }
+}
+
+/// The editable list of replacement rules, each row under its rule's key.
+fn replacement_rows(
+    ui: &mut egui::Ui,
+    rules: &mut Vec<crate::config::Replacement>,
+    keys: &mut RuleKeys,
+) {
+    keys.fit(rules.len());
+    // Edit in place; defer the structural removal until after the
+    // borrow ends so we don't mutate the Vec mid-iteration.
+    let mut remove: Option<usize> = None;
+    for (i, rule) in rules.iter_mut().enumerate() {
+        if i > 0 {
+            divider(ui);
+        }
+        let key = keys.key(i);
+        if ui
+            .push_id(("repl_rule", key), |ui| replacement_editor(ui, rule))
+            .inner
+        {
+            remove = Some(i);
+        }
+    }
+    if let Some(i) = remove {
+        rules.remove(i);
+        keys.remove(i);
+    }
 }
 
 impl SettingsApp {
@@ -907,23 +968,9 @@ impl SettingsApp {
                 ui.add_space(12.0);
             }
 
-            // Edit in place; defer the structural removal until after the
-            // borrow ends so we don't mutate the Vec mid-iteration.
-            let mut remove: Option<usize> = None;
-            let count = self.cfg.replacements.len();
-            for i in 0..count {
-                if i > 0 {
-                    divider(ui);
-                }
-                if replacement_editor(ui, i, &mut self.cfg.replacements[i]) {
-                    remove = Some(i);
-                }
-            }
-            if let Some(i) = remove {
-                self.cfg.replacements.remove(i);
-            }
+            replacement_rows(ui, &mut self.cfg.replacements, &mut self.rule_keys);
 
-            if count > 0 {
+            if !self.cfg.replacements.is_empty() {
                 ui.add_space(16.0);
             }
             if ui
@@ -1661,5 +1708,114 @@ mod tests {
             seen = Some(esc_closes(popup_open, false, false, false));
         });
         assert_eq!(seen, Some(EscCloses::Popup));
+    }
+
+    fn rule(from: &str, enabled: bool) -> crate::config::Replacement {
+        crate::config::Replacement {
+            from: from.into(),
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn removing_a_rule_keeps_the_keys_of_the_rules_below_it() {
+        let mut keys = RuleKeys::default();
+        keys.fit(3);
+        let (b, c) = (keys.key(1), keys.key(2));
+        keys.remove(0);
+        assert_eq!((keys.key(0), keys.key(1)), (b, c));
+    }
+
+    /// A rule added after a removal must not inherit the removed rule's
+    /// state, so its key is new rather than the one that was freed.
+    #[test]
+    fn a_new_rule_never_reuses_a_removed_rules_key() {
+        let mut keys = RuleKeys::default();
+        keys.fit(2);
+        let gone = keys.key(1);
+        keys.remove(1);
+        keys.fit(2);
+        assert_ne!(keys.key(1), gone);
+    }
+
+    /// Runs one frame of the rule list with `events` as its input, and says
+    /// whether anything on it is still animating — which is what a switch
+    /// inheriting another rule's on/off state looks like.
+    fn rules_frame_animates(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        rules: &mut Vec<crate::config::Replacement>,
+        keys: &mut RuleKeys,
+    ) -> bool {
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| replacement_rows(ui, rules, keys));
+        });
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay == std::time::Duration::ZERO
+    }
+
+    /// #96: the rules below a removed one used to take over its row's ids,
+    /// so an off rule's switch slid on when an on rule moved into its place.
+    #[test]
+    fn removing_a_rule_leaves_the_switches_below_it_still() {
+        let ctx = egui::Context::default();
+        let mut rules = vec![rule("a", false), rule("b", true), rule("c", false)];
+        let mut keys = RuleKeys::default();
+        rules_frame_animates(&ctx, vec![], &mut rules, &mut keys);
+        assert!(
+            !rules_frame_animates(&ctx, vec![], &mut rules, &mut keys),
+            "settled"
+        );
+
+        rules.remove(0);
+        keys.remove(0);
+        assert!(!rules_frame_animates(&ctx, vec![], &mut rules, &mut keys));
+    }
+
+    /// Focus and cursor live in egui memory under the field's id, so typing
+    /// lands in the right rule only if that id stays with its rule.
+    #[test]
+    fn a_focused_field_stays_with_its_rule_when_an_earlier_rule_is_removed() {
+        let ctx = egui::Context::default();
+        let mut rules = vec![rule("a", true), rule("b", true)];
+        let mut keys = RuleKeys::default();
+        rules_frame_animates(&ctx, vec![], &mut rules, &mut keys);
+
+        // Tab to the third text field: a's "hears", a's "writes", b's "hears".
+        let tab = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let is_field = |id: egui::Id| egui::TextEdit::load_state(&ctx, id).is_some();
+        let (mut fields, mut last) = (0, None);
+        for _ in 0..32 {
+            rules_frame_animates(&ctx, vec![tab.clone()], &mut rules, &mut keys);
+            let now = ctx.memory(|m| m.focused());
+            if now != last && now.is_some_and(is_field) {
+                fields += 1;
+                if fields == 3 {
+                    break;
+                }
+            }
+            last = now;
+        }
+        assert_eq!(fields, 3, "tabbing reached b's field");
+
+        let typed = |s: &str| vec![egui::Event::Text(s.into())];
+        rules_frame_animates(&ctx, typed("1"), &mut rules, &mut keys);
+        assert_eq!(rules[1].from, "b1");
+
+        rules.remove(0);
+        keys.remove(0);
+        rules_frame_animates(&ctx, vec![], &mut rules, &mut keys);
+        rules_frame_animates(&ctx, typed("2"), &mut rules, &mut keys);
+        assert_eq!(rules[0].from, "b12");
     }
 }
