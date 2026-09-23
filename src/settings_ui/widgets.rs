@@ -17,6 +17,9 @@
 //   it is never widened to fit content. Option rows cut the *middle* out
 //   (`middle_elided_galley`) — device names differ at the end, so a trailing
 //   cut is what makes two rows look alike.
+// - A field's validation message hangs beneath its row, in the control
+//   column (`field_error`), not inside the row: the row keeps its height, so
+//   the field stays level with its label whether or not there is an error.
 
 use super::theme::*;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -320,14 +323,66 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
 // ---- rows --------------------------------------------------------------
 
 /// Single-line text input forced to a fixed width and height so every input
-/// in the window lines up.
-pub(super) fn text_input(ui: &mut egui::Ui, text: &mut String, placeholder: &str, width: f32) {
-    ui.add_sized(
-        [width, CONTROL_H],
-        egui::TextEdit::singleline(text)
-            .hint_text(hint(placeholder))
-            .vertical_align(egui::Align::Center),
+/// in the window lines up. An `invalid` field keeps its metrics and swaps its
+/// border — idle, hovered and focused alike — for the destructive colour; the
+/// message itself goes beneath the row, in `field_error`.
+pub(super) fn text_input(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    placeholder: &str,
+    width: f32,
+    invalid: bool,
+) -> egui::Response {
+    ui.scope(|ui| {
+        if invalid {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.bg_stroke.color = DESTRUCTIVE;
+            v.widgets.hovered.bg_stroke.color = DESTRUCTIVE;
+            v.widgets.active.bg_stroke.color = DESTRUCTIVE;
+            v.selection.stroke.color = DESTRUCTIVE;
+        }
+        ui.add_sized(
+            [width, CONTROL_H],
+            egui::TextEdit::singleline(text)
+                .hint_text(hint(placeholder))
+                .vertical_align(egui::Align::Center),
+        )
+    })
+    .inner
+}
+
+/// A validation message hung beneath a row, in the control column: laid out
+/// against CONTROL_W and painted from the control's left edge, so it sits
+/// directly under the field it's about and wraps within that column rather
+/// than across the label. Measured, then allocated at the measured height.
+pub(super) fn field_error(ui: &mut egui::Ui, msg: &str) {
+    let gap = 2.0;
+    let galley = field_error_galley(ui.ctx(), msg);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), gap + galley.size().y),
+        egui::Sense::hover(),
     );
+    ui.painter().galley(
+        egui::pos2(rect.right() - CONTROL_W, rect.top() + gap),
+        galley,
+        Color32::PLACEHOLDER,
+    );
+}
+
+/// The message wrapped to the control column. The message quotes what was
+/// typed, which can be one unbroken run longer than the column, so the wrap
+/// may break inside a word rather than let it overflow.
+fn field_error_galley(ctx: &egui::Context, msg: &str) -> std::sync::Arc<egui::Galley> {
+    let mut job = LayoutJob::single_section(
+        msg.to_owned(),
+        TextFormat {
+            font_id: egui::FontId::proportional(11.5),
+            color: DESTRUCTIVE,
+            ..Default::default()
+        },
+    );
+    job.wrap = TextWrapping::wrap_at_width(CONTROL_W);
+    ctx.fonts(|f| f.layout_job(job))
 }
 
 /// One label/value row. Label column is capped so long captions can't slide
@@ -870,6 +925,23 @@ mod tests {
                 g.size().x
             );
         }
+    }
+
+    /// A hotkey error quotes what was typed, and what was typed can be one
+    /// long run with nowhere to wrap. The message still stays in the control
+    /// column instead of running off the pane's right edge.
+    #[test]
+    fn a_field_error_stays_inside_the_control_column() {
+        let ctx = font_ctx();
+        let typed = "Ctrl+Bakslashbakslashbakslashbakslashbakslashbakslash";
+        let msg = crate::hotkey::parse(typed).unwrap_err().to_string();
+        let g = field_error_galley(&ctx, &msg);
+        assert!(g.rows.len() > 1, "{msg:?} is too long for one line");
+        assert!(
+            g.size().x <= CONTROL_W,
+            "error galley {} wider than the {CONTROL_W}px column",
+            g.size().x
+        );
     }
 
     /// The head rounds up, so an odd budget favours the start.

@@ -44,28 +44,72 @@ pub enum HotkeyEvent {
     Released(Chord, Instant),
 }
 
-pub fn parse(spec: &str) -> Result<HotKey> {
+/// Why a hotkey spec didn't parse. The messages are written for the settings
+/// window, which shows them beneath the field the spec was typed into — so
+/// they name the offending part, never the whole spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// Nothing but whitespace and stray `+`s.
+    Empty,
+    /// Modifiers with no key to go with them.
+    NoKey,
+    /// More than one non-modifier key, as typed.
+    TwoKeys(String, String),
+    /// A key name we don't map, as typed.
+    UnknownKey(String),
+    /// F13 and up: real keys, but not ones we map.
+    UnsupportedFunctionKey(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Empty => write!(f, "Enter a key combination, like Ctrl+Backslash."),
+            ParseError::NoKey => write!(f, "Add a key to go with the modifiers."),
+            ParseError::TwoKeys(a, b) => {
+                write!(
+                    f,
+                    "Use one key besides the modifiers, not both {a} and {b}."
+                )
+            }
+            ParseError::UnknownKey(k) => write!(f, "“{k}” isn't a key name Draft knows."),
+            ParseError::UnsupportedFunctionKey(k) => {
+                write!(f, "{k} isn't supported — use F1 to F12.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Parse a spec like "Ctrl+Shift+Backslash". Parts are `+`-separated, trimmed
+/// and case-insensitive; empty parts are skipped. The settings window validates
+/// with this same function, so a spec it lets through is one this accepts.
+pub fn parse(spec: &str) -> Result<HotKey, ParseError> {
     let mut mods = Modifiers::empty();
-    let mut key: Option<Code> = None;
-    for part in spec.split('+').map(str::trim) {
+    let mut key: Option<(Code, &str)> = None;
+    for part in spec.split('+').map(str::trim).filter(|p| !p.is_empty()) {
         match part.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => mods |= Modifiers::CONTROL,
             "shift" => mods |= Modifiers::SHIFT,
             "alt" => mods |= Modifiers::ALT,
             "super" | "win" | "meta" => mods |= Modifiers::SUPER,
-            other => {
-                if key.is_some() {
-                    return Err(anyhow!("hotkey '{spec}': multiple non-modifier keys"));
+            _ => {
+                if let Some((_, first)) = key {
+                    return Err(ParseError::TwoKeys(first.into(), part.into()));
                 }
-                key = Some(parse_code(other)?);
+                key = Some((parse_code(part)?, part));
             }
         }
     }
-    let code = key.ok_or_else(|| anyhow!("hotkey '{spec}': no key specified"))?;
-    Ok(HotKey::new(Some(mods), code))
+    match key {
+        Some((code, _)) => Ok(HotKey::new(Some(mods), code)),
+        None if mods.is_empty() => Err(ParseError::Empty),
+        None => Err(ParseError::NoKey),
+    }
 }
 
-fn parse_code(s: &str) -> Result<Code> {
+fn parse_code(s: &str) -> Result<Code, ParseError> {
     // Map a small set of human-friendly names. Anything not listed falls back
     // to letter/digit detection so "A", "1", "F5" etc. just work.
     let upper = s.to_ascii_uppercase();
@@ -142,9 +186,9 @@ fn parse_code(s: &str) -> Result<Code> {
             "F10" => Code::F10,
             "F11" => Code::F11,
             "F12" => Code::F12,
-            _ => return Err(anyhow!("unsupported function key: {s}")),
+            _ => return Err(ParseError::UnsupportedFunctionKey(s.into())),
         },
-        _ => return Err(anyhow!("unknown key name: {s}")),
+        _ => return Err(ParseError::UnknownKey(s.into())),
     };
     Ok(code)
 }
@@ -203,6 +247,12 @@ fn install_handler_once(waker: &crate::wake::Waker) -> crossbeam_channel::Receiv
     rx.clone()
 }
 
+/// `parse`, with the spec put back into the message: the log has no field
+/// beside it to say what was typed.
+fn parse_for_register(spec: &str) -> Result<HotKey> {
+    parse(spec).map_err(|e| anyhow!("hotkey '{spec}': {e}"))
+}
+
 /// Register the dictation hotkey (required) and, when given, the
 /// push-to-command hotkey. A command chord that fails to parse or register
 /// (e.g. another app owns the combo) is logged and skipped rather than
@@ -216,7 +266,7 @@ pub fn register(
     command_spec: Option<&str>,
     waker: &crate::wake::Waker,
 ) -> Result<(HotkeyHandle, crossbeam_channel::Receiver<HotkeyEvent>)> {
-    let dictate = parse(dictate_spec)?;
+    let dictate = parse_for_register(dictate_spec)?;
     let manager =
         GlobalHotKeyManager::new().map_err(|e| anyhow!("global-hotkey init failed: {e}"))?;
     manager.register(dictate).map_err(|e| {
@@ -226,7 +276,7 @@ pub fn register(
 
     let mut command_id = None;
     if let Some(spec) = command_spec {
-        let attempt = parse(spec).and_then(|hk| {
+        let attempt = parse_for_register(spec).and_then(|hk| {
             manager.register(hk).map_err(|e| {
                 anyhow!("RegisterHotKey failed for '{spec}': {e}. Another app may own this combo.")
             })?;
@@ -256,4 +306,65 @@ pub fn register(
         },
         rx,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_well_formed_chord_parses() {
+        let hk = parse("Ctrl+Backslash").unwrap();
+        assert_eq!(hk, HotKey::new(Some(Modifiers::CONTROL), Code::Backslash));
+        let hk = parse(" shift + alt + f5 ").unwrap();
+        assert_eq!(
+            hk,
+            HotKey::new(Some(Modifiers::SHIFT | Modifiers::ALT), Code::F5)
+        );
+    }
+
+    #[test]
+    fn a_blank_spec_asks_for_a_combination() {
+        assert_eq!(parse(""), Err(ParseError::Empty));
+        assert_eq!(parse("   "), Err(ParseError::Empty));
+    }
+
+    #[test]
+    fn modifiers_alone_ask_for_a_key() {
+        assert_eq!(parse("Ctrl+Shift"), Err(ParseError::NoKey));
+        assert_eq!(parse("Ctrl+"), Err(ParseError::NoKey));
+    }
+
+    #[test]
+    fn an_unknown_key_is_named_as_typed() {
+        assert_eq!(
+            parse("Ctrl+Bakslash"),
+            Err(ParseError::UnknownKey("Bakslash".into()))
+        );
+    }
+
+    #[test]
+    fn two_keys_are_both_named() {
+        assert_eq!(
+            parse("Ctrl+A+b"),
+            Err(ParseError::TwoKeys("A".into(), "b".into()))
+        );
+    }
+
+    #[test]
+    fn a_function_key_past_f12_is_refused() {
+        assert_eq!(
+            parse("Ctrl+F13"),
+            Err(ParseError::UnsupportedFunctionKey("F13".into()))
+        );
+    }
+
+    /// The message is shown beneath the field, which already says what was
+    /// typed — so it names the offending part, and never echoes the whole spec.
+    #[test]
+    fn a_message_names_the_problem_not_the_spec() {
+        let msg = parse("Ctrl+Bakslash").unwrap_err().to_string();
+        assert!(msg.contains("Bakslash"), "{msg}");
+        assert!(!msg.contains("Ctrl+"), "{msg}");
+    }
 }

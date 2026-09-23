@@ -228,6 +228,34 @@ struct Snapshot {
     autostart_enabled: bool,
 }
 
+/// What's wrong with each hotkey field, as the main process's parser would
+/// find it on reload. A spec that fails there is logged and the old binding
+/// kept — invisible from here — so Save refuses to write one.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HotkeyErrors {
+    dictate: Option<String>,
+    /// Only checked while push-to-command is on: that's the only time the main
+    /// process parses it, and the only time its field is on screen.
+    command: Option<String>,
+}
+
+impl HotkeyErrors {
+    fn of(cfg: &Config) -> Self {
+        let check = |spec: &str| crate::hotkey::parse(spec).err().map(|e| e.to_string());
+        HotkeyErrors {
+            dictate: check(&cfg.hotkey),
+            command: cfg
+                .push_to_command
+                .then(|| check(&cfg.command_hotkey))
+                .flatten(),
+        }
+    }
+
+    fn is_clear(&self) -> bool {
+        self.dictate.is_none() && self.command.is_none()
+    }
+}
+
 /// Open API-key editor. Follows the write-only pattern: we never prefill or
 /// redisplay the stored secret — the buffer starts empty and only overwrites
 /// the saved key if the user actually types one.
@@ -283,6 +311,12 @@ impl SettingsApp {
         self.current_snapshot() != self.baseline
     }
 
+    /// Save is offered only when there's something to save and nothing in it
+    /// the main process would refuse.
+    fn can_save(&self) -> bool {
+        self.is_dirty() && HotkeyErrors::of(&self.cfg).is_clear()
+    }
+
     fn save(&mut self) {
         if let Err(e) = self.cfg.save() {
             self.save_status = Some((false, format!("Config save failed: {e}")));
@@ -324,7 +358,7 @@ impl eframe::App for SettingsApp {
         if save_shortcut
             && self.key_dialog.is_none()
             && !self.confirm_clear_history
-            && self.is_dirty()
+            && self.can_save()
         {
             self.save();
         }
@@ -420,10 +454,16 @@ impl SettingsApp {
     }
 
     fn tab_recording(&mut self, ui: &mut egui::Ui) {
+        let errs = HotkeyErrors::of(&self.cfg);
         group(ui, |ui| {
-            row(ui, "Hotkey", "Push-to-talk key combination.", |ui| {
-                text_input(ui, &mut self.cfg.hotkey, "Ctrl+Backslash", CONTROL_W);
-            });
+            hotkey_row(
+                ui,
+                "Hotkey",
+                "Push-to-talk key combination.",
+                &mut self.cfg.hotkey,
+                "Ctrl+Backslash",
+                errs.dictate.as_deref(),
+            );
             divider(ui);
             row(
                 ui,
@@ -491,18 +531,13 @@ impl SettingsApp {
             );
             if self.cfg.push_to_command {
                 divider(ui);
-                row(
+                hotkey_row(
                     ui,
                     "Command hotkey",
                     "Same syntax as the main hotkey.",
-                    |ui| {
-                        text_input(
-                            ui,
-                            &mut self.cfg.command_hotkey,
-                            "Ctrl+Shift+Backslash",
-                            CONTROL_W,
-                        );
-                    },
+                    &mut self.cfg.command_hotkey,
+                    "Ctrl+Shift+Backslash",
+                    errs.command.as_deref(),
                 );
             }
         });
@@ -1016,13 +1051,14 @@ impl SettingsApp {
         ui.painter()
             .hline(ui.max_rect().x_range(), ui.max_rect().top(), border());
         let dirty = self.is_dirty();
+        let can_save = self.can_save();
         let size = Vec2::new(ui.available_width(), ui.available_height());
         ui.allocate_ui_with_layout(
             size,
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
-                let save = ui.add(primary_button("Save", dirty));
-                if save.clicked() && dirty {
+                let save = ui.add(primary_button("Save", can_save));
+                if save.clicked() && can_save {
                     self.save();
                 }
                 ui.add_space(8.0);
@@ -1034,6 +1070,15 @@ impl SettingsApp {
                 match (&self.save_status, dirty) {
                     (Some((false, msg)), _) => {
                         ui.label(RichText::new(msg).size(12.0).color(DESTRUCTIVE));
+                    }
+                    // Dirty but unsaveable: the field at fault may be on a
+                    // pane the user has since left, so say why Save is off.
+                    (_, true) if !can_save => {
+                        ui.label(
+                            RichText::new("A hotkey needs fixing before you can save.")
+                                .size(12.0)
+                                .color(DESTRUCTIVE),
+                        );
                     }
                     (Some((true, msg)), false) => {
                         ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
@@ -1205,6 +1250,28 @@ impl SettingsApp {
 
 // ---- pane chrome -------------------------------------------------------
 
+/// A hotkey row, flagged against the parser the main process registers with:
+/// the field turns red and the message hangs beneath the row. `error` is as
+/// of the start of this frame, so an edit asks for one more — the flag then
+/// catches up with what was just typed.
+fn hotkey_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    caption: &str,
+    spec: &mut String,
+    placeholder: &str,
+    error: Option<&str>,
+) {
+    row(ui, label, caption, |ui| {
+        if text_input(ui, spec, placeholder, CONTROL_W, error.is_some()).changed() {
+            ui.ctx().request_repaint();
+        }
+    });
+    if let Some(msg) = error {
+        field_error(ui, msg);
+    }
+}
+
 fn pane_header(ui: &mut egui::Ui, tab: Tab) {
     ui.label(RichText::new(tab.label()).size(21.0).strong().color(FG));
     ui.add_space(3.0);
@@ -1251,5 +1318,56 @@ fn relative_time(now: i64, ts: i64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_hotkeys_are_clear() {
+        let cfg = Config {
+            push_to_command: true,
+            ..Config::default()
+        };
+        assert!(HotkeyErrors::of(&cfg).is_clear());
+    }
+
+    #[test]
+    fn a_bad_dictation_hotkey_is_flagged_on_its_own_field() {
+        let cfg = Config {
+            hotkey: "Ctrl+Bakslash".into(),
+            ..Config::default()
+        };
+        let errs = HotkeyErrors::of(&cfg);
+        assert!(errs.dictate.as_deref().unwrap().contains("Bakslash"));
+        assert_eq!(errs.command, None);
+        assert!(!errs.is_clear());
+    }
+
+    #[test]
+    fn a_bad_command_hotkey_is_flagged_while_push_to_command_is_on() {
+        let cfg = Config {
+            push_to_command: true,
+            command_hotkey: "Ctrl+Shift".into(),
+            ..Config::default()
+        };
+        let errs = HotkeyErrors::of(&cfg);
+        assert_eq!(errs.dictate, None);
+        assert!(errs.command.is_some());
+        assert!(!errs.is_clear());
+    }
+
+    /// The main process never parses the command chord with push-to-command
+    /// off, and the field isn't on screen — so it can't block Save either.
+    #[test]
+    fn a_bad_command_hotkey_is_ignored_while_push_to_command_is_off() {
+        let cfg = Config {
+            push_to_command: false,
+            command_hotkey: "nonsense".into(),
+            ..Config::default()
+        };
+        assert!(HotkeyErrors::of(&cfg).is_clear());
     }
 }
