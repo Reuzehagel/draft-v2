@@ -33,7 +33,16 @@ use theme::*;
 use widgets::*;
 
 pub fn run() -> anyhow::Result<()> {
-    let cfg = Config::load().unwrap_or_default();
+    // An unreadable config refuses to open rather than offering defaults to
+    // Save — see ADR 0002 (#93).
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "config unreadable; settings not opened");
+            refuse_to_open(&e);
+            return Ok(());
+        }
+    };
     let autostart_enabled = autostart::is_enabled();
 
     let mut keys = ProviderKeys::default();
@@ -91,6 +100,31 @@ pub fn run() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
+}
+
+/// Tell the user why Settings didn't open. A plain message box rather than an
+/// egui window: there is nothing to lay out, and it blocks until dismissed, so
+/// the subprocess exits (and the main process reloads) only once it's been read.
+fn refuse_to_open(e: &anyhow::Error) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+    };
+
+    // `{e:#}` prints the whole chain, which names the file.
+    let text = format!(
+        "Draft couldn't read its settings file, so Settings won't open \
+         — saving from it would replace your settings with the defaults.\n\n\
+         {e:#}"
+    );
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from("Draft — Settings"),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
 }
 
 /// The displays the pill can be pinned to, as (device path, label).

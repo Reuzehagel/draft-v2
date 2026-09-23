@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -258,20 +259,29 @@ impl Config {
     /// Returns (config, first_run). `first_run` is true when the config
     /// file did not exist before this call.
     pub fn load_with_first_run() -> Result<(Self, bool)> {
-        let path = crate::paths::config_file()?;
-        if !path.exists() {
+        Self::load_from(&crate::paths::config_file()?)
+    }
+
+    /// `load_with_first_run` against an explicit path. A file that exists but
+    /// can't be read is an error, never defaults — anything that saves what it
+    /// loaded would write those defaults over the user's config. `try_exists`,
+    /// not `exists`, for the same reason: a failed existence check is not a
+    /// first run.
+    pub fn load_from(path: &Path) -> Result<(Self, bool)> {
+        if !path.try_exists()? {
             let cfg = Self::default();
-            cfg.save()?;
+            cfg.save_to(path)?;
             return Ok((cfg, true));
         }
-        let text = std::fs::read_to_string(&path)?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("couldn't read {}", path.display()))?;
         let cfg: Self = match toml::from_str(&text) {
             Ok(cfg) => cfg,
             Err(e) => {
                 // Don't silently overwrite the user's settings on the next save:
                 // preserve the unparseable file as a .bak so it can be recovered.
                 let backup = path.with_extension("toml.bak");
-                if let Err(be) = std::fs::rename(&path, &backup) {
+                if let Err(be) = std::fs::rename(path, &backup) {
                     tracing::warn!(error = %be, "could not back up corrupt config");
                 }
                 tracing::warn!(
@@ -286,10 +296,13 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = crate::paths::config_file()?;
+        self.save_to(&crate::paths::config_file()?)
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self)?;
         // Atomic replace so a crash mid-write can't leave a truncated config.
-        crate::paths::atomic_write(&path, text)
+        crate::paths::atomic_write(path, text)
     }
 }
 
@@ -382,6 +395,39 @@ mod tests {
     fn an_empty_pill_table_takes_the_defaults() {
         let cfg: Config = toml::from_str("[pill]\n").expect("empty table parses");
         assert_eq!(cfg.pill, PillConfig::default());
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("draft-config-tests").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A config that exists but can't be read is an error, not defaults: the
+    /// Settings window would otherwise offer those defaults to Save, and Save
+    /// would write them over the user's real config.
+    #[test]
+    fn a_config_that_exists_but_cannot_be_read_is_an_error_and_left_alone() {
+        let dir = scratch_dir("unreadable");
+        let path = dir.join("config.toml");
+        // A directory where the file should be: it exists, and reading it fails.
+        std::fs::create_dir(&path).expect("stand-in");
+
+        assert!(Config::load_from(&path).is_err());
+        assert!(path.is_dir(), "the unreadable config was replaced");
+        assert!(!path.with_extension("toml.bak").exists());
+    }
+
+    #[test]
+    fn a_missing_config_is_a_first_run_and_writes_the_defaults() {
+        let dir = scratch_dir("missing");
+        let path = dir.join("config.toml");
+
+        let (cfg, first_run) = Config::load_from(&path).expect("loads");
+        assert!(first_run);
+        assert_eq!(cfg, Config::default());
+        assert!(path.is_file());
     }
 
     #[test]
