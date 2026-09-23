@@ -290,6 +290,31 @@ impl HotkeyErrors {
     }
 }
 
+/// What one Esc closes: the topmost surface only — a **popup**, else a
+/// **modal card**, else the window.
+#[derive(Debug, PartialEq, Eq)]
+enum EscCloses {
+    Popup,
+    KeyDialog,
+    ConfirmClear,
+    Window,
+}
+
+/// egui 0.29's popup closes itself on Esc but reads the key without consuming
+/// it, so the popup has to be asked about here or the same press closes the
+/// window too (#94).
+fn esc_closes(popup_open: bool, key_dialog_open: bool, confirm_clear_open: bool) -> EscCloses {
+    if popup_open {
+        EscCloses::Popup
+    } else if key_dialog_open {
+        EscCloses::KeyDialog
+    } else if confirm_clear_open {
+        EscCloses::ConfirmClear
+    } else {
+        EscCloses::Window
+    }
+}
+
 /// Open API-key editor. Follows the write-only pattern: we never prefill or
 /// redisplay the stored secret — the buffer starts empty and only overwrites
 /// the saved key if the user actually types one.
@@ -397,13 +422,16 @@ impl eframe::App for SettingsApp {
             self.save();
         }
         if close_shortcut {
-            // Esc dismisses an open dialog first, then the window.
-            if self.key_dialog.is_some() {
-                self.key_dialog = None;
-            } else if self.confirm_clear_history {
-                self.confirm_clear_history = false;
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let popup_open = ctx.memory(|m| m.any_popup_open());
+            match esc_closes(
+                popup_open,
+                self.key_dialog.is_some(),
+                self.confirm_clear_history,
+            ) {
+                EscCloses::Popup => ctx.memory_mut(|m| m.close_popup()),
+                EscCloses::KeyDialog => self.key_dialog = None,
+                EscCloses::ConfirmClear => self.confirm_clear_history = false,
+                EscCloses::Window => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
 
@@ -1403,5 +1431,50 @@ mod tests {
             ..Config::default()
         };
         assert!(HotkeyErrors::of(&cfg).is_clear());
+    }
+
+    #[test]
+    fn esc_with_a_popup_open_closes_only_the_popup() {
+        assert_eq!(esc_closes(true, false, false), EscCloses::Popup);
+    }
+
+    #[test]
+    fn esc_with_a_modal_card_open_closes_only_the_modal() {
+        assert_eq!(esc_closes(false, true, false), EscCloses::KeyDialog);
+        assert_eq!(esc_closes(false, false, true), EscCloses::ConfirmClear);
+    }
+
+    #[test]
+    fn esc_with_nothing_open_closes_the_window() {
+        assert_eq!(esc_closes(false, false, false), EscCloses::Window);
+    }
+
+    /// The bug behind #94: egui 0.29's popup reads Esc without consuming it,
+    /// so the popup opened on an earlier frame must still read as open at the
+    /// top of the frame that carries the Esc — which is where `update` asks.
+    /// This pins an egui assumption; revisit it on an egui bump.
+    #[test]
+    fn a_popup_opened_last_frame_is_still_open_when_esc_arrives() {
+        let ctx = egui::Context::default();
+        let popup = egui::Id::new("popup");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.memory_mut(|m| m.open_popup(popup));
+        });
+        let esc = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut seen = None;
+        let _ = ctx.run(esc, |ctx| {
+            let popup_open = ctx.memory(|m| m.any_popup_open());
+            seen = Some(esc_closes(popup_open, false, false));
+        });
+        assert_eq!(seen, Some(EscCloses::Popup));
     }
 }
