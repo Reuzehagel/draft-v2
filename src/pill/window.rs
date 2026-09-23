@@ -260,23 +260,13 @@ impl PillWindow {
     /// the frame and flicker a layered window; and never
     /// `Window::set_cursor_hittest`, which ORs the layered bit away as the
     /// price of hit-testing (#20, and this module's header).
-    pub fn set_click_through(&self, on: bool) {
+    ///
+    /// The state is remembered as well as written, so a re-arm of the pill's
+    /// ex-styles after a failed present restores it rather than forcing
+    /// click-through back on under buttons the pill is showing (#89).
+    pub fn set_click_through(&mut self, on: bool) {
         #[cfg(windows)]
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
-            };
-            let hwnd = self.layered.hwnd;
-            let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            let next = if on {
-                cur | WS_EX_TRANSPARENT.0
-            } else {
-                cur & !WS_EX_TRANSPARENT.0
-            };
-            if next != cur {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next as isize);
-            }
-        }
+        self.layered.set_click_through(on);
         #[cfg(not(windows))]
         let _ = on;
     }
@@ -410,13 +400,20 @@ struct LayeredSurface {
     bits: *mut u8,
     w: u32,
     h: u32,
+    /// What WS_EX_TRANSPARENT is *meant* to be right now — the last thing
+    /// [`PillWindow::set_click_through`] was told. Kept because the bit itself
+    /// is not a reliable record: winit's clobber wipes it, and the re-arm that
+    /// repairs the clobber has to put it back as it was, not as it started.
+    click_through: bool,
 }
 
 #[cfg(windows)]
 impl LayeredSurface {
     fn new(window: &Window, w: u32, h: u32) -> Result<Self> {
         let hwnd = hwnd_from_window(window)?;
-        unsafe { apply_pill_ex_styles(hwnd) };
+        // Born click-through: a new pill shows no buttons.
+        let click_through = true;
+        unsafe { apply_pill_ex_styles(hwnd, click_through) };
         let (mem_dc, dib, bits) = create_dib(w, h)?;
         Ok(Self {
             hwnd,
@@ -425,7 +422,25 @@ impl LayeredSurface {
             bits,
             w,
             h,
+            click_through,
         })
+    }
+
+    /// Record and write WS_EX_TRANSPARENT — see [`PillWindow::set_click_through`].
+    /// The one place `click_through` changes, so the record and the bit move
+    /// together.
+    fn set_click_through(&mut self, on: bool) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
+        };
+        self.click_through = on;
+        unsafe {
+            let cur = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
+            let next = with_click_through(cur, on);
+            if next != cur {
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next as isize);
+            }
+        }
     }
 
     fn resize(&mut self, window: &Window, w: u32, h: u32) -> Result<()> {
@@ -459,6 +474,7 @@ impl LayeredSurface {
         // GWL_EXSTYLE absolutely from a flag set that has no layered bit. So
         // re-arm ONLY on failure — and re-assert the whole pill set, since the
         // same write also took NOACTIVATE, TOOLWINDOW and TRANSPARENT with it.
+        // TRANSPARENT goes back as the mode wants it, not as the pill started.
         unsafe {
             if self.update_layered().is_err() {
                 use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
@@ -466,7 +482,7 @@ impl LayeredSurface {
                     ex_style = format_args!("{:#x}", GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)),
                     "layered present failed; re-arming pill ex-styles"
                 );
-                rearm_ex_styles(self.hwnd);
+                rearm_ex_styles(self.hwnd, self.click_through);
                 self.update_layered()?;
             }
         }
@@ -545,6 +561,9 @@ fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND>
 /// one of its mutators runs, so they are re-asserted as a set rather than one
 /// at a time.
 ///
+/// WS_EX_TRANSPARENT is in the set as the pill's resting state, but its value
+/// on any write is the mode's to decide — see [`with_pill_ex_style`].
+///
 /// WS_EX_TOPMOST is carried here only so a re-assertion doesn't *drop* it —
 /// setting the bit through SetWindowLongPtrW does not restack the window. The
 /// actual z-order comes from `WindowLevel::AlwaysOnTop` at creation and would
@@ -563,9 +582,25 @@ const PILL_EX_STYLE: u32 = {
 
 /// The pill's bits ORed onto whatever GWL_EXSTYLE currently holds — never an
 /// absolute write, so bits Windows or winit set for their own reasons survive.
+///
+/// All but WS_EX_TRANSPARENT, which is not a constant of the pill but of its
+/// mode: it lands where `click_through` says. A re-arm while the pill is
+/// showing buttons — the bar, or a click-started session's check — would
+/// otherwise switch their clicks off until the next mode change (#89).
 #[cfg(windows)]
-fn with_pill_ex_style(cur: u32) -> u32 {
-    cur | PILL_EX_STYLE
+fn with_pill_ex_style(cur: u32, click_through: bool) -> u32 {
+    with_click_through(cur | PILL_EX_STYLE, click_through)
+}
+
+/// `cur` with WS_EX_TRANSPARENT set or cleared, and nothing else touched.
+#[cfg(windows)]
+fn with_click_through(cur: u32, on: bool) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_TRANSPARENT;
+    if on {
+        cur | WS_EX_TRANSPARENT.0
+    } else {
+        cur & !WS_EX_TRANSPARENT.0
+    }
 }
 
 /// The same value with WS_EX_LAYERED knocked out, for the first half of the
@@ -579,7 +614,7 @@ fn without_layered(cur: u32) -> u32 {
 /// Re-assert every pill ex-style bit, dropping WS_EX_LAYERED first so the
 /// window genuinely re-enters layered mode rather than seeing a no-op write.
 #[cfg(windows)]
-unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
+unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND, click_through: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
     };
@@ -588,17 +623,22 @@ unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
     // Re-read rather than reusing `cur`: the write above is itself a window
     // state change, and reusing the stale value would make the second write
     // absolute again — the very hazard this is here to close.
-    apply_pill_ex_styles(hwnd);
+    apply_pill_ex_styles(hwnd, click_through);
 }
 
-/// OR the pill's ex-style bits onto whatever GWL_EXSTYLE holds right now.
+/// OR the pill's ex-style bits onto whatever GWL_EXSTYLE holds right now, with
+/// WS_EX_TRANSPARENT as `click_through` says.
 #[cfg(windows)]
-unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND) {
+unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND, click_through: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
     };
     let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, with_pill_ex_style(cur) as isize);
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        with_pill_ex_style(cur, click_through) as isize,
+    );
 }
 
 /// Put the window at its home monitor's placement, size and all, in one call.
@@ -729,23 +769,57 @@ mod tests {
     #[test]
     fn applying_the_pill_set_preserves_foreign_bits() {
         let cur = WS_EX_APPWINDOW.0;
-        assert_eq!(with_pill_ex_style(cur), cur | PILL_EX_STYLE);
+        assert_eq!(with_pill_ex_style(cur, true), cur | PILL_EX_STYLE);
     }
 
     #[test]
     fn applying_the_pill_set_is_idempotent() {
-        let once = with_pill_ex_style(WS_EX_APPWINDOW.0);
-        assert_eq!(with_pill_ex_style(once), once);
+        for click_through in [true, false] {
+            let once = with_pill_ex_style(WS_EX_APPWINDOW.0, click_through);
+            assert_eq!(with_pill_ex_style(once, click_through), once);
+        }
+    }
+
+    // A re-arm while buttons are showing must leave them clickable: winit's
+    // clobber took TRANSPARENT with everything else, and putting it back on
+    // would let a click fall through the bar to the app beneath (#89).
+    #[test]
+    fn applying_the_pill_set_while_showing_buttons_leaves_transparent_clear() {
+        for cur in [WS_EX_APPWINDOW.0, WS_EX_APPWINDOW.0 | WS_EX_TRANSPARENT.0] {
+            let next = with_pill_ex_style(cur, false);
+            assert_eq!(next & WS_EX_TRANSPARENT.0, 0);
+            assert_eq!(next, (cur | PILL_EX_STYLE) & !WS_EX_TRANSPARENT.0);
+        }
+    }
+
+    #[test]
+    fn applying_the_pill_set_while_not_showing_buttons_leaves_transparent_set() {
+        for cur in [WS_EX_APPWINDOW.0, WS_EX_APPWINDOW.0 | WS_EX_TRANSPARENT.0] {
+            let next = with_pill_ex_style(cur, true);
+            assert_eq!(next & WS_EX_TRANSPARENT.0, WS_EX_TRANSPARENT.0);
+            assert_eq!(next, cur | PILL_EX_STYLE);
+        }
+    }
+
+    // The flip on a mode change moves TRANSPARENT and nothing else.
+    #[test]
+    fn the_click_through_flip_touches_only_the_transparent_bit() {
+        let cur = with_pill_ex_style(WS_EX_APPWINDOW.0, true);
+        let off = with_click_through(cur, false);
+        assert_eq!(off, cur & !WS_EX_TRANSPARENT.0);
+        assert_eq!(with_click_through(off, true), cur);
     }
 
     // The re-arm's first write must drop LAYERED and nothing else — clearing
     // NOACTIVATE for even one message would let the pill take focus.
     #[test]
     fn the_rearm_clears_only_the_layered_bit() {
-        let cur = with_pill_ex_style(WS_EX_APPWINDOW.0);
-        let cleared = without_layered(cur);
-        assert_eq!(cleared & WS_EX_LAYERED.0, 0);
-        assert_eq!(cleared, cur & !WS_EX_LAYERED.0);
-        assert_eq!(with_pill_ex_style(cleared), cur);
+        for click_through in [true, false] {
+            let cur = with_pill_ex_style(WS_EX_APPWINDOW.0, click_through);
+            let cleared = without_layered(cur);
+            assert_eq!(cleared & WS_EX_LAYERED.0, 0);
+            assert_eq!(cleared, cur & !WS_EX_LAYERED.0);
+            assert_eq!(with_pill_ex_style(cleared, click_through), cur);
+        }
     }
 }

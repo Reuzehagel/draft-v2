@@ -1732,7 +1732,7 @@ impl PillAdapter {
         // the app underneath.
         let buttons = mode.shows_buttons();
         if buttons != self.mode.is_some_and(PillMode::shows_buttons) {
-            if let Some(pw) = self.window.as_ref() {
+            if let Some(pw) = self.window.as_mut() {
                 pw.set_click_through(!buttons);
             }
         }
