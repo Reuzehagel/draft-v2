@@ -4,6 +4,10 @@
 #![warn(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 pub mod adapter;
+/// Times one animated frame. Test-only and `#[ignore]`d — see the module
+/// header for how to run it.
+#[cfg(test)]
+mod bench;
 pub mod core;
 pub mod fullscreen;
 pub mod geom;
@@ -17,6 +21,7 @@ pub mod monitor;
 #[cfg(test)]
 mod preview;
 pub mod render;
+pub mod surface;
 pub mod text;
 pub mod window;
 

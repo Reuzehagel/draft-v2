@@ -10,6 +10,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod activation;
+mod alloc_count;
 mod autostart;
 mod hotkey;
 mod llm;
@@ -27,6 +28,12 @@ mod wake;
 // still resolve from every adapter module — the extraction moved the code,
 // not the vocabulary.
 use draft::{audio, config, history, logging, postprocess, secrets, transcribe};
+
+/// Test builds count their allocations, so the pill's frame path can be held to
+/// allocating nothing (#106). Release and debug builds of the app are untouched.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
 
 use anyhow::Result;
 use std::collections::VecDeque;

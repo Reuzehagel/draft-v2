@@ -646,10 +646,12 @@ impl<W: PillPort> PillAdapter<W> {
         let ring = matches!(self.mode, Some(PillMode::Recording { .. }))
             .then_some(self.ring.as_ref())
             .flatten();
-        let bars = if geom.bars > 0.0 {
-            bars_for_frame(&mut self.bands, ring, handoff_damping(self.handoff_since))
+        let row;
+        let bars: &[f32] = if geom.bars > 0.0 {
+            row = bars_for_frame(&mut self.bands, ring, handoff_damping(self.handoff_since));
+            &row
         } else {
-            Vec::new()
+            &[]
         };
         // Per-button hover, likewise: the Geom carries the bar's *growth*, and
         // which button is lit is state beside it.
@@ -657,7 +659,7 @@ impl<W: PillPort> PillAdapter<W> {
         // And the label, likewise: what it says is a surface of its own with
         // its own clock, not something a Geom could carry.
         let label = self.label.at(now);
-        if let Err(e) = pill.render(&geom, &bars, &slots, &label, self.body_style) {
+        if let Err(e) = pill.render(&geom, bars, &slots, &label, self.body_style) {
             tracing::error!(error = %e, "pill render failed");
         }
         // One more frame is owed while a transition is still running, so the
@@ -680,12 +682,6 @@ impl PillAdapter<PillWindow> {
     }
 }
 
-/// A flat row — every bar at its resting height. What "stopped listening" looks
-/// like, and all Processing and Done ever show once the handoff has run.
-fn flat_bars() -> Vec<f32> {
-    vec![0.0; pill::BAR_COUNT]
-}
-
 /// How much of the waveform is left, given when the handoff started. `None` —
 /// no handoff yet — is the recording case's full strength.
 fn handoff_damping(since: Option<Instant>) -> f32 {
@@ -704,24 +700,32 @@ fn handoff_damping(since: Option<Instant>) -> f32 {
 /// A free function over the fields it needs rather than a method: `redraw`
 /// holds a mutable borrow of the window across the whole match, and `&mut self`
 /// here would collide with it.
+///
+/// An array by value, not a `Vec`: the row is a fixed length, and this runs
+/// every frame of every recording — which is no place to allocate (#106).
 fn bars_for_frame(
     bands: &mut audio::level::BandMeter,
     ring: Option<&audio::ring::Buffer>,
     damping: f32,
-) -> Vec<f32> {
+) -> [f32; pill::BAR_COUNT] {
+    // A flat row — every bar at its resting height. What "stopped listening"
+    // looks like, and all Processing and Done ever show once the handoff has
+    // run.
+    let mut bars = [0.0; pill::BAR_COUNT];
     // Past the fall there is nothing left to shape — and nothing to gain from
     // advancing a meter whose output is about to be multiplied by zero.
     if damping <= 0.0 {
-        return flat_bars();
+        return bars;
     }
     let raw = match ring {
-        Some(ring) => bands.tick(ring).to_vec(),
-        None => bands.hold().to_vec(),
+        Some(ring) => bands.tick(ring),
+        None => bands.hold(),
     };
-    audio::level::shape_bars(&raw)
-        .into_iter()
-        .map(|v| v * damping)
-        .collect()
+    audio::level::shape_bars(raw, &mut bars);
+    for v in &mut bars {
+        *v *= damping;
+    }
+    bars
 }
 
 #[cfg(test)]
@@ -854,6 +858,35 @@ mod tests {
         assert!(!pill.wants_frame(settled));
         assert!(!pill.wants_frame(settled + SETTLE));
         assert_eq!(log.borrow().renders, drawn);
+    }
+
+    /// A recording frame — the one drawn ~30 times a second for as long as
+    /// anyone talks — reads the meter, shapes the row and hands it to the
+    /// window without allocating (#106). The window's own share is the
+    /// renderer's, held by `pill::surface`.
+    #[test]
+    fn a_recording_frame_allocates_nothing() {
+        let (mut pill, _, settled) = settled_nub();
+        let ring = audio::ring::Buffer::new(16_000, 16_000);
+        ring.extend(
+            &(0..4_000)
+                .map(|i| (i as f32 * 0.05).sin() * 0.3)
+                .collect::<Vec<_>>(),
+        );
+        pill.set_ring(ring);
+        pill.set_mode(
+            PillMode::Recording {
+                origin: Origin::Hotkey,
+            },
+            settled,
+        );
+        // One frame first: the label's and icons' caches fill on first use.
+        pill.redraw(settled);
+        for step in 1..=5 {
+            let now = settled + Duration::from_millis(33 * step);
+            let ((), n) = crate::alloc_count::during(|| pill.redraw(now));
+            assert_eq!(n, 0, "frame {step} allocated {n} times");
+        }
     }
 
     #[test]

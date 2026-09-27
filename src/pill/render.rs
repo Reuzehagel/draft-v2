@@ -33,7 +33,8 @@ use crate::pill::icons;
 use crate::pill::label::Fade;
 use crate::pill::text;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
+    FillRule, IntRect, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Rect, Shader, Stroke,
+    Transform,
 };
 
 // The waveform has a metric of its own (#75), in logical pixels, scaled by DPI
@@ -138,15 +139,101 @@ impl Bars {
 /// The one place either is worked out. `pm.height() / 2.0` was that answer
 /// until #46 put the label above the pill, and it is now wrong everywhere; a
 /// single derivation is what stops it coming back in one caller.
-fn centre(pm: &Pixmap, scale: f32) -> (f32, f32) {
+fn centre(pm: &Canvas, scale: f32) -> (f32, f32) {
     (
         pm.width() as f32 / 2.0,
         pill_centre_y(pm.height() as f32, scale),
     )
 }
 
-fn clear_transparent(pm: &mut Pixmap) {
-    pm.fill(Color::TRANSPARENT);
+/// The pixmap a frame is drawn into, and the part of it the frame touched.
+///
+/// Every mark [`draw`] makes goes through here, so the bounds are the union of
+/// what was actually painted rather than a second derivation of the layout —
+/// a hand-kept list of "where the pill can be" would drift from the renderer
+/// the first time a mark moved. They are what lets `pill::surface` clear,
+/// resolve and present only the pixels a frame could have changed (#106).
+struct Canvas<'a> {
+    pm: &'a mut Pixmap,
+    drawn: Option<Rect>,
+}
+
+impl Canvas<'_> {
+    fn width(&self) -> u32 {
+        self.pm.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.pm.height()
+    }
+
+    fn fill_path(&mut self, path: &Path, paint: &Paint, rule: FillRule, ts: Transform) {
+        if invisible(paint) {
+            return;
+        }
+        self.mark(path.bounds(), ts, 0.0);
+        self.pm.fill_path(path, paint, rule, ts, None);
+    }
+
+    fn stroke_path(&mut self, path: &Path, paint: &Paint, stroke: &Stroke, ts: Transform) {
+        if invisible(paint) {
+            return;
+        }
+        // A whole width past the centreline, not half: a miter reaches further
+        // than the stroke's half-width at a corner.
+        self.mark(path.bounds(), ts, stroke.width);
+        self.pm.stroke_path(path, paint, stroke, ts, None);
+    }
+
+    fn fill_rect(&mut self, rect: Rect, paint: &Paint, ts: Transform) {
+        if invisible(paint) {
+            return;
+        }
+        self.mark(rect, ts, 0.0);
+        self.pm.fill_rect(rect, paint, ts, None);
+    }
+
+    /// Grow the drawn bounds by `r` under `ts`, `outset` further for a stroke,
+    /// and a pixel more for the anti-aliased edge fading out past the geometry.
+    fn mark(&mut self, r: Rect, ts: Transform, outset: f32) {
+        // The stroke's outset is in the path's own units, so it is added
+        // before the transform — a scaled stroke is scaled wider. The
+        // anti-aliased pixel is in device pixels, so it is added after.
+        let Some(r) = Rect::from_ltrb(
+            r.left() - outset,
+            r.top() - outset,
+            r.right() + outset,
+            r.bottom() + outset,
+        )
+        .and_then(|r| r.transform(ts)) else {
+            return;
+        };
+        let (l, t, rr, b) = (
+            r.left() - 1.0,
+            r.top() - 1.0,
+            r.right() + 1.0,
+            r.bottom() + 1.0,
+        );
+        let joined = match self.drawn {
+            Some(d) => Rect::from_ltrb(
+                l.min(d.left()),
+                t.min(d.top()),
+                rr.max(d.right()),
+                b.max(d.bottom()),
+            ),
+            None => Rect::from_ltrb(l, t, rr, b),
+        };
+        if joined.is_some() {
+            self.drawn = joined;
+        }
+    }
+}
+
+/// A solid paint at alpha 0, which draws nothing. Skipped rather than painted,
+/// so a mark faded all the way out — `Hidden`'s body, a label gone blank —
+/// does not count as drawn and keep its pixels in every frame's damage.
+fn invisible(paint: &Paint) -> bool {
+    matches!(paint.shader, Shader::SolidColor(c) if c.alpha() <= 0.0)
 }
 
 /// The stroke width and the body rect a `geom` draws at `scale`.
@@ -184,6 +271,12 @@ fn body_of(geom: &Geom, scale: f32) -> (f32, f32, f32) {
 /// glyphs, their emphasis — is the same code drawing the same marks. Unified
 /// gets no extra pass, which is the whole of "it costs a layout branch, not a
 /// renderer": no resting disc, no brighter glyph, no wider slab.
+///
+/// `pm` is drawn *onto*, not cleared: it must be transparent wherever this
+/// frame might paint. Clearing is the caller's, because only the caller knows
+/// how little of it needs clearing — `pill::surface` wipes just what the last
+/// frame drew. What comes back is where this one drew, in `pm`'s pixels, or
+/// `None` if it drew nothing at all.
 pub fn draw(
     pm: &mut Pixmap,
     scale: f32,
@@ -192,9 +285,21 @@ pub fn draw(
     slots: &[Slot; BUTTON_COUNT],
     label: &Fade,
     style: BodyStyle,
-) {
-    clear_transparent(pm);
+) -> Option<Rect> {
+    let mut canvas = Canvas { pm, drawn: None };
+    draw_frame(&mut canvas, scale, geom, bar_heights, slots, label, style);
+    canvas.drawn
+}
 
+fn draw_frame(
+    pm: &mut Canvas,
+    scale: f32,
+    geom: &Geom,
+    bar_heights: &[f32],
+    slots: &[Slot; BUTTON_COUNT],
+    label: &Fade,
+    style: BodyStyle,
+) {
     // Before the pill's own early-out: the label is a separate surface in the
     // same window, and a degenerate Geom is no reason for it not to be drawn.
     draw_label(pm, scale, geom.h, label);
@@ -235,7 +340,7 @@ pub fn draw(
     let mut fill = Paint::default();
     fill.set_color_rgba8(geom.fill.0, geom.fill.1, geom.fill.2, alpha_u8(geom.fill_a));
     fill.anti_alias = true;
-    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity());
 
     let mut edge = Paint::default();
     edge.set_color_rgba8(
@@ -253,7 +358,6 @@ pub fn draw(
             ..Default::default()
         },
         Transform::identity(),
-        None,
     );
 
     if geom.bars > 0.0 {
@@ -330,7 +434,7 @@ fn bars_of(geom: &Geom, scale: f32, count: usize) -> Bars {
 /// because a cursor drift must not hide the only way to stop it — and a pair
 /// that is always there does not need a hover state to say it is there. Which
 /// is also why neither is drawn at the bar's dimmed idle emphasis.
-fn draw_check(pm: &mut Pixmap, geom: &Geom, scale: f32, cy: f32) {
+fn draw_check(pm: &mut Canvas, geom: &Geom, scale: f32, cy: f32) {
     let opacity = geom.check.clamp(0.0, 1.0);
     if opacity <= 0.0 {
         return;
@@ -351,7 +455,7 @@ fn draw_check(pm: &mut Pixmap, geom: &Geom, scale: f32, cy: f32) {
         };
         fill.set_color_rgba8(255, 255, 255, alpha_u8(disc_a * opacity));
         fill.anti_alias = true;
-        pm.fill_path(&disc, &fill, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(&disc, &fill, FillRule::Winding, Transform::identity());
 
         let box_px = CHECK_GLYPH_BOX * scale;
         let Some(path) = icons::glyph(button.icon, box_px) else {
@@ -379,7 +483,6 @@ fn draw_check(pm: &mut Pixmap, geom: &Geom, scale: f32, cy: f32) {
                 ..Default::default()
             },
             Transform::from_translate(x, cy),
-            None,
         );
     }
 }
@@ -396,7 +499,7 @@ fn draw_check(pm: &mut Pixmap, geom: &Geom, scale: f32, cy: f32) {
 ///
 /// The measuring is here rather than in `pill::label` on purpose: a width needs
 /// a face, and the label's state machine is asserted without one.
-fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
+fn draw_label(pm: &mut Canvas, scale: f32, body_h: f32, fade: &Fade) {
     if fade.is_blank() {
         return;
     }
@@ -429,7 +532,7 @@ fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
     let mut fill = Paint::default();
     fill.set_color_rgba8(BODY.0, BODY.1, BODY.2, alpha_u8(PILL_FILL_A * opacity));
     fill.anti_alias = true;
-    pm.fill_path(&chip, &fill, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(&chip, &fill, FillRule::Winding, Transform::identity());
 
     let mut edge = Paint::default();
     edge.set_color_rgba8(
@@ -447,7 +550,6 @@ fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
             ..Default::default()
         },
         Transform::identity(),
-        None,
     );
 
     for (t, a) in [(from, a_from), (to, a_to)] {
@@ -468,7 +570,6 @@ fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
             &paint,
             FillRule::Winding,
             Transform::from_translate(cx, cy),
-            None,
         );
     }
 }
@@ -496,7 +597,7 @@ fn draw_label(pm: &mut Pixmap, scale: f32, body_h: f32, fade: &Fade) {
 /// **Islands only**, and structurally so: the strip exists to fill the gaps
 /// between three shapes, and a unified bar has none — its body is opaque across
 /// every slab already.
-fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
+fn draw_hit_strip(pm: &mut Canvas, scale: f32, progress: f32) {
     if progress < 0.5 {
         return;
     }
@@ -511,7 +612,7 @@ fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
     };
     let mut paint = Paint::default();
     paint.set_color_rgba8(255, 255, 255, HIT_A);
-    pm.fill_rect(rect, &paint, Transform::identity(), None);
+    pm.fill_rect(rect, &paint, Transform::identity());
 }
 
 /// The hit strip's alpha. Not 1: the surface is rendered at 4x and halved twice
@@ -546,7 +647,7 @@ struct Island {
 /// the body has this frame — so the same fold-out falls out of the same call,
 /// with the body's own growth doing what the progress does for the flankers.
 fn islands(
-    pm: &Pixmap,
+    pm: &Canvas,
     geom: &Geom,
     scale: f32,
     border_w: f32,
@@ -614,7 +715,7 @@ fn island_path(island: &Island) -> Option<tiny_skia::Path> {
 
 /// A flanker, in the body's own colours at `opacity` — it fades in as it slides
 /// out, so the pair reads as one gesture.
-fn fill_island(pm: &mut Pixmap, geom: &Geom, island: &Island, border_w: f32, opacity: f32) {
+fn fill_island(pm: &mut Canvas, geom: &Geom, island: &Island, border_w: f32, opacity: f32) {
     if island.w <= 0.0 || island.h <= 0.0 {
         return;
     }
@@ -630,7 +731,7 @@ fn fill_island(pm: &mut Pixmap, geom: &Geom, island: &Island, border_w: f32, opa
         alpha_u8(geom.fill_a * o),
     );
     fill.anti_alias = true;
-    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(&path, &fill, FillRule::Winding, Transform::identity());
 
     let mut edge = Paint::default();
     edge.set_color_rgba8(
@@ -648,7 +749,6 @@ fn fill_island(pm: &mut Pixmap, geom: &Geom, island: &Island, border_w: f32, opa
             ..Default::default()
         },
         Transform::identity(),
-        None,
     );
 }
 
@@ -661,7 +761,7 @@ const INDICATOR_A: f32 = 28.0;
 /// The hovered button's fill: a rounded rect inset from the island's edges,
 /// radius half its height — a shape inside a shape at any slot width, so the
 /// circle and the stadium need no separate treatment.
-fn draw_indicator(pm: &mut Pixmap, island: &Island, scale: f32, strength: f32) {
+fn draw_indicator(pm: &mut Canvas, island: &Island, scale: f32, strength: f32) {
     let strength = strength.clamp(0.0, 1.0);
     if strength <= 0.0 {
         return;
@@ -686,13 +786,7 @@ fn draw_indicator(pm: &mut Pixmap, island: &Island, scale: f32, strength: f32) {
     let mut paint = Paint::default();
     paint.set_color_rgba8(255, 255, 255, alpha_u8(INDICATOR_A * strength));
     paint.anti_alias = true;
-    pm.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity());
 }
 
 /// The glyph's alpha at full attention: the hovered button's glyph is at full
@@ -709,7 +803,7 @@ const GLYPH_DISABLED: f32 = 0.35;
 
 /// One button's icon, at the emphasis its slot is at.
 fn draw_glyph(
-    pm: &mut Pixmap,
+    pm: &mut Canvas,
     button: &Button,
     island: &Island,
     scale: f32,
@@ -743,7 +837,6 @@ fn draw_glyph(
             ..Default::default()
         },
         Transform::from_translate(island.cx, island.cy),
-        None,
     );
 }
 
@@ -754,7 +847,7 @@ fn alpha_u8(a: f32) -> u8 {
     a.clamp(0.0, 255.0) as u8
 }
 
-fn draw_bars(pm: &mut Pixmap, cy: f32, g: &Bars, bar_heights: &[f32], opacity: f32) {
+fn draw_bars(pm: &mut Canvas, cy: f32, g: &Bars, bar_heights: &[f32], opacity: f32) {
     if bar_heights.is_empty() || g.bar_w <= 0.0 {
         return;
     }
@@ -775,13 +868,7 @@ fn draw_bars(pm: &mut Pixmap, cy: f32, g: &Bars, bar_heights: &[f32], opacity: f
         rounded_rect(&mut pb, x, y, g.bar_w, bh, r);
     }
     if let Some(path) = pb.finish() {
-        pm.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity());
     }
 }
 
@@ -811,18 +898,30 @@ fn rounded_rect(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, r: f32) {
 }
 
 // Convert tiny-skia's premultiplied RGBA into the premultiplied BGRA that
-// UpdateLayeredWindow + AC_SRC_ALPHA expects.
-pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8]) {
+// UpdateLayeredWindow + AC_SRC_ALPHA expects — within `r` only, since `dst` is
+// the layered surface's own buffer and keeps every pixel outside it from the
+// frames before (see `pill::surface` for why those are already right).
+pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8], r: IntRect) {
     let src = pm.data();
     debug_assert_eq!(src.len(), dst.len());
-    // Bound by the shorter buffer so a size desync can never become an
-    // out-of-bounds write in release builds (where the assert is compiled out).
-    let pixels = src.len().min(dst.len()) / 4;
-    for i in 0..pixels {
-        dst[i * 4] = src[i * 4 + 2]; // B
-        dst[i * 4 + 1] = src[i * 4 + 1]; // G
-        dst[i * 4 + 2] = src[i * 4]; // R
-        dst[i * 4 + 3] = src[i * 4 + 3]; // A
+    let stride = pm.width() as usize * 4;
+    let (x0, x1) = (r.left().max(0) as usize * 4, r.right().max(0) as usize * 4);
+    let x1 = x1.min(stride);
+    for y in r.top().max(0) as usize..r.bottom().max(0) as usize {
+        let row = y * stride;
+        // Bound by the shorter buffer so a size desync can never become an
+        // out-of-bounds write in release builds (where the assert is compiled
+        // out).
+        let (Some(s), Some(d)) = (src.get(row + x0..row + x1), dst.get_mut(row + x0..row + x1))
+        else {
+            return;
+        };
+        for (s, d) in s.chunks_exact(4).zip(d.chunks_exact_mut(4)) {
+            d[0] = s[2]; // B
+            d[1] = s[1]; // G
+            d[2] = s[0]; // R
+            d[3] = s[3]; // A
+        }
     }
 }
 
@@ -1458,29 +1557,18 @@ mod tests {
     /// this draws through the same chain `PillWindow` uses.
     #[test]
     fn the_gaps_between_islands_are_not_holes() {
-        const SS: u32 = 4;
-        let mut hi = Pixmap::new(ENVELOPE_W * SS, ENVELOPE_H * SS).unwrap();
-        draw(
-            &mut hi,
-            SS as f32,
+        let mut surface = crate::pill::surface::Surface::new(ENVELOPE_W, ENVELOPE_H).unwrap();
+        surface.draw(
+            1.0,
             &Geom::of(ISLANDS),
             &FLAT,
             &NO_SLOTS,
             &NO_LABEL,
             BodyStyle::Islands,
         );
-        // 4x → 2x → 1x, exactly as `blit_and_present` does it.
-        let paint = tiny_skia::PixmapPaint {
-            quality: tiny_skia::FilterQuality::Bilinear,
-            ..Default::default()
-        };
-        let half = Transform::from_scale(0.5, 0.5);
-        let mut mid = Pixmap::new(ENVELOPE_W * 2, ENVELOPE_H * 2).unwrap();
-        mid.draw_pixmap(0, 0, hi.as_ref(), &paint, half, None);
-        let mut out = Pixmap::new(ENVELOPE_W, ENVELOPE_H).unwrap();
-        out.draw_pixmap(0, 0, mid.as_ref(), &paint, half, None);
+        let out = surface.pixels();
 
-        let cy = cy(&out, 1.0);
+        let cy = cy(out, 1.0);
         // The middle of each gap: between Copy and Dictate, and between
         // Dictate and Settings.
         for (i, b) in BUTTONS.iter().enumerate().take(BUTTONS.len() - 1) {

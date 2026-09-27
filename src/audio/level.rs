@@ -34,7 +34,6 @@ const IDLE_SPEED: f32 = 3.0; // radians/sec
 const IDLE_BAR_OFFSET: f32 = 0.7; // phase shift per bar → wave travels across
 
 pub struct BandMeter {
-    n_bands: usize,
     bars: Vec<f32>,
     out: Vec<f32>,
     phase: f32,
@@ -43,6 +42,10 @@ pub struct BandMeter {
     fft: Arc<dyn realfft::RealToComplex<f32>>,
     input_scratch: Vec<f32>,
     output_scratch: Vec<Complex<f32>>,
+    /// The FFT's own working space, owned so a transform allocates nothing.
+    fft_scratch: Vec<Complex<f32>>,
+    /// Each band's level this tick, before easing.
+    targets: Vec<f32>,
     last_tick: Option<std::time::Instant>,
 }
 
@@ -52,6 +55,7 @@ impl BandMeter {
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let input_scratch = vec![0.0; FFT_SIZE];
         let output_scratch = fft.make_output_vec();
+        let fft_scratch = fft.make_scratch_vec();
 
         // Hann window — concentrates spectral energy, reduces leakage.
         let window: Vec<f32> = (0..FFT_SIZE)
@@ -80,7 +84,6 @@ impl BandMeter {
         }
 
         Self {
-            n_bands,
             bars: vec![0.0; n_bands],
             out: vec![0.0; n_bands],
             phase: 0.0,
@@ -89,6 +92,8 @@ impl BandMeter {
             fft,
             input_scratch,
             output_scratch,
+            fft_scratch,
+            targets: vec![0.0; n_bands],
             last_tick: None,
         }
     }
@@ -113,10 +118,10 @@ impl BandMeter {
         self.last_tick = Some(now);
         self.phase += dt_ms / 1000.0;
 
-        let targets = self.compute_band_targets(buffer);
+        self.compute_band_targets(buffer);
         let attack_alpha = 1.0 - (-dt_ms / ATTACK_MS).exp();
         let release_alpha = 1.0 - (-dt_ms / RELEASE_MS).exp();
-        for (cur, &target) in self.bars.iter_mut().zip(targets.iter()) {
+        for (cur, &target) in self.bars.iter_mut().zip(&self.targets) {
             let alpha = if target > *cur {
                 attack_alpha
             } else {
@@ -164,68 +169,72 @@ impl BandMeter {
         }
     }
 
-    fn compute_band_targets(&mut self, buffer: &Buffer) -> Vec<f32> {
-        let samples = buffer.snapshot_tail(FFT_SIZE);
-        if samples.is_empty() {
-            return vec![0.0; self.n_bands];
-        }
+    /// Fill `targets` from the tail of `buffer`. Into buffers the meter already
+    /// owns, every one of them: this runs once per pill frame for as long as
+    /// anyone is talking, so it allocates nothing (#106).
+    fn compute_band_targets(&mut self, buffer: &Buffer) {
         // Zero-pad short captures by leaving leading zeros in the scratch.
-        let pad = FFT_SIZE - samples.len();
-        for v in &mut self.input_scratch[..pad] {
-            *v = 0.0;
-        }
-        for (i, &s) in samples.iter().enumerate() {
-            self.input_scratch[pad + i] = s * self.window[pad + i];
-        }
-        if self
-            .fft
-            .process(&mut self.input_scratch, &mut self.output_scratch)
-            .is_err()
+        let (input, window) = (&mut self.input_scratch, &self.window);
+        let have = buffer.with_tail(FFT_SIZE, |samples| {
+            let pad = FFT_SIZE - samples.len();
+            input[..pad].fill(0.0);
+            for (i, &s) in samples.iter().enumerate() {
+                input[pad + i] = s * window[pad + i];
+            }
+            samples.len()
+        });
+        if have == 0
+            || self
+                .fft
+                .process_with_scratch(
+                    &mut self.input_scratch,
+                    &mut self.output_scratch,
+                    &mut self.fft_scratch,
+                )
+                .is_err()
         {
-            return vec![0.0; self.n_bands];
+            self.targets.fill(0.0);
+            return;
         }
 
-        let mags: Vec<f32> = self.output_scratch.iter().map(|c| c.norm()).collect();
-
-        self.bin_ranges
-            .iter()
-            .map(|&(b0, b1)| {
-                let slice = &mags[b0..b1.min(mags.len())];
-                if slice.is_empty() {
-                    return 0.0;
-                }
-                let mean: f32 = slice.iter().sum::<f32>() / slice.len() as f32;
-                // Normalize: FFT magnitude scales with window sum/2 ≈ FFT_SIZE/4.
-                let norm = mean / (FFT_SIZE as f32 * 0.25);
-                if norm <= 1e-7 {
-                    return 0.0;
-                }
-                let db = 20.0 * norm.log10();
-                // Linear dB mapping (no sqrt). sqrt compressed the top end
-                // and made loud bands all crowd toward 1.0, washing out
-                // inter-band variation.
-                ((db - NOISE_FLOOR_DB) / (FULL_SCALE_DB - NOISE_FLOOR_DB)).clamp(0.0, 1.0)
-            })
-            .collect()
+        let mags = &self.output_scratch;
+        for (target, &(b0, b1)) in self.targets.iter_mut().zip(&self.bin_ranges) {
+            let bins = &mags[b0.min(mags.len())..b1.min(mags.len())];
+            *target = if bins.is_empty() {
+                0.0
+            } else {
+                band_level(bins)
+            };
+        }
     }
 }
 
-/// Center-tall envelope applied as a multiplier on top of the raw band
-/// values. Returns a brand new Vec the renderer can consume.
-pub fn shape_bars(raw: &[f32]) -> Vec<f32> {
-    let n = raw.len();
-    if n == 0 {
-        return Vec::new();
+/// One band's level, 0..1, from the FFT bins it spans.
+fn band_level(bins: &[Complex<f32>]) -> f32 {
+    let mean: f32 = bins.iter().map(|c| c.norm()).sum::<f32>() / bins.len() as f32;
+    // Normalize: FFT magnitude scales with window sum/2 ≈ FFT_SIZE/4.
+    let norm = mean / (FFT_SIZE as f32 * 0.25);
+    if norm <= 1e-7 {
+        return 0.0;
     }
-    raw.iter()
-        .enumerate()
-        .map(|(i, &v)| {
-            let center = (n as f32 - 1.0) / 2.0;
-            let d = (i as f32 - center).abs() / center.max(1.0);
-            // Edge multiplier 0.85, center 1.0. Very subtle bias — we want
-            // the per-band variation to dominate the silhouette.
-            let mult = 1.0 - 0.15 * d;
-            (v * mult).clamp(0.0, 1.0)
-        })
-        .collect()
+    let db = 20.0 * norm.log10();
+    // Linear dB mapping (no sqrt). sqrt compressed the top end
+    // and made loud bands all crowd toward 1.0, washing out
+    // inter-band variation.
+    ((db - NOISE_FLOOR_DB) / (FULL_SCALE_DB - NOISE_FLOOR_DB)).clamp(0.0, 1.0)
+}
+
+/// Center-tall envelope applied as a multiplier on top of the raw band
+/// values, from `raw` into `out` — the caller's buffer, so a frame's bars cost
+/// no allocation. `out` takes as many bars as both have.
+pub fn shape_bars(raw: &[f32], out: &mut [f32]) {
+    let n = raw.len();
+    for (i, (o, &v)) in out.iter_mut().zip(raw).enumerate() {
+        let center = (n as f32 - 1.0) / 2.0;
+        let d = (i as f32 - center).abs() / center.max(1.0);
+        // Edge multiplier 0.85, center 1.0. Very subtle bias — we want
+        // the per-band variation to dominate the silhouette.
+        let mult = 1.0 - 0.15 * d;
+        *o = (v * mult).clamp(0.0, 1.0);
+    }
 }

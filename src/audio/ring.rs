@@ -48,10 +48,13 @@ impl Buffer {
         std::mem::take(&mut *buf)
     }
 
-    /// Copy the last `n` samples (or fewer if less is available).
-    pub fn snapshot_tail(&self, n: usize) -> Vec<f32> {
+    /// Hand `f` the last `n` samples (or fewer if less is available), under
+    /// the lock — which the capture callback is waiting on, so `f` should copy
+    /// what it needs and return. Borrowed rather than copied out, because the
+    /// meter reads this every frame and a copy is an allocation a frame.
+    pub fn with_tail<R>(&self, n: usize, f: impl FnOnce(&[f32]) -> R) -> R {
         let buf = self.inner.lock();
         let start = buf.len().saturating_sub(n);
-        buf[start..].to_vec()
+        f(&buf[start..])
     }
 }

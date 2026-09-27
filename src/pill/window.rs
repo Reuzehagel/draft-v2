@@ -26,17 +26,10 @@ use crate::pill::geom::{Geom, Slots};
 use crate::pill::hook::HookEvent;
 use crate::pill::label::Fade;
 use crate::pill::monitor::HomeMonitor;
+use crate::pill::surface::Surface;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::Sender;
-use tiny_skia::Pixmap;
-
-// Render the pill at this multiple of device resolution, then downscale to
-// device size by halving twice (4×→2×→1×). Each halving is an exact 2×
-// reduction, where bilinear sampling becomes a clean 2×2 box average — this
-// avoids both bilinear's undersampling (when downscaling >2× in one shot) and
-// bicubic's ringing halos at the high-contrast border edge. Must be a power of
-// two so the halving chain lands exactly on device resolution.
-const SUPERSAMPLE: u32 = 4;
+use tiny_skia::{IntRect, Pixmap};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::platform::windows::WindowAttributesExtWindows;
@@ -77,12 +70,12 @@ pub struct PillWindow {
     /// The scale is read off this rather than stored beside it: two copies of
     /// one number is one hand-sync away from the bug this ticket exists to fix.
     home: HomeMonitor,
-    pixmap: Pixmap,
-    hires: Pixmap,
-    // Intermediate 2× buffer for the halving downscale chain.
-    mid: Pixmap,
+    /// The pixels, at the home monitor's resolution — supersampled, halved,
+    /// and only as much of it per frame as the frame could have changed.
+    surface: Surface,
     /// The last frame drawn, so it can be pushed again when the system drops
-    /// the layered surface. `None` before the first frame.
+    /// the layered surface. `None` before the first frame; after that it is
+    /// overwritten in place, so a frame costs no allocation to remember.
     last: Option<Frame>,
     layered: LayeredSurface,
 }
@@ -133,10 +126,7 @@ impl PillWindow {
         // buffers and the scale `render` draws at have to come from the same
         // fact, or the surface is drawn for one monitor and sized for another.
         let (w, h) = surface_size(&home);
-        let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
-        let hires =
-            Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE).ok_or_else(|| anyhow!("hires pixmap"))?;
-        let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
+        let surface = Surface::new(w, h).ok_or_else(|| anyhow!("surface {w}x{h}"))?;
 
         let layered = LayeredSurface::new(&window, w, h)?;
         let hook = crate::pill::hook::PillHook::install(layered.hwnd, hook_tx);
@@ -145,9 +135,7 @@ impl PillWindow {
             hook,
             window,
             home,
-            pixmap,
-            hires,
-            mid,
+            surface,
             last: None,
             layered,
         })
@@ -222,23 +210,38 @@ impl PillWindow {
         style: BodyStyle,
     ) -> Result<()> {
         self.ensure_size()?;
-        crate::pill::render::draw(
-            &mut self.hires,
-            self.home.scale() * SUPERSAMPLE as f32,
-            geom,
-            bar_heights,
-            slots,
-            label,
-            style,
-        );
-        self.last = Some(Frame {
+        let last = self.last.get_or_insert_with(|| Frame {
             geom: *geom,
-            bars: bar_heights.to_vec(),
+            bars: Vec::with_capacity(crate::pill::BAR_COUNT),
             slots: *slots,
             label: *label,
             style,
         });
-        self.blit_and_present()
+        last.geom = *geom;
+        // Into the buffer the last frame's bars are in: the row is the same
+        // length every frame, so this never grows it.
+        last.bars.clear();
+        last.bars.extend_from_slice(bar_heights);
+        last.slots = *slots;
+        last.label = *label;
+        last.style = style;
+        self.present_last()
+    }
+
+    /// Draw [`Self::last`] and push it through `UpdateLayeredWindow`.
+    fn present_last(&mut self) -> Result<()> {
+        let Some(f) = &self.last else {
+            return Ok(());
+        };
+        let damage = self.surface.draw(
+            self.home.scale(),
+            &f.geom,
+            &f.bars,
+            &f.slots,
+            &f.label,
+            f.style,
+        );
+        self.layered.present(self.surface.pixels(), damage)
     }
 
     /// Flip the pill's click-through.
@@ -303,22 +306,11 @@ impl PillWindow {
     ///
     /// A no-op before the first frame — there is nothing to re-push yet.
     pub fn repush(&mut self) -> Result<()> {
-        let Some(frame) = self.last.take() else {
-            return Ok(());
-        };
-        let res = self.render(
-            &frame.geom,
-            &frame.bars,
-            &frame.slots,
-            &frame.label,
-            frame.style,
-        );
-        // `render` restores `last` on success; put it back if it didn't get
-        // that far, so a failed re-push doesn't cost us the next one.
         if self.last.is_none() {
-            self.last = Some(frame);
+            return Ok(());
         }
-        res
+        self.ensure_size()?;
+        self.present_last()
     }
 
     /// Match the buffers to the **home monitor's placement**. The window is
@@ -339,45 +331,18 @@ impl PillWindow {
     ///
     /// All or nothing: every new buffer is built before any old one is
     /// released, so a failure leaves the previous surface whole — and, since
-    /// the pixmaps still don't match, the next render tries again.
+    /// the surface still doesn't match, the next render tries again.
     fn ensure_size(&mut self) -> Result<()> {
         let (w, h) = surface_size(&self.home);
-        if self.pixmap.width() != w || self.pixmap.height() != h {
-            let pixmap = Pixmap::new(w, h).ok_or_else(|| anyhow!("pixmap {w}x{h}"))?;
-            let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
-                .ok_or_else(|| anyhow!("hires pixmap"))?;
-            let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
+        if self.surface.width() != w || self.surface.height() != h {
+            // A new surface damages all of itself on its first frame, which is
+            // what the new DIB — written by nothing yet — needs.
+            let surface = Surface::new(w, h).ok_or_else(|| anyhow!("surface {w}x{h}"))?;
             self.layered.dib.resize(w, h)?;
-            self.pixmap = pixmap;
-            self.hires = hires;
-            self.mid = mid;
+            self.surface = surface;
             place(self.layered.hwnd, &self.home);
         }
         Ok(())
-    }
-
-    /// Downscale the hi-res buffer to device size by halving twice (4×→2×→1×),
-    /// then push it through UpdateLayeredWindow. Each halving is an exact 2×
-    /// reduction so bilinear acts as a clean box average — no undersampling, no
-    /// ringing.
-    fn blit_and_present(&mut self) -> Result<()> {
-        let paint = tiny_skia::PixmapPaint {
-            quality: tiny_skia::FilterQuality::Bilinear,
-            ..Default::default()
-        };
-        let half = tiny_skia::Transform::from_scale(0.5, 0.5);
-
-        // 4× → 2×
-        self.mid.fill(tiny_skia::Color::TRANSPARENT);
-        self.mid
-            .draw_pixmap(0, 0, self.hires.as_ref(), &paint, half, None);
-
-        // 2× → 1× (device)
-        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        self.pixmap
-            .draw_pixmap(0, 0, self.mid.as_ref(), &paint, half, None);
-
-        self.layered.present(&self.pixmap)
     }
 }
 
@@ -424,8 +389,14 @@ impl LayeredSurface {
         }
     }
 
-    fn present(&mut self, pm: &Pixmap) -> Result<()> {
-        crate::pill::render::pixmap_to_premul_bgra(pm, self.dib.pixels());
+    /// Push `pm` to the screen. Only `damage` is copied into the DIB — the
+    /// rest of it already holds these pixels from earlier frames — but the
+    /// whole DIB is pushed, so a re-push after the system dropped the surface
+    /// restores all of it. `None` copies nothing: no pixel changed.
+    fn present(&mut self, pm: &Pixmap, damage: Option<IntRect>) -> Result<()> {
+        if let Some(r) = damage {
+            crate::pill::render::pixmap_to_premul_bgra(pm, self.dib.pixels(), r);
+        }
 
         // Normally we just blit. Re-arming WS_EX_LAYERED briefly drops the
         // window out of per-pixel-alpha mode, so Windows flashes it as a plain
@@ -454,14 +425,9 @@ impl LayeredSurface {
 
     fn update_layered(&self) -> Result<()> {
         use windows::Win32::Foundation::POINT;
-        use windows::Win32::Graphics::Gdi::{
-            GetDC, ReleaseDC, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
-        };
+        use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION};
         use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
-        // SAFETY: GetDC(None) takes no pointers; the screen DC it returns is
-        // released below on every path, since nothing between can return.
-        let screen_dc = unsafe { GetDC(None) };
         let size = windows::Win32::Foundation::SIZE {
             cx: self.dib.w as i32,
             cy: self.dib.h as i32,
@@ -473,15 +439,19 @@ impl LayeredSurface {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
+        // No screen DC. The destination DC only picks a palette, which a
+        // 32bpp alpha push never consults, and `None` is documented to mean
+        // the default one — so taking and releasing the screen's DC on every
+        // present was two calls for nothing (#106).
+        //
         // SAFETY: the pointers are to locals that outlive the call. The source
         // DC is the DIB's own, alive as long as `self`, with its bitmap
         // selected and exactly `size` pixels large. A stale `hwnd` fails the
-        // call rather than touching memory; a null `screen_dc` only means the
-        // default palette, which a 32bpp alpha push never consults.
+        // call rather than touching memory.
         let res = unsafe {
             UpdateLayeredWindow(
                 self.hwnd,
-                screen_dc,
+                None,
                 None,
                 Some(&size),
                 self.dib.dc.0,
@@ -491,10 +461,6 @@ impl LayeredSurface {
                 ULW_ALPHA,
             )
         };
-        // SAFETY: `screen_dc` came from GetDC(None) above and is released once.
-        // The count it returns says nothing actionable: a DC that would not
-        // release has nothing left to retry with.
-        unsafe { ReleaseDC(None, screen_dc) };
         res.map_err(|e| anyhow!("UpdateLayeredWindow: {e}"))
     }
 }
