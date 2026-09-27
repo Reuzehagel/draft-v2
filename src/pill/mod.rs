@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod core;
 pub mod fullscreen;
 pub mod geom;
