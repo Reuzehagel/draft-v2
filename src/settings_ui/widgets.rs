@@ -161,6 +161,75 @@ fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, rounding: 
     );
 }
 
+// ---- screen readers ----------------------------------------------------
+
+/// Tell a screen reader what `resp`'s control is. `info` is what egui already
+/// knows how to say; `refine` then edits the node egui built from it, for what
+/// `WidgetInfo` has no field for — a switch's role, a tab's selection, a value.
+/// Both are no-ops unless a screen reader has switched AccessKit on.
+fn announce(
+    resp: &egui::Response,
+    info: impl Fn() -> egui::WidgetInfo,
+    refine: impl FnOnce(&mut egui::accesskit::NodeBuilder),
+) {
+    resp.widget_info(info);
+    resp.ctx.accesskit_node_builder(resp.id, refine);
+}
+
+/// What the `row` a control sits in says about it, for the control to be
+/// announced by. A row's label is painted beside the control, not by it, so
+/// nothing would otherwise tie the two together for a screen reader.
+#[derive(Clone)]
+struct RowLabel {
+    label: String,
+    caption: String,
+}
+
+fn row_label_id() -> egui::Id {
+    egui::Id::new("settings_row_label")
+}
+
+/// Name `id`'s node after the row it sits in, then let `refine` add to it.
+/// The row is read before the node is opened: both take the context lock, and
+/// it isn't re-entrant.
+fn name_by_row(
+    ui: &egui::Ui,
+    id: egui::Id,
+    refine: impl FnOnce(&mut egui::accesskit::NodeBuilder),
+) {
+    let row = ui.data(|d| d.get_temp::<RowLabel>(row_label_id()));
+    ui.ctx().accesskit_node_builder(id, |node| {
+        if let Some(row) = row {
+            node.set_name(row.label);
+            node.set_description(row.caption);
+        }
+        refine(node);
+    });
+}
+
+/// A switch: announced as one, on or off.
+fn announce_switch(resp: &egui::Response, on: bool, label: &str, caption: Option<&str>) {
+    announce(
+        resp,
+        || egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, label),
+        |node| {
+            node.set_role(egui::accesskit::Role::Switch);
+            if let Some(caption) = caption {
+                node.set_description(caption);
+            }
+        },
+    );
+}
+
+/// A button whose name is its text.
+fn announce_button(resp: &egui::Response, enabled: bool, text: &str) {
+    announce(
+        resp,
+        || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text),
+        |_| {},
+    );
+}
+
 // ---- rail nav ----------------------------------------------------------
 
 /// One left-rail nav item. Selected gets a neutral filled pill; hover gets a
@@ -169,6 +238,16 @@ pub(super) fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // A tab rather than a toggled button: the rail picks one pane of several,
+    // and a screen reader says which is selected.
+    announce(
+        &resp,
+        || egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, label),
+        |node| {
+            node.set_role(egui::accesskit::Role::Tab);
+            node.set_selected(selected);
+        },
+    );
     let id = ui.make_persistent_id(("nav", label));
 
     let hover_t = ui
@@ -224,6 +303,7 @@ pub(super) fn combo<T: PartialEq + Clone>(
                 }
             }
         });
+    name_by_row(ui, r.response.id, |node| node.set_value(selected_text));
     r.response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
@@ -257,6 +337,15 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // The full text, not the elided galley: the cut is for the eye only.
+    announce(
+        &resp,
+        || egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, text),
+        |node| {
+            node.set_role(egui::accesskit::Role::ListBoxOption);
+            node.set_selected(selected);
+        },
+    );
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
@@ -328,6 +417,9 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
     } else {
         ("Not set", MUTED_FG)
     };
+    // Named "API key" out of a row too; the row's label wins inside one.
+    announce_button(&resp, true, "API key");
+    name_by_row(ui, resp.id, |node| node.set_value(status));
     let g =
         ui.painter()
             .layout_no_wrap(status.to_string(), egui::FontId::proportional(13.0), scolor);
@@ -373,14 +465,22 @@ pub(super) fn text_input(
             v.widgets.active.bg_stroke.color = DESTRUCTIVE;
             v.selection.stroke.color = DESTRUCTIVE;
         }
-        ui.add_sized(
+        let resp = ui.add_sized(
             [width, CONTROL_H],
             egui::TextEdit::singleline(text)
                 .hint_text(hint(placeholder))
                 .vertical_align(egui::Align::Center),
-        )
+        );
+        name_by_row(ui, resp.id, |node| node.set_placeholder(placeholder));
+        resp
     })
     .inner
+}
+
+/// Name a text field that sits outside a `row`, so has no row to be named by.
+pub(super) fn name_field(resp: &egui::Response, name: &str) {
+    resp.ctx
+        .accesskit_node_builder(resp.id, |node| node.set_name(name));
 }
 
 /// A validation message hung beneath a row, in the control column: laid out
@@ -431,7 +531,17 @@ pub(super) fn row(
             ui.label(RichText::new(label).size(13.5).color(FG));
             ui.label(RichText::new(caption).size(11.5).color(MUTED_FG));
         },
-        control,
+        |ui| {
+            // Held only while the control is laid out, so a control after the
+            // row can't pick up its label.
+            let row = RowLabel {
+                label: label.to_owned(),
+                caption: caption.to_owned(),
+            };
+            ui.data_mut(|d| d.insert_temp(row_label_id(), row));
+            control(ui);
+            ui.data_mut(|d| d.remove::<RowLabel>(row_label_id()));
+        },
     );
 }
 
@@ -474,27 +584,29 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
         // and doesn't wrap in the narrow window.
         ui.spacing_mut().item_spacing.x = 0.0;
         let id = ui.make_persistent_id("repl_enabled");
-        if mini_switch(ui, rule.enabled, id) {
+        if mini_switch(ui, rule.enabled, "Rule enabled", id) {
             rule.enabled = !rule.enabled;
         }
         ui.add_space(10.0);
-        ui.add_sized(
+        let from = ui.add_sized(
             [field_w, CONTROL_H],
             egui::TextEdit::singleline(&mut rule.from)
                 .id_salt("repl_from")
                 .hint_text(hint("hears…"))
                 .vertical_align(egui::Align::Center),
         );
+        name_field(&from, "Hears");
         ui.add_space(8.0);
         ui.label(RichText::new("→").size(15.0).color(MUTED_FG));
         ui.add_space(8.0);
-        ui.add_sized(
+        let to = ui.add_sized(
             [field_w, CONTROL_H],
             egui::TextEdit::singleline(&mut rule.to)
                 .id_salt("repl_to")
                 .hint_text(hint("writes…"))
                 .vertical_align(egui::Align::Center),
         );
+        name_field(&to, "Writes");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add(ghost_button("Remove", 72.0, CONTROL_H)).clicked() {
                 remove = true;
@@ -513,10 +625,12 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
 }
 
 /// Compact label-less toggle switch for inline use in list rows. Returns true
-/// on click; the caller flips the bound value.
-pub(super) fn mini_switch(ui: &mut egui::Ui, on: bool, id: egui::Id) -> bool {
+/// on click; the caller flips the bound value. `label` is never painted — it
+/// is what a screen reader calls the switch.
+pub(super) fn mini_switch(ui: &mut egui::Ui, on: bool, label: &str, id: egui::Id) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    announce_switch(&resp, on, label, None);
     paint_toggle(ui, rect, on, id, resp.hovered());
     focus_ring(ui, &resp, rect, rect.height() / 2.0);
     resp.clicked()
@@ -563,6 +677,7 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
     if resp.clicked() {
         *value = !*value;
     }
+    announce_switch(&resp, *value, label, Some(caption));
     let hover_t = ui
         .ctx()
         .animate_bool_with_time(id.with("hover"), resp.hovered(), 0.12);
@@ -657,6 +772,7 @@ pub(super) fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '
             egui::Sense::hover()
         };
         let (rect, resp) = ui.allocate_exact_size(size, sense);
+        announce_button(&resp, enabled, text);
         let id = ui.make_persistent_id(("primary_btn", text));
         let pressed = enabled && resp.is_pointer_button_down_on();
         let press_t = ui.ctx().animate_bool_with_time(id, pressed, 0.07);
@@ -695,6 +811,7 @@ pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
     move |ui: &mut egui::Ui| {
         let size = Vec2::new(94.0, 34.0);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        announce_button(&resp, true, text);
         let id = ui.make_persistent_id(("destructive_btn", text));
         let pressed = resp.is_pointer_button_down_on();
         let press_t = ui.ctx().animate_bool_with_time(id, pressed, 0.07);
@@ -726,6 +843,7 @@ pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
 pub(super) fn ghost_button(text: &str, width: f32, height: f32) -> impl egui::Widget + '_ {
     move |ui: &mut egui::Ui| {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
+        announce_button(&resp, true, text);
         let fill = if resp.is_pointer_button_down_on() {
             CONTROL_HOVER
         } else if resp.hovered() {
@@ -1040,8 +1158,7 @@ mod tests {
         "ghost",
     ];
 
-    /// One frame of `CONTROLS`, with a disabled Save among them. Returns
-    /// which ones were activated this frame, in order.
+    /// One frame of `controls`.
     fn controls_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> [bool; CONTROLS.len()] {
         let mut hit = [false; CONTROLS.len()];
         let input = egui::RawInput {
@@ -1050,20 +1167,26 @@ mod tests {
             ..Default::default()
         };
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                hit[0] = nav_item(ui, "Recording", false);
-                let mut on = false;
-                toggle_row(ui, &mut on, "Launch at login", "Start Draft with Windows.");
-                hit[1] = on;
-                hit[2] = mini_switch(ui, false, egui::Id::new("mini"));
-                hit[3] = key_opener(ui, true);
-                // Disabled: nothing to do, so nothing to land on.
-                ui.add(primary_button("Save", false));
-                hit[4] = ui.add(primary_button("Apply", true)).clicked();
-                hit[5] = ui.add(destructive_button("Clear")).clicked();
-                hit[6] = ui.add(ghost_button("Close", 84.0, 34.0)).clicked();
-            });
+            egui::CentralPanel::default().show(ctx, |ui| hit = controls(ui));
         });
+        hit
+    }
+
+    /// `CONTROLS`, with a disabled Save among them. Returns which ones were
+    /// activated, in order.
+    fn controls(ui: &mut egui::Ui) -> [bool; CONTROLS.len()] {
+        let mut hit = [false; CONTROLS.len()];
+        hit[0] = nav_item(ui, "Recording", false);
+        let mut on = false;
+        toggle_row(ui, &mut on, "Launch at login", "Start Draft with Windows.");
+        hit[1] = on;
+        hit[2] = mini_switch(ui, false, "Rule enabled", egui::Id::new("mini"));
+        hit[3] = key_opener(ui, true);
+        // Disabled: nothing to do, so nothing to land on.
+        ui.add(primary_button("Save", false));
+        hit[4] = ui.add(primary_button("Apply", true)).clicked();
+        hit[5] = ui.add(destructive_button("Clear")).clicked();
+        hit[6] = ui.add(ghost_button("Close", 84.0, 34.0)).clicked();
         hit
     }
 
@@ -1201,7 +1324,7 @@ mod tests {
                         after.push(ui.cursor().min);
                         toggle_row(ui, &mut false, "Launch at login", "Start with Windows.");
                         after.push(ui.cursor().min);
-                        mini_switch(ui, false, egui::Id::new("mini"));
+                        mini_switch(ui, false, "Rule enabled", egui::Id::new("mini"));
                         after.push(ui.cursor().min);
                         key_opener(ui, false);
                         after.push(ui.cursor().min);
@@ -1232,6 +1355,159 @@ mod tests {
                 rings[0]
             );
             assert_eq!(after, layout, "focusing the {name} moved the layout");
+        }
+    }
+
+    use egui::accesskit::{Action, Node, Role, Toggled};
+
+    /// The AccessKit nodes one frame of `build` hands a screen reader.
+    fn a11y_nodes(mut build: impl FnMut(&mut egui::Ui)) -> Vec<Node> {
+        let ctx = font_ctx();
+        ctx.enable_accesskit();
+        let out = ctx.run(
+            egui::RawInput {
+                max_texture_side: Some(2048),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, &mut build);
+            },
+        );
+        let update = out.platform_output.accesskit_update.expect("accesskit on");
+        update.nodes.into_iter().map(|(_, n)| n).collect()
+    }
+
+    /// The one node of `role` a screen reader would announce as `name`.
+    fn named<'a>(nodes: &'a [Node], role: Role, name: &str) -> &'a Node {
+        let found: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.role() == role && n.name() == Some(name))
+            .collect();
+        assert_eq!(found.len(), 1, "one {role:?} named {name:?}");
+        found[0]
+    }
+
+    /// A switch is announced as one, named by its row, and says on or off.
+    #[test]
+    fn a_switch_reports_its_label_and_whether_it_is_on() {
+        let nodes = a11y_nodes(|ui| {
+            toggle_row(ui, &mut true, "Launch at login", "Start with Windows.");
+            mini_switch(ui, false, "Rule enabled", egui::Id::new("mini"));
+        });
+        let row = named(&nodes, Role::Switch, "Launch at login");
+        assert_eq!(row.toggled(), Some(Toggled::True));
+        assert_eq!(row.description(), Some("Start with Windows."));
+        let mini = named(&nodes, Role::Switch, "Rule enabled");
+        assert_eq!(mini.toggled(), Some(Toggled::False));
+    }
+
+    /// Rail items are tabs, and the current pane's is the selected one.
+    #[test]
+    fn a_rail_item_reports_whether_it_is_selected() {
+        let nodes = a11y_nodes(|ui| {
+            nav_item(ui, "Recording", true);
+            nav_item(ui, "Pill", false);
+        });
+        assert_eq!(
+            named(&nodes, Role::Tab, "Recording").is_selected(),
+            Some(true)
+        );
+        assert_eq!(named(&nodes, Role::Tab, "Pill").is_selected(), Some(false));
+    }
+
+    /// A dropdown in a row is named by the row, described by its caption, and
+    /// reports the option it currently shows.
+    #[test]
+    fn a_dropdown_reports_its_row_label_and_current_option() {
+        let nodes = a11y_nodes(|ui| {
+            row(ui, "Activation", "Hold the key, or tap to toggle.", |ui| {
+                let mut v = 1;
+                combo(
+                    ui,
+                    "activation",
+                    &mut v,
+                    "Toggle",
+                    &[(0, "Hold"), (1, "Toggle")],
+                );
+            });
+        });
+        let combo = named(&nodes, Role::ComboBox, "Activation");
+        assert_eq!(combo.value(), Some("Toggle"));
+        assert_eq!(combo.description(), Some("Hold the key, or tap to toggle."));
+    }
+
+    /// An option in an open dropdown says whether it is the current one.
+    #[test]
+    fn a_dropdown_option_reports_whether_it_is_selected() {
+        let nodes = a11y_nodes(|ui| {
+            combo_item(ui, "Hold", false);
+            combo_item(ui, "Toggle", true);
+        });
+        let hold = named(&nodes, Role::ListBoxOption, "Hold");
+        assert_eq!(hold.is_selected(), Some(false));
+        let toggle = named(&nodes, Role::ListBoxOption, "Toggle");
+        assert_eq!(toggle.is_selected(), Some(true));
+    }
+
+    /// A text field and the key opener in rows are named by the row; the
+    /// opener says whether a key is set.
+    #[test]
+    fn row_controls_are_named_by_their_row() {
+        let nodes = a11y_nodes(|ui| {
+            row(ui, "Hotkey", "Push-to-talk key combination.", |ui| {
+                text_input(
+                    ui,
+                    &mut "Ctrl+Backslash".into(),
+                    "Ctrl+Backslash",
+                    CONTROL_W,
+                    false,
+                );
+            });
+            row(
+                ui,
+                "API key",
+                "Stored in Windows Credential Manager.",
+                |ui| {
+                    key_opener(ui, true);
+                },
+            );
+        });
+        named(&nodes, Role::TextInput, "Hotkey");
+        let opener = named(&nodes, Role::Button, "API key");
+        assert_eq!(opener.value(), Some("Configured"));
+    }
+
+    /// Buttons say what they do, and a Save with nothing to save says it is
+    /// unavailable.
+    #[test]
+    fn a_button_reports_its_text_and_whether_it_is_enabled() {
+        let nodes = a11y_nodes(|ui| {
+            ui.add(primary_button("Save", false));
+            ui.add(destructive_button("Clear"));
+            ui.add(ghost_button("Close", 84.0, 34.0));
+        });
+        assert!(named(&nodes, Role::Button, "Save").is_disabled());
+        assert!(!named(&nodes, Role::Button, "Clear").is_disabled());
+        named(&nodes, Role::Button, "Close");
+    }
+
+    /// Nothing Tab can reach is announced without a name.
+    #[test]
+    fn every_focusable_control_has_a_name() {
+        let nodes = a11y_nodes(|ui| {
+            controls(ui);
+        });
+        let focusable: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.supports_action(Action::Focus))
+            .collect();
+        assert!(focusable.len() >= CONTROLS.len());
+        for n in focusable {
+            assert!(
+                n.name().is_some_and(|s| !s.is_empty()),
+                "a focusable {:?} has no name",
+                n.role()
+            );
         }
     }
 

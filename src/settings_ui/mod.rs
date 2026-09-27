@@ -1049,6 +1049,7 @@ impl SettingsApp {
                     .desired_width(f32::INFINITY)
                     .hint_text(hint("e.g.  Janssen\n      kubectl\n      Reson8")),
             );
+            name_field(&resp, "Custom vocabulary");
             if resp.changed() {
                 self.cfg.vocabulary = self
                     .vocab_buffer
@@ -1155,12 +1156,13 @@ impl SettingsApp {
 
             // Search box: filters the list as you type. Full width so it lines
             // up with the entries below.
-            ui.add_sized(
+            let search = ui.add_sized(
                 [ui.available_width(), CONTROL_H],
                 egui::TextEdit::singleline(&mut self.history_filter)
                     .hint_text(hint("Search transcripts…"))
                     .vertical_align(egui::Align::Center),
             );
+            name_field(&search, "Search transcripts");
             ui.add_space(10.0);
 
             // Case-insensitive substring match over text and provider. Computed
@@ -1327,13 +1329,14 @@ impl SettingsApp {
                 ui.horizontal(|ui| {
                     let show_w = 56.0;
                     let field_w = ui.available_width() - show_w - 8.0;
-                    ui.add_sized(
+                    let field = ui.add_sized(
                         [field_w, CONTROL_H],
                         egui::TextEdit::singleline(&mut dlg.buffer)
                             .password(!dlg.reveal)
                             .hint_text(hint("paste key…"))
                             .vertical_align(egui::Align::Center),
                     );
+                    name_field(&field, &format!("{} API key", dlg.provider.label()));
                     ui.add_space(8.0);
                     let eye = if dlg.reveal { "Hide" } else { "Show" };
                     if ui.add(ghost_button(eye, show_w, CONTROL_H)).clicked() {
