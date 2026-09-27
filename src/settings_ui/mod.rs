@@ -12,25 +12,30 @@
 // The module splits along what-changes-together lines:
 // - `theme`    — every colour, metric, and the egui style install.
 // - `widgets`  — reusable stateless widgets (rows, toggles, buttons, modal).
-// - `download` — the model download's shared state and worker body.
+// - `state`    — what the window edits, the dirty check and Save; no egui.
+// - `format`   — worked-out text: relative times, download progress.
+// - `download` — the model download's shared state and worker.
 // - `focus_trap` — keeps Tab inside an open dialog.
-// - here       — the app: state, tabs, dialogs, save/dirty logic.
+// - here       — the app: panes, dialogs, and the frame that draws them.
 // Read the header comments of `theme` and `widgets` before adding UI; they
 // document the layout invariants (measure-then-allocate, bounded
 // right_to_left, shared control metrics) this window depends on.
 
 mod download;
 mod focus_trap;
+mod format;
+mod state;
 mod theme;
 mod widgets;
 
-use crate::autostart;
 use crate::config::{Activation, Config, MonitorPolicy, PasteMode, PillBodyStyle, Provider};
 use crate::secrets;
-use crate::transcribe::parakeet_download::{self, Progress as DlProgress};
+use crate::transcribe::parakeet_download;
 use download::DownloadState;
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
 use focus_trap::FocusTrap;
+use format::{progress_fraction, progress_label, relative_time};
+use state::{Form, SystemStore, ALL_PROVIDERS};
 use std::sync::{Arc, Mutex};
 use theme::*;
 use widgets::*;
@@ -46,32 +51,10 @@ pub fn run() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let autostart_enabled = autostart::is_enabled();
-
-    let mut keys = ProviderKeys::default();
-    let mut key_sources = Vec::new();
-    for &p in ALL_PROVIDERS {
-        let (key, source) = secrets::load_key_with_source(p);
-        keys.set(p, key.unwrap_or_default());
-        key_sources.push((p, source));
-    }
-
-    let baseline = Snapshot {
-        cfg: cfg.clone(),
-        keys: keys.clone(),
-        autostart_enabled,
-    };
-
-    let vocab_buffer = cfg.vocabulary.join("\n");
     let app = SettingsApp {
         tab: Tab::Recording,
-        cfg,
-        vocab_buffer,
-        keys,
-        key_sources,
-        autostart_enabled,
+        form: Form::load(cfg),
         key_dialog: None,
-        baseline,
         save_status: None,
         download_state: Arc::new(Mutex::new(DownloadState::new(
             parakeet_download::is_present(),
@@ -166,15 +149,6 @@ const ALL_MONITOR_POLICIES: &[MonitorPolicy] = &[
     MonitorPolicy::Pinned,
 ];
 
-const ALL_PROVIDERS: &[Provider] = &[
-    Provider::LocalParakeet,
-    Provider::Mistral,
-    Provider::Groq,
-    Provider::Openai,
-    Provider::Elevenlabs,
-    Provider::Reson8,
-];
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Recording,
@@ -221,79 +195,6 @@ impl Tab {
             Tab::History => "Recent transcripts — recover anything a paste missed.",
             Tab::System => "Startup and app behaviour.",
         }
-    }
-}
-
-#[derive(Default, Clone, PartialEq, Eq)]
-struct ProviderKeys {
-    mistral: String,
-    groq: String,
-    openai: String,
-    elevenlabs: String,
-    reson8: String,
-}
-
-impl ProviderKeys {
-    fn get(&self, p: Provider) -> &str {
-        match p {
-            Provider::Mistral => &self.mistral,
-            Provider::Groq => &self.groq,
-            Provider::Openai => &self.openai,
-            Provider::Elevenlabs => &self.elevenlabs,
-            Provider::Reson8 => &self.reson8,
-            Provider::LocalParakeet => "",
-        }
-    }
-    fn get_mut(&mut self, p: Provider) -> Option<&mut String> {
-        Some(match p {
-            Provider::Mistral => &mut self.mistral,
-            Provider::Groq => &mut self.groq,
-            Provider::Openai => &mut self.openai,
-            Provider::Elevenlabs => &mut self.elevenlabs,
-            Provider::Reson8 => &mut self.reson8,
-            Provider::LocalParakeet => return None,
-        })
-    }
-    fn set(&mut self, p: Provider, v: String) {
-        if let Some(slot) = self.get_mut(p) {
-            *slot = v;
-        }
-    }
-}
-
-/// On-open (and post-save) snapshot used to detect unsaved changes.
-#[derive(Clone, PartialEq, Eq)]
-struct Snapshot {
-    cfg: Config,
-    keys: ProviderKeys,
-    autostart_enabled: bool,
-}
-
-/// What's wrong with each hotkey field, as the main process's parser would
-/// find it on reload. A spec that fails there is logged and the old binding
-/// kept — invisible from here — so Save refuses to write one.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct HotkeyErrors {
-    dictate: Option<String>,
-    /// Only checked while push-to-command is on: that's the only time the main
-    /// process parses it, and the only time its field is on screen.
-    command: Option<String>,
-}
-
-impl HotkeyErrors {
-    fn of(cfg: &Config) -> Self {
-        let check = |spec: &str| crate::hotkey::parse(spec).err().map(|e| e.to_string());
-        HotkeyErrors {
-            dictate: check(&cfg.hotkey),
-            command: cfg
-                .push_to_command
-                .then(|| check(&cfg.command_hotkey))
-                .flatten(),
-        }
-    }
-
-    fn is_clear(&self) -> bool {
-        self.dictate.is_none() && self.command.is_none()
     }
 }
 
@@ -358,19 +259,8 @@ struct KeyDialog {
 
 struct SettingsApp {
     tab: Tab,
-    cfg: Config,
-    /// Editable text behind `cfg.vocabulary` — one term per line. The Vec is
-    /// re-derived from this on every edit; the buffer keeps blank lines the
-    /// user is still typing around.
-    vocab_buffer: String,
-    keys: ProviderKeys,
-    /// Where each key in `keys` came from, as of open or the last save. Save
-    /// consults it through `secrets::key_write` so an environment key is never
-    /// persisted and a key that failed to load is never deleted.
-    key_sources: Vec<(Provider, secrets::KeySource)>,
-    autostart_enabled: bool,
+    form: Form,
     key_dialog: Option<KeyDialog>,
-    baseline: Snapshot,
     save_status: Option<(bool, String)>,
     download_state: Arc<Mutex<DownloadState>>,
     /// Snapshot of the transcript history as of when this window opened. The
@@ -457,51 +347,11 @@ fn replacement_rows(
 }
 
 impl SettingsApp {
-    fn current_snapshot(&self) -> Snapshot {
-        Snapshot {
-            cfg: self.cfg.clone(),
-            keys: self.keys.clone(),
-            autostart_enabled: self.autostart_enabled,
-        }
-    }
-
-    fn is_dirty(&self) -> bool {
-        self.current_snapshot() != self.baseline
-    }
-
-    /// Save is offered only when there's something to save and nothing in it
-    /// the main process would refuse.
-    fn can_save(&self) -> bool {
-        self.is_dirty() && HotkeyErrors::of(&self.cfg).is_clear()
-    }
-
     fn save(&mut self) {
-        if let Err(e) = self.cfg.save() {
-            self.save_status = Some((false, format!("Config save failed: {e}")));
-            return;
-        }
-        for (p, source) in self.key_sources.iter_mut() {
-            let Some(write) =
-                secrets::key_write(self.baseline.keys.get(*p), self.keys.get(*p), *source)
-            else {
-                continue;
-            };
-            if let Err(e) = secrets::apply_write(*p, &write) {
-                self.save_status = Some((false, format!("Keyring save failed ({p:?}): {e}")));
-                return;
-            }
-            // Advance this key's baseline now, not with the rest: if a later
-            // step fails, the next save must compare against what the keyring
-            // holds, or a Remove made in between would read as "no edit".
-            *source = write.leaves();
-            self.baseline.keys.set(*p, self.keys.get(*p).to_string());
-        }
-        if let Err(e) = autostart::set_enabled(self.autostart_enabled) {
-            self.save_status = Some((false, format!("Autostart toggle failed: {e}")));
-            return;
-        }
-        self.baseline = self.current_snapshot();
-        self.save_status = Some((true, "Saved. Applies when this window closes.".into()));
+        self.save_status = Some(match self.form.save(&mut SystemStore) {
+            Ok(()) => (true, "Saved. Applies when this window closes.".into()),
+            Err(msg) => (false, msg),
+        });
     }
 }
 
@@ -542,7 +392,7 @@ impl SettingsApp {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        if save_shortcut && self.open_dialog().is_none() && self.can_save() {
+        if save_shortcut && self.open_dialog().is_none() && self.form.can_save() {
             self.save();
         }
         if close_shortcut {
@@ -560,7 +410,7 @@ impl SettingsApp {
                 EscCloses::Window => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
-        if hold_close(ctx, self.is_dirty(), self.close_confirmed) {
+        if hold_close(ctx, self.form.is_dirty(), self.close_confirmed) {
             // The prompt replaces whatever modal was up: the window is on its
             // way out, and one question at a time.
             self.key_dialog = None;
@@ -665,13 +515,13 @@ impl SettingsApp {
     }
 
     fn tab_recording(&mut self, ui: &mut egui::Ui) {
-        let errs = HotkeyErrors::of(&self.cfg);
+        let errs = self.form.hotkey_errors();
         group(ui, |ui| {
             hotkey_row(
                 ui,
                 "Hotkey",
                 "Push-to-talk key combination.",
-                &mut self.cfg.hotkey,
+                &mut self.form.cfg.hotkey,
                 "Ctrl+Backslash",
                 errs.dictate.as_deref(),
             );
@@ -682,6 +532,7 @@ impl SettingsApp {
                 "Which input device Draft records from.",
                 |ui| {
                     let selected = self
+                        .form
                         .cfg
                         .input_device
                         .clone()
@@ -696,7 +547,7 @@ impl SettingsApp {
                     combo(
                         ui,
                         "input_device",
-                        &mut self.cfg.input_device,
+                        &mut self.form.cfg.input_device,
                         &selected,
                         &options,
                     );
@@ -704,25 +555,25 @@ impl SettingsApp {
             );
             divider(ui);
             row(ui, "Activation", "Hold the key, or tap to toggle.", |ui| {
-                let sel = match self.cfg.activation {
+                let sel = match self.form.cfg.activation {
                     Activation::Hold => "Hold",
                     Activation::Toggle => "Toggle",
                 };
                 combo(
                     ui,
                     "activation",
-                    &mut self.cfg.activation,
+                    &mut self.form.cfg.activation,
                     sel,
                     &[(Activation::Hold, "Hold"), (Activation::Toggle, "Toggle")],
                 );
             });
             // The double-press lock only applies in Hold mode — reveal it
             // progressively rather than showing a dead control in Toggle.
-            if matches!(self.cfg.activation, Activation::Hold) {
+            if matches!(self.form.cfg.activation, Activation::Hold) {
                 divider(ui);
                 toggle_row(
                     ui,
-                    &mut self.cfg.double_press_lock,
+                    &mut self.form.cfg.double_press_lock,
                     "Double-press to lock",
                     "Tap the hotkey twice quickly to keep recording hands-free.",
                 );
@@ -734,19 +585,19 @@ impl SettingsApp {
         group(ui, |ui| {
             toggle_row(
                 ui,
-                &mut self.cfg.push_to_command,
+                &mut self.form.cfg.push_to_command,
                 "Push-to-command",
                 "Hold a second hotkey and speak an instruction instead of \
                  dictating — the AI's answer is pasted at your cursor. \
                  Uses Groq; add its API key under Transcription.",
             );
-            if self.cfg.push_to_command {
+            if self.form.cfg.push_to_command {
                 divider(ui);
                 hotkey_row(
                     ui,
                     "Command hotkey",
                     "Same syntax as the main hotkey.",
-                    &mut self.cfg.command_hotkey,
+                    &mut self.form.cfg.command_hotkey,
                     "Ctrl+Shift+Backslash",
                     errs.command.as_deref(),
                 );
@@ -763,7 +614,7 @@ impl SettingsApp {
         group(ui, |ui| {
             toggle_row(
                 ui,
-                &mut self.cfg.pill.resident,
+                &mut self.form.cfg.pill.resident,
                 "Keep the pill on screen",
                 "A small marker sits at the bottom of your screen whenever Draft \
                  is running, so you can tell at a glance that it's alive. Turn \
@@ -774,7 +625,7 @@ impl SettingsApp {
             // not: the button bar only ever appears on hover, and there is
             // nothing to hover with the pill off. Same test, opposite answer,
             // because the question is whether the setting is still in force.
-            if self.cfg.pill.resident {
+            if self.form.cfg.pill.resident {
                 divider(ui);
                 self.body_style_row(ui);
             }
@@ -787,7 +638,7 @@ impl SettingsApp {
                 "Show it on",
                 "Which display the pill appears on.",
                 |ui| {
-                    let sel = self.cfg.pill.monitor.label();
+                    let sel = self.form.cfg.pill.monitor.label();
                     let options: Vec<(MonitorPolicy, &str)> = ALL_MONITOR_POLICIES
                         .iter()
                         .map(|&p| (p, p.label()))
@@ -795,7 +646,7 @@ impl SettingsApp {
                     combo(
                         ui,
                         "pill_monitor",
-                        &mut self.cfg.pill.monitor,
+                        &mut self.form.cfg.pill.monitor,
                         sel,
                         &options,
                     );
@@ -803,7 +654,7 @@ impl SettingsApp {
             );
             // Progressive reveal, as with the double-press lock: the picker
             // means nothing under the other three policies.
-            if self.cfg.pill.monitor == MonitorPolicy::Pinned {
+            if self.form.cfg.pill.monitor == MonitorPolicy::Pinned {
                 divider(ui);
                 self.pinned_display_row(ui);
             }
@@ -821,7 +672,7 @@ impl SettingsApp {
     /// Off is islands, and off is the default: the toggle adds the reduced
     /// option rather than choosing between two peers.
     fn body_style_row(&mut self, ui: &mut egui::Ui) {
-        let mut unified = self.cfg.pill.body_style == PillBodyStyle::Unified;
+        let mut unified = self.form.cfg.pill.body_style == PillBodyStyle::Unified;
         toggle_row(
             ui,
             &mut unified,
@@ -831,7 +682,7 @@ impl SettingsApp {
              on to put them in a single bar instead. Same buttons, same \
              actions, just a different shape.",
         );
-        self.cfg.pill.body_style = if unified {
+        self.form.cfg.pill.body_style = if unified {
             PillBodyStyle::Unified
         } else {
             PillBodyStyle::Islands
@@ -846,7 +697,7 @@ impl SettingsApp {
     /// pinned display that isn't connected right now says so, and the pill
     /// falls back to the primary until it comes back.
     fn pinned_display_row(&mut self, ui: &mut egui::Ui) {
-        let pinned = self.cfg.pill.monitor_pinned_path.clone();
+        let pinned = self.form.cfg.pill.monitor_pinned_path.clone();
         let connected = self
             .displays
             .iter()
@@ -865,7 +716,7 @@ impl SettingsApp {
             combo(
                 ui,
                 "pill_monitor_pinned",
-                &mut self.cfg.pill.monitor_pinned_path,
+                &mut self.form.cfg.pill.monitor_pinned_path,
                 &selected,
                 &options,
             );
@@ -875,16 +726,16 @@ impl SettingsApp {
     fn tab_transcription(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         group(ui, |ui| {
             row(ui, "Provider", "Where your audio is transcribed.", |ui| {
-                let sel = self.cfg.provider.label();
+                let sel = self.form.cfg.provider.label();
                 let options: Vec<(Provider, &str)> =
                     ALL_PROVIDERS.iter().map(|&p| (p, p.label())).collect();
-                combo(ui, "provider", &mut self.cfg.provider, sel, &options);
+                combo(ui, "provider", &mut self.form.cfg.provider, sel, &options);
             });
 
-            if secrets::slot_name(self.cfg.provider).is_some() {
+            if secrets::slot_name(self.form.cfg.provider).is_some() {
                 divider(ui);
-                let configured = !self.keys.get(self.cfg.provider).trim().is_empty();
-                let provider = self.cfg.provider;
+                let configured = !self.form.keys.get(self.form.cfg.provider).trim().is_empty();
+                let provider = self.form.cfg.provider;
                 row(
                     ui,
                     "API key",
@@ -904,14 +755,14 @@ impl SettingsApp {
                 );
             }
 
-            if matches!(self.cfg.provider, Provider::LocalParakeet) {
+            if matches!(self.form.cfg.provider, Provider::LocalParakeet) {
                 divider(ui);
                 self.parakeet_row(ui, ctx);
             } else {
                 divider(ui);
                 toggle_row(
                     ui,
-                    &mut self.cfg.fallback_to_local,
+                    &mut self.form.cfg.fallback_to_local,
                     "Offline fallback",
                     "If the cloud call fails, the local model transcribes \
                      instead, so the dictation isn't lost. Requires the \
@@ -940,7 +791,7 @@ impl SettingsApp {
                     let (label, pct) = state
                         .progress
                         .as_ref()
-                        .map(|p| (format_progress_label(p), progress_fraction(p)))
+                        .map(|p| (progress_label(p), progress_fraction(p)))
                         .unwrap_or_else(|| ("Starting download…".into(), 0.0));
                     let bar = ui.add(
                         egui::ProgressBar::new(pct)
@@ -963,22 +814,9 @@ impl SettingsApp {
                         .clicked()
                     {
                         state.start();
-                        let handle = self.download_state.clone();
                         let repaint_ctx = ctx.clone();
-                        std::thread::spawn(move || {
-                            download::run(
-                                &handle,
-                                |report| {
-                                    parakeet_download::download(|p: DlProgress| {
-                                        report(p);
-                                        repaint_ctx.request_repaint();
-                                    })
-                                },
-                                parakeet_download::is_present,
-                            );
-                            // The progress repaint loop stops once running=false;
-                            // wake the UI once more so the final state shows.
-                            repaint_ctx.request_repaint();
+                        download::spawn(self.download_state.clone(), move || {
+                            repaint_ctx.request_repaint()
                         });
                     }
                 }
@@ -1003,7 +841,7 @@ impl SettingsApp {
             );
             ui.add_space(16.0);
 
-            if self.cfg.replacements.is_empty() {
+            if self.form.cfg.replacements.is_empty() {
                 ui.label(
                     RichText::new("No rules yet.")
                         .size(12.5)
@@ -1013,16 +851,17 @@ impl SettingsApp {
                 ui.add_space(12.0);
             }
 
-            replacement_rows(ui, &mut self.cfg.replacements, &mut self.rule_keys);
+            replacement_rows(ui, &mut self.form.cfg.replacements, &mut self.rule_keys);
 
-            if !self.cfg.replacements.is_empty() {
+            if !self.form.cfg.replacements.is_empty() {
                 ui.add_space(16.0);
             }
             if ui
                 .add(ghost_button("Add replacement", 160.0, CONTROL_H))
                 .clicked()
             {
-                self.cfg
+                self.form
+                    .cfg
                     .replacements
                     .push(crate::config::Replacement::default());
             }
@@ -1045,20 +884,14 @@ impl SettingsApp {
             );
             ui.add_space(10.0);
             let resp = ui.add(
-                egui::TextEdit::multiline(&mut self.vocab_buffer)
+                egui::TextEdit::multiline(&mut self.form.vocab_buffer)
                     .desired_rows(5)
                     .desired_width(f32::INFINITY)
                     .hint_text(hint("e.g.  Janssen\n      kubectl\n      Reson8")),
             );
             name_control(&resp, "Custom vocabulary");
             if resp.changed() {
-                self.cfg.vocabulary = self
-                    .vocab_buffer
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect();
+                self.form.vocabulary_edited();
             }
         });
     }
@@ -1070,14 +903,14 @@ impl SettingsApp {
                 "Paste mode",
                 "Use Type for hosts that swallow Ctrl+V.",
                 |ui| {
-                    let sel = match self.cfg.paste_mode {
+                    let sel = match self.form.cfg.paste_mode {
                         PasteMode::Clipboard => "Clipboard (Ctrl+V)",
                         PasteMode::Unicode => "Type (Unicode)",
                     };
                     combo(
                         ui,
                         "paste_mode",
-                        &mut self.cfg.paste_mode,
+                        &mut self.form.cfg.paste_mode,
                         sel,
                         &[
                             (PasteMode::Clipboard, "Clipboard (Ctrl+V)"),
@@ -1089,21 +922,21 @@ impl SettingsApp {
             divider(ui);
             toggle_row(
                 ui,
-                &mut self.cfg.append_trailing_space,
+                &mut self.form.cfg.append_trailing_space,
                 "Append trailing space",
                 "Adds one space after each transcript so the next word doesn't smash into it.",
             );
             divider(ui);
             toggle_row(
                 ui,
-                &mut self.cfg.restore_clipboard,
+                &mut self.form.cfg.restore_clipboard,
                 "Restore clipboard",
                 "Put your previous clipboard back after pasting.",
             );
             divider(ui);
             toggle_row(
                 ui,
-                &mut self.cfg.voice_commands,
+                &mut self.form.cfg.voice_commands,
                 "Voice commands",
                 "Saying \"new line\", \"new paragraph\", \"scratch that\", or \
                  \"all caps\" formats the transcript instead of appearing in it.",
@@ -1245,7 +1078,7 @@ impl SettingsApp {
         group(ui, |ui| {
             toggle_row(
                 ui,
-                &mut self.autostart_enabled,
+                &mut self.form.autostart_enabled,
                 "Start with Windows",
                 "Launches Draft automatically on sign-in (HKCU registry entry).",
             );
@@ -1256,8 +1089,8 @@ impl SettingsApp {
         // Top hairline so the footer reads as a distinct bar.
         ui.painter()
             .hline(ui.max_rect().x_range(), ui.max_rect().top(), border());
-        let dirty = self.is_dirty();
-        let can_save = self.can_save();
+        let dirty = self.form.is_dirty();
+        let can_save = self.form.can_save();
         let size = Vec2::new(ui.available_width(), ui.available_height());
         ui.allocate_ui_with_layout(
             size,
@@ -1316,7 +1149,7 @@ impl SettingsApp {
             let Some(dlg) = self.key_dialog.as_mut() else {
                 return;
             };
-            let configured = !self.keys.get(dlg.provider).trim().is_empty();
+            let configured = !self.form.keys.get(dlg.provider).trim().is_empty();
             let scrim_clicked = modal_card(ctx, KEY_DIALOG, |ui| {
                 ui.label(
                     RichText::new(format!("{} API key", dlg.provider.label()))
@@ -1375,11 +1208,11 @@ impl SettingsApp {
 
         match act {
             Act::Commit(p, buf) => {
-                self.keys.set(p, buf);
+                self.form.keys.set(p, buf);
                 self.key_dialog = None;
             }
             Act::Remove(p) => {
-                self.keys.set(p, String::new());
+                self.form.keys.set(p, String::new());
                 self.key_dialog = None;
             }
             Act::Cancel => self.key_dialog = None,
@@ -1468,7 +1301,7 @@ impl SettingsApp {
             Cancel,
         }
         let mut act = Act::None;
-        let can_save = self.can_save();
+        let can_save = self.form.can_save();
         let scrim_clicked = modal_card(ctx, UNSAVED_PROMPT, |ui| {
             ui.label(
                 RichText::new("Save changes before closing?")
@@ -1513,7 +1346,7 @@ impl SettingsApp {
                 self.save();
                 // A failed save stays open with the footer saying why, rather
                 // than closing on edits that never reached disk.
-                if !self.is_dirty() {
+                if !self.form.is_dirty() {
                     self.close_confirmed = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1559,98 +1392,9 @@ fn pane_header(ui: &mut egui::Ui, tab: Tab) {
     ui.label(RichText::new(tab.subtitle()).size(12.5).color(MUTED_FG));
 }
 
-// ---- progress formatting ----------------------------------------------
-
-fn progress_fraction(p: &DlProgress) -> f32 {
-    let per_file = 1.0 / p.file_count.max(1) as f32;
-    let within = match p.bytes_total {
-        Some(total) if total > 0 => (p.bytes_done as f32 / total as f32).clamp(0.0, 1.0),
-        _ => 0.0,
-    };
-    (p.file_index as f32 * per_file + within * per_file).clamp(0.0, 1.0)
-}
-
-fn format_progress_label(p: &DlProgress) -> String {
-    let done_mb = p.bytes_done as f64 / 1_048_576.0;
-    match p.bytes_total {
-        Some(total) if total > 0 => {
-            let total_mb = total as f64 / 1_048_576.0;
-            format!(
-                "{}/{}  {:>6.1} / {:>6.1} MB",
-                p.file_index + 1,
-                p.file_count,
-                done_mb,
-                total_mb
-            )
-        }
-        _ => format!("{}/{}  {:>6.1} MB", p.file_index + 1, p.file_count, done_mb),
-    }
-}
-
-/// Coarse "x ago" rendering of a Unix timestamp relative to `now` — enough to
-/// orient a recovery, without pulling in a date library.
-fn relative_time(now: i64, ts: i64) -> String {
-    let secs = (now - ts).max(0);
-    if secs < 60 {
-        "just now".into()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_default_hotkeys_are_clear() {
-        let cfg = Config {
-            push_to_command: true,
-            ..Config::default()
-        };
-        assert!(HotkeyErrors::of(&cfg).is_clear());
-    }
-
-    #[test]
-    fn a_bad_dictation_hotkey_is_flagged_on_its_own_field() {
-        let cfg = Config {
-            hotkey: "Ctrl+Bakslash".into(),
-            ..Config::default()
-        };
-        let errs = HotkeyErrors::of(&cfg);
-        assert!(errs.dictate.as_deref().unwrap().contains("Bakslash"));
-        assert_eq!(errs.command, None);
-        assert!(!errs.is_clear());
-    }
-
-    #[test]
-    fn a_bad_command_hotkey_is_flagged_while_push_to_command_is_on() {
-        let cfg = Config {
-            push_to_command: true,
-            command_hotkey: "Ctrl+Shift".into(),
-            ..Config::default()
-        };
-        let errs = HotkeyErrors::of(&cfg);
-        assert_eq!(errs.dictate, None);
-        assert!(errs.command.is_some());
-        assert!(!errs.is_clear());
-    }
-
-    /// The main process never parses the command chord with push-to-command
-    /// off, and the field isn't on screen — so it can't block Save either.
-    #[test]
-    fn a_bad_command_hotkey_is_ignored_while_push_to_command_is_off() {
-        let cfg = Config {
-            push_to_command: false,
-            command_hotkey: "nonsense".into(),
-            ..Config::default()
-        };
-        assert!(HotkeyErrors::of(&cfg).is_clear());
-    }
 
     #[test]
     fn esc_with_a_popup_open_closes_only_the_popup() {
@@ -1876,21 +1620,10 @@ mod tests {
     /// A window with nothing loaded from the machine: default config, no
     /// keys, no history, no devices.
     fn blank_app(tab: Tab) -> SettingsApp {
-        let cfg = Config::default();
-        let baseline = Snapshot {
-            cfg: cfg.clone(),
-            keys: ProviderKeys::default(),
-            autostart_enabled: false,
-        };
         SettingsApp {
             tab,
-            vocab_buffer: String::new(),
-            cfg,
-            keys: ProviderKeys::default(),
-            key_sources: Vec::new(),
-            autostart_enabled: false,
+            form: Form::new(Config::default(), [], false),
             key_dialog: None,
-            baseline,
             save_status: None,
             download_state: Arc::new(Mutex::new(DownloadState::new(false))),
             history: Vec::new(),
@@ -2080,7 +1813,7 @@ mod tests {
         frame(&ctx, &mut app, vec![]);
         frame(&ctx, &mut app, press(egui::Key::Space));
         assert!(
-            !app.autostart_enabled,
+            !app.form.autostart_enabled,
             "the toggle behind the dialog flipped"
         );
         assert!(app.confirm_clear_history, "the dialog is still up");

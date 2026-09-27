@@ -1,12 +1,12 @@
 // The Parakeet model download as the Transcription pane sees it: the shared
-// state the pane draws from, and the worker body that drives it. The pane
+// state the pane draws from, and the worker that drives it. The pane
 // shows its progress state (and keeps repainting) exactly while
 // `running` is set, so the one thing the worker must guarantee is that
 // `running` clears however the download ends — returned, failed, or panicked.
 
-use crate::transcribe::parakeet_download::Progress;
+use crate::transcribe::parakeet_download::{self, Progress};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(super) struct DownloadState {
     pub model_present: bool,
@@ -59,6 +59,26 @@ pub(super) fn run(
     s.running = false;
     s.model_present = model_present;
     s.finished = Some(result);
+}
+
+/// Runs the real download on a thread of its own, once `start` has entered
+/// the progress state. `repaint` wakes the window: on every progress update,
+/// and once more at the end — the pane stops repainting on its own once
+/// `running` clears, so without it the final state wouldn't show.
+pub(super) fn spawn(state: Arc<Mutex<DownloadState>>, repaint: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        run(
+            &state,
+            |report| {
+                parakeet_download::download(|p: Progress| {
+                    report(p);
+                    repaint();
+                })
+            },
+            parakeet_download::is_present,
+        );
+        repaint();
+    });
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
