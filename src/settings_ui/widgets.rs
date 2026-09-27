@@ -24,6 +24,7 @@
 //   the control's rect, within egui's clip margin, so a focused control takes
 //   exactly the room an unfocused one does and nothing beside it moves.
 
+use super::focus_trap;
 use super::theme::*;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2};
@@ -755,6 +756,27 @@ pub(super) fn divider(ui: &mut egui::Ui) {
     ui.add_space(8.0);
 }
 
+/// Lay `add` out in a child `Ui` that, while `inert`, takes no input — no
+/// focus, no clicks, no keys — yet paints exactly as it otherwise would. A
+/// widget that had focus surrenders it, so Space/Enter can't reach it either.
+///
+/// The child is disabled through `UiBuilder::disabled`, not `Ui::disable` (or
+/// `add_enabled_ui`, which calls it): in egui 0.29 only the latter fades what
+/// it paints. The child is there whether or not `inert` is set, so the ids of
+/// everything inside don't change when a dialog opens.
+pub(super) fn inert_if<R>(
+    ui: &mut egui::Ui,
+    inert: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let builder = if inert {
+        egui::UiBuilder::new().disabled()
+    } else {
+        egui::UiBuilder::new()
+    };
+    ui.scope_builder(builder, add).inner
+}
+
 /// Dimmed-scrim modal: paints a click-to-dismiss scrim above the panels and
 /// one centred 360px card above that, in the house dialog frame. Returns
 /// true when the scrim was clicked — callers treat that as cancel. Both
@@ -802,7 +824,10 @@ pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut e
                 })
                 .show(ui, |ui| {
                     ui.set_width(360.0);
+                    let [start, end] = focus_trap::ends(id);
+                    focus_trap::stop(ui, start);
                     body(ui);
+                    focus_trap::stop(ui, end);
                 });
         });
     scrim_clicked
@@ -1067,26 +1092,30 @@ mod tests {
     #[test]
     fn tab_passes_over_a_modal_scrim_to_the_dialog() {
         let ctx = font_ctx();
-        let frame = |events| {
+        let mut trap = focus_trap::FocusTrap::default();
+        // One frame as the app runs it: the trap feeds in a replayed press
+        // before, and checks where Tab left focus after.
+        let mut frame = |events| {
             let (mut dismissed, mut ok) = (false, false);
-            let _ = ctx.run(
-                egui::RawInput {
-                    events,
-                    max_texture_side: Some(2048),
-                    ..Default::default()
-                },
-                |ctx| {
-                    dismissed = modal_card(ctx, "dialog", |ui| {
-                        ok = ui.add(ghost_button("OK", 84.0, 34.0)).clicked();
-                    });
-                },
-            );
+            let mut input = egui::RawInput {
+                events,
+                max_texture_side: Some(2048),
+                ..Default::default()
+            };
+            trap.before_frame(&mut input);
+            let _ = ctx.run(input, |ctx| {
+                dismissed = modal_card(ctx, "dialog", |ui| {
+                    ok = ui.add(ghost_button("OK", 84.0, 34.0)).clicked();
+                });
+                trap.after_frame(ctx, Some("dialog"));
+            });
             (dismissed, ok)
         };
-        // Two frames to settle: a Window's first is an invisible sizing pass.
+        // Two frames to settle: an Area's first is an invisible sizing pass.
         frame(vec![]);
         frame(vec![]);
         frame(vec![key(egui::Key::Tab)]);
+        frame(vec![]);
         assert_eq!(
             frame(vec![key(egui::Key::Space)]),
             (false, true),

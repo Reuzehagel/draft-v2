@@ -13,12 +13,14 @@
 // - `theme`    — every colour, metric, and the egui style install.
 // - `widgets`  — reusable stateless widgets (rows, toggles, buttons, modal).
 // - `download` — the model download's shared state and worker body.
+// - `focus_trap` — keeps Tab inside an open dialog.
 // - here       — the app: state, tabs, dialogs, save/dirty logic.
 // Read the header comments of `theme` and `widgets` before adding UI; they
 // document the layout invariants (measure-then-allocate, bounded
 // right_to_left, shared control metrics) this window depends on.
 
 mod download;
+mod focus_trap;
 mod theme;
 mod widgets;
 
@@ -28,6 +30,7 @@ use crate::secrets;
 use crate::transcribe::parakeet_download::{self, Progress as DlProgress};
 use download::DownloadState;
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
+use focus_trap::FocusTrap;
 use std::sync::{Arc, Mutex};
 use theme::*;
 use widgets::*;
@@ -81,6 +84,7 @@ pub fn run() -> anyhow::Result<()> {
         input_devices: crate::audio::capture::input_device_names(),
         displays: pinnable_displays(),
         rule_keys: RuleKeys::default(),
+        focus_trap: FocusTrap::default(),
     };
 
     let viewport = egui::ViewportBuilder::default()
@@ -390,6 +394,7 @@ struct SettingsApp {
     /// is only ever shown.
     displays: Vec<(String, String)>,
     rule_keys: RuleKeys,
+    focus_trap: FocusTrap,
 }
 
 /// A stable key for each replacement rule's row, parallel to
@@ -500,13 +505,35 @@ impl SettingsApp {
     }
 }
 
+// Dialog ids: each `modal_card`'s, and its focus trap's.
+const KEY_DIALOG: &str = "key_dialog";
+const CONFIRM_CLEAR: &str = "confirm_clear";
+const UNSAVED_PROMPT: &str = "unsaved_prompt";
+
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.focus_trap.before_frame(raw_input);
+    }
 }
 
 impl SettingsApp {
+    /// The open dialog's id, if any — the one drawn last, should two be up.
+    fn open_dialog(&self) -> Option<&'static str> {
+        if self.unsaved_prompt {
+            Some(UNSAVED_PROMPT)
+        } else if self.confirm_clear_history {
+            Some(CONFIRM_CLEAR)
+        } else if self.key_dialog.is_some() {
+            Some(KEY_DIALOG)
+        } else {
+            None
+        }
+    }
+
     /// One frame of the whole window.
     fn ui(&mut self, ctx: &egui::Context) {
         let (save_shortcut, close_shortcut) = ctx.input(|i| {
@@ -515,12 +542,7 @@ impl SettingsApp {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        if save_shortcut
-            && self.key_dialog.is_none()
-            && !self.confirm_clear_history
-            && !self.unsaved_prompt
-            && self.can_save()
-        {
+        if save_shortcut && self.open_dialog().is_none() && self.can_save() {
             self.save();
         }
         if close_shortcut {
@@ -546,6 +568,10 @@ impl SettingsApp {
             self.unsaved_prompt = true;
         }
 
+        // Behind an open dialog the window is inert — nothing there keeps
+        // focus or hears Space/Enter — and `focus_trap` keeps Tab going round
+        // the dialog's own controls.
+        let inert = self.open_dialog().is_some();
         egui::SidePanel::left("rail")
             .resizable(false)
             .exact_width(RAIL_W)
@@ -555,7 +581,7 @@ impl SettingsApp {
                 top: 18.0,
                 bottom: 14.0,
             }))
-            .show(ctx, |ui| self.rail(ui));
+            .show(ctx, |ui| inert_if(ui, inert, |ui| self.rail(ui)));
 
         // The footer is a strip of the central panel, laid out *after* the
         // pane, rather than a bottom panel of its own. egui's Tab order is the
@@ -565,33 +591,36 @@ impl SettingsApp {
         egui::CentralPanel::default()
             .frame(Frame::default().fill(BG))
             .show(ctx, |ui| {
-                let full = ui.max_rect();
-                let (pane, footer) = full.split_top_bottom_at_y(full.bottom() - FOOTER_H);
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pane), |ui| {
-                    Frame::default()
-                        .inner_margin(Margin {
-                            left: 28.0,
-                            // Small on purpose: the scroll bar should sit near
-                            // the window edge, not float in the middle —
-                            // `bar_inner_margin` already keeps it clear of the
-                            // content.
-                            right: 10.0,
-                            top: 24.0,
-                            bottom: 8.0,
-                        })
-                        .show(ui, |ui| self.pane(ui, ctx));
-                });
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer), |ui| {
-                    Frame::default()
-                        .inner_margin(Margin::symmetric(28.0, 0.0))
-                        .show(ui, |ui| self.footer(ui, ctx));
-                });
+                inert_if(ui, inert, |ui| {
+                    let full = ui.max_rect();
+                    let (pane, footer) = full.split_top_bottom_at_y(full.bottom() - FOOTER_H);
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pane), |ui| {
+                        Frame::default()
+                            .inner_margin(Margin {
+                                left: 28.0,
+                                // Small on purpose: the scroll bar should sit
+                                // near the window edge, not float in the
+                                // middle — `bar_inner_margin` already keeps it
+                                // clear of the content.
+                                right: 10.0,
+                                top: 24.0,
+                                bottom: 8.0,
+                            })
+                            .show(ui, |ui| self.pane(ui, ctx));
+                    });
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer), |ui| {
+                        Frame::default()
+                            .inner_margin(Margin::symmetric(28.0, 0.0))
+                            .show(ui, |ui| self.footer(ui, ctx));
+                    });
+                })
             });
 
         // Modals sit above everything when open.
         self.key_dialog_view(ctx);
         self.confirm_clear_view(ctx);
         self.unsaved_prompt_view(ctx);
+        self.focus_trap.after_frame(ctx, self.open_dialog());
     }
 
     /// The selected tab's header and its scrolling rows.
@@ -1279,7 +1308,7 @@ impl SettingsApp {
                 return;
             };
             let configured = !self.keys.get(dlg.provider).trim().is_empty();
-            let scrim_clicked = modal_card(ctx, "key_dialog", |ui| {
+            let scrim_clicked = modal_card(ctx, KEY_DIALOG, |ui| {
                 ui.label(
                     RichText::new(format!("{} API key", dlg.provider.label()))
                         .size(15.0)
@@ -1361,7 +1390,7 @@ impl SettingsApp {
             Cancel,
         }
         let mut act = Act::None;
-        let scrim_clicked = modal_card(ctx, "confirm_clear", |ui| {
+        let scrim_clicked = modal_card(ctx, CONFIRM_CLEAR, |ui| {
             ui.label(
                 RichText::new("Clear history?")
                     .size(15.0)
@@ -1430,7 +1459,7 @@ impl SettingsApp {
         }
         let mut act = Act::None;
         let can_save = self.can_save();
-        let scrim_clicked = modal_card(ctx, "unsaved_prompt", |ui| {
+        let scrim_clicked = modal_card(ctx, UNSAVED_PROMPT, |ui| {
             ui.label(
                 RichText::new("Save changes before closing?")
                     .size(15.0)
@@ -1862,7 +1891,72 @@ mod tests {
             input_devices: Vec::new(),
             displays: Vec::new(),
             rule_keys: RuleKeys::default(),
+            focus_trap: FocusTrap::default(),
         }
+    }
+
+    const SCREEN: egui::Rect = egui::Rect {
+        min: egui::Pos2::ZERO,
+        max: egui::pos2(760.0, 560.0),
+    };
+
+    /// One frame of the whole window at its default size.
+    fn frame(
+        ctx: &egui::Context,
+        app: &mut SettingsApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(SCREEN),
+            max_texture_side: Some(2048),
+            events,
+            ..Default::default()
+        };
+        eframe::App::raw_input_hook(app, ctx, &mut input);
+        ctx.run(input, |ctx| app.ui(ctx))
+    }
+
+    /// Tab (Shift+Tab with `back`), then the frames the app asks for straight
+    /// after — a deferred focus move, a replayed press — as eframe would run
+    /// them.
+    fn tab(ctx: &egui::Context, app: &mut SettingsApp, back: bool) {
+        let modifiers = if back {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        let press = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        frame(ctx, app, vec![press]);
+        for _ in 0..3 {
+            frame(ctx, app, vec![]);
+        }
+    }
+
+    fn press(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    fn styled_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+        ctx
+    }
+
+    fn focused_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+        let id = ctx.memory(|m| m.focused())?;
+        Some(ctx.read_response(id).expect("focused widget").rect)
     }
 
     /// #99: Tab reads the window the way a person does — down the rail, then
@@ -1870,38 +1964,19 @@ mod tests {
     /// the panels have to be *laid out* in.
     #[test]
     fn tab_reads_the_window_rail_then_pane_then_footer() {
-        let ctx = egui::Context::default();
-        install_style(&ctx);
+        let ctx = styled_ctx();
         let mut app = blank_app(Tab::System);
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 560.0));
-        let mut frame = |events| {
-            let input = egui::RawInput {
-                screen_rect: Some(screen),
-                max_texture_side: Some(2048),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| app.ui(ctx));
-        };
-        frame(vec![]);
+        frame(&ctx, &mut app, vec![]);
 
-        let tab = egui::Event::Key {
-            key: egui::Key::Tab,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
         let mut regions = Vec::new();
         // Seven rail items, System's one toggle, then Close — Save is off,
         // with nothing to save.
         for _ in 0..9 {
-            frame(vec![tab.clone()]);
-            let id = ctx.memory(|m| m.focused()).expect("tab focuses something");
-            let r = ctx.read_response(id).expect("focused widget").rect;
+            tab(&ctx, &mut app, false);
+            let r = focused_rect(&ctx).expect("tab focuses something");
             regions.push(if r.right() <= RAIL_W {
                 "rail"
-            } else if r.top() >= screen.bottom() - FOOTER_H {
+            } else if r.top() >= SCREEN.bottom() - FOOTER_H {
                 "footer"
             } else {
                 "pane"
@@ -1910,5 +1985,115 @@ mod tests {
         let mut want = vec!["rail"; 7];
         want.extend(["pane", "footer"]);
         assert_eq!(regions, want);
+    }
+
+    /// While a dialog is up, Tab goes round its own buttons and nothing else:
+    /// the rail, pane and footer behind the scrim are out of reach, and every
+    /// press lands on a control — none is lost on the way round.
+    #[test]
+    fn tab_stays_inside_an_open_dialog() {
+        let card = SCREEN.shrink2(Vec2::new(180.0, 150.0));
+        for back in [false, true] {
+            let ctx = styled_ctx();
+            let mut app = blank_app(Tab::System);
+            app.confirm_clear_history = true;
+            frame(&ctx, &mut app, vec![]);
+            frame(&ctx, &mut app, vec![]);
+
+            let mut stops = Vec::new();
+            for press in 1..=6 {
+                tab(&ctx, &mut app, back);
+                let r = focused_rect(&ctx)
+                    .unwrap_or_else(|| panic!("press {press} (back: {back}) focused nothing"));
+                assert!(
+                    card.contains_rect(r) && r.area() > 0.0,
+                    "press {press} (back: {back}) left the dialog's controls for {r:?}"
+                );
+                stops.push(r);
+            }
+            // Clear and Cancel, turn about, whichever way round.
+            assert_ne!(stops[0], stops[1], "back: {back}");
+            for i in 2..stops.len() {
+                assert_eq!(stops[i], stops[i - 2], "back: {back}, press {}", i + 1);
+            }
+        }
+    }
+
+    /// The API-key dialog's text field is in the round too, and typing lands
+    /// in it — the brackets either side of the card never keep focus.
+    #[test]
+    fn tab_goes_round_the_key_dialog_field_included() {
+        let ctx = styled_ctx();
+        let mut app = blank_app(Tab::Transcription);
+        app.key_dialog = Some(KeyDialog {
+            provider: Provider::Groq,
+            buffer: String::new(),
+            reveal: false,
+        });
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+
+        // The field, Show, Cancel — Save is off with the field empty, and
+        // there's no Remove with no key saved.
+        let mut stops = Vec::new();
+        for _ in 0..6 {
+            tab(&ctx, &mut app, false);
+            stops.push(focused_rect(&ctx).expect("every Tab lands on something"));
+        }
+        assert!(stops[..3].iter().all(|r| r.area() > 0.0));
+        assert_ne!(stops[0], stops[1]);
+        assert_ne!(stops[1], stops[2]);
+        assert_eq!(stops[..3], stops[3..]);
+
+        // Round to the field again, and type.
+        tab(&ctx, &mut app, false);
+        frame(&ctx, &mut app, vec![egui::Event::Text("gsk_".into())]);
+        let dlg = app.key_dialog.as_ref().expect("still open");
+        assert_eq!(dlg.buffer, "gsk_");
+    }
+
+    /// A control that had focus when the dialog opened loses it: Space then
+    /// does nothing behind the scrim.
+    #[test]
+    fn space_does_nothing_behind_an_open_dialog() {
+        let ctx = styled_ctx();
+        let mut app = blank_app(Tab::System);
+        frame(&ctx, &mut app, vec![]);
+        // Seven rail items, then System's launch-at-login toggle.
+        for _ in 0..8 {
+            tab(&ctx, &mut app, false);
+        }
+        let r = focused_rect(&ctx).expect("the toggle has focus");
+        assert!(r.left() > RAIL_W && r.bottom() < SCREEN.bottom() - FOOTER_H);
+
+        app.confirm_clear_history = true;
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, press(egui::Key::Space));
+        assert!(
+            !app.autostart_enabled,
+            "the toggle behind the dialog flipped"
+        );
+        assert!(app.confirm_clear_history, "the dialog is still up");
+    }
+
+    /// Making the window inert doesn't grey it out: behind the scrim it paints
+    /// exactly what it painted before the dialog opened. (`Ui::disable` and
+    /// `add_enabled_ui` would fade it.)
+    #[test]
+    fn a_dialog_leaves_the_window_behind_it_as_it_was() {
+        let ctx = styled_ctx();
+        let mut app = blank_app(Tab::Recording);
+        frame(&ctx, &mut app, vec![]);
+        let before = frame(&ctx, &mut app, vec![]).shapes;
+
+        app.confirm_clear_history = true;
+        frame(&ctx, &mut app, vec![]);
+        let during = frame(&ctx, &mut app, vec![]).shapes;
+        // The window's own layer paints first; the scrim and card follow.
+        assert!(during.len() > before.len(), "the dialog paints something");
+        assert!(
+            during[..before.len()] == before[..],
+            "the window behind the dialog painted differently"
+        );
     }
 }
