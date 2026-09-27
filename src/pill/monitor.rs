@@ -206,6 +206,41 @@ impl From<&MonitorInfo> for HomeMonitor {
     }
 }
 
+/// What a monitor reports when its DPI can't be read. 96 is 100%, which is
+/// the right guess and the one every non-per-monitor-aware path assumes.
+const DEFAULT_DPI: u32 = 96;
+
+/// Charge each monitor the strip an auto-hiding taskbar will cover when it
+/// slides out — the one thing about a taskbar `rcWork` does not say, because an
+/// auto-hiding one is reserved no space at all (#72).
+///
+/// The *size* comes from the primary: `thickness` is its taskbar in physical
+/// pixels, and Windows 11's per-monitor taskbars share its *logical* thickness,
+/// so it is converted at the primary's DPI and rescaled to each monitor's —
+/// the same taskbar is 48 physical pixels on a 100% panel and 72 on a 150% one.
+///
+/// The *presence* is per monitor: with "Show my taskbar on all displays" off, a
+/// secondary has no taskbar to slide out at all (#97). `has_bar` answers that,
+/// and a monitor it says no to is charged nothing.
+fn charge_autohide_reserve(
+    monitors: &mut [MonitorInfo],
+    thickness: i32,
+    has_bar: impl Fn(&MonitorInfo) -> bool,
+) {
+    let primary_dpi = monitors
+        .iter()
+        .find(|m| m.primary)
+        .map_or(DEFAULT_DPI, |m| m.dpi);
+    let logical = thickness as f32 * 96.0 / primary_dpi as f32;
+    for m in monitors.iter_mut() {
+        m.autohide_reserve = if has_bar(m) {
+            (logical * m.dpi as f32 / 96.0).round() as i32
+        } else {
+            0
+        };
+    }
+}
+
 /// How the home monitor is derived. `focused` is the default because Draft
 /// pastes into the foreground window: the pill is feedback about text that is
 /// going to land *there*, so a pill on another monitor is feedback in the wrong
@@ -426,7 +461,7 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
 
 #[cfg(windows)]
 mod win {
-    use super::{Displays, MonitorId, MonitorInfo, Rect};
+    use super::{charge_autohide_reserve, Displays, MonitorId, MonitorInfo, Rect, DEFAULT_DPI};
     use std::collections::HashMap;
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
@@ -441,7 +476,8 @@ mod win {
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ABE_BOTTOM, ABM_GETSTATE, ABM_GETTASKBARPOS, ABS_AUTOHIDE, APPBARDATA,
+        SHAppBarMessage, ABE_BOTTOM, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABM_GETTASKBARPOS,
+        ABS_AUTOHIDE, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, MONITORINFOF_PRIMARY,
@@ -450,10 +486,6 @@ mod win {
     /// `ERROR_SUCCESS`. The display-config calls return a bare `WIN32_ERROR`
     /// rather than a `Result`, so this is the check.
     const OK: u32 = 0;
-
-    /// What a monitor reports when its DPI can't be read. 96 is 100%, which is
-    /// the right guess and the one every non-per-monitor-aware path assumes.
-    const DEFAULT_DPI: u32 = 96;
 
     /// Every connected monitor, joined to its EDID-derived device path.
     pub fn enumerate() -> Displays {
@@ -477,33 +509,33 @@ mod win {
                 autohide_reserve: 0,
             });
         }
-        charge_autohide_reserve(&mut monitors);
+        if let Some(thickness) = autohide_taskbar_thickness() {
+            charge_autohide_reserve(&mut monitors, thickness, |m| {
+                has_bottom_autohide_bar(m.work)
+            });
+        }
         Displays::new(monitors)
     }
 
-    /// Charge every monitor the strip an auto-hiding taskbar will cover when it
-    /// slides out — the one thing about a taskbar `rcWork` does not say, because
-    /// an auto-hiding one is reserved no space at all (#72).
+    /// Whether this monitor has an auto-hiding taskbar docked to its bottom
+    /// edge. `ABM_GETAUTOHIDEBAREX` finds the monitor from `rc` and answers with
+    /// that monitor's bar's window handle, or null when it has none — which is
+    /// the case on a secondary with "Show my taskbar on all displays" off (#97).
+    /// A handle is all it gives, so it decides *whether* to charge, never how
+    /// much; the size is the primary's, from `ABM_GETTASKBARPOS`.
     ///
-    /// One query answers for the whole desk. Windows 11 puts a taskbar on every
-    /// monitor, but they share the primary's auto-hide setting, its edge, and
-    /// its *logical* thickness; `ABM_GETAUTOHIDEBAREX` would only say whether a
-    /// given monitor has one, since it returns a window handle rather than a
-    /// size. So the primary's thickness is measured once and re-scaled per
-    /// monitor, which is what keeps the mixed-DPI desk right: the same taskbar
-    /// is 48 physical pixels on a 100% panel and 72 on a 150% one.
-    fn charge_autohide_reserve(monitors: &mut [MonitorInfo]) {
-        let Some(thickness) = autohide_taskbar_thickness() else {
-            return;
+    /// The work rect stands in for the monitor rect: it lies wholly on the
+    /// monitor, so it names the same one.
+    fn has_bottom_autohide_bar(work: Rect) -> bool {
+        let mut abd = appbar_data();
+        abd.uEdge = ABE_BOTTOM;
+        abd.rc = RECT {
+            left: work.left,
+            top: work.top,
+            right: work.right,
+            bottom: work.bottom,
         };
-        let primary_dpi = monitors
-            .iter()
-            .find(|m| m.primary)
-            .map_or(DEFAULT_DPI, |m| m.dpi);
-        let logical = thickness as f32 * 96.0 / primary_dpi as f32;
-        for m in monitors.iter_mut() {
-            m.autohide_reserve = (logical * m.dpi as f32 / 96.0).round() as i32;
-        }
+        unsafe { SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &mut abd) != 0 }
     }
 
     /// The taskbar's thickness in physical pixels, and **only** when it both
@@ -1302,6 +1334,50 @@ mod tests {
                 (gap - crate::pill::PILL_BOTTOM_MARGIN as f32).abs() <= 1.0,
                 "monitor {} gap {gap}",
                 m.id
+            );
+        }
+    }
+
+    /// With a taskbar on every display, every monitor is charged — the primary's
+    /// thickness rescaled to each one's DPI, exactly as before #97.
+    #[test]
+    fn a_taskbar_on_every_display_charges_every_monitor() {
+        let mut all = desk().all().to_vec();
+        // 48 logical px measured on the 150% primary: 72 physical there.
+        charge_autohide_reserve(&mut all, 72, |_| true);
+        assert_eq!(all[0].autohide_reserve, 72);
+        assert_eq!(all[1].autohide_reserve, 48);
+
+        // And the secondary clears its own slid-out bar, not just the primary.
+        let secondary = HomeMonitor::from(&Displays::new(all).all()[1]);
+        let margin = (crate::pill::PILL_BOTTOM_MARGIN as f32 * secondary.scale()).round() as i32;
+        assert_eq!(
+            secondary.placement().bottom,
+            secondary.work.bottom - 48 - margin
+        );
+    }
+
+    /// "Show my taskbar on all displays" off: the secondary has no taskbar to
+    /// slide out, so it is charged nothing and the pill sits the ordinary margin
+    /// above its `rcWork` — while the primary still clears its slid-out bar.
+    #[test]
+    fn a_monitor_without_an_auto_hiding_taskbar_is_charged_nothing() {
+        let mut all = desk().all().to_vec();
+        charge_autohide_reserve(&mut all, 72, |m| m.primary);
+        let desk = Displays::new(all);
+
+        let primary = HomeMonitor::from(&desk.all()[0]);
+        let secondary = HomeMonitor::from(&desk.all()[1]);
+        assert_eq!(primary.autohide_reserve, 72);
+        assert_eq!(secondary.autohide_reserve, 0);
+
+        for (home, reserve) in [(primary, 72), (secondary, 0)] {
+            let margin = (crate::pill::PILL_BOTTOM_MARGIN as f32 * home.scale()).round() as i32;
+            assert_eq!(
+                home.placement().bottom,
+                home.work.bottom - reserve - margin,
+                "monitor {}",
+                home.id
             );
         }
     }
