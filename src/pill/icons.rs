@@ -107,7 +107,7 @@ fn build(icon: Icon, box_px: f32) -> Option<Path> {
 /// horizontal and vertical line, cubic, elliptical arc and close, absolute and
 /// relative. Anything else is a data change that has to arrive with the code to
 /// draw it, so it fails loudly here rather than dropping a stroke silently.
-fn parse(d: &str) -> Option<Path> {
+pub(crate) fn parse(d: &str) -> Option<Path> {
     use svgtypes::PathSegment as Seg;
     let mut pb = PathBuilder::new();
     // The current point and the subpath's start, both in grid units — a

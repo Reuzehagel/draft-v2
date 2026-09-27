@@ -99,6 +99,7 @@ fn main() -> Result<()> {
 
     let tray = tray::build(&tray_status(&cfg, None, !history::is_empty()))?;
     let menu_rx = tray::menu_event_receiver(waker.clone());
+    let desk_rx = tray::desk_changes();
 
     let command_spec = cfg.push_to_command.then(|| cfg.command_hotkey.clone());
     let (hotkey_handle, hotkey_rx) =
@@ -128,6 +129,7 @@ fn main() -> Result<()> {
     let mut app = App {
         tray,
         menu_rx,
+        desk_rx,
         hotkey_handle: Some(hotkey_handle),
         hotkey_rx,
         session,
@@ -222,6 +224,8 @@ fn fsm_mode_from_config(cfg: &config::Config) -> activation::Mode {
 struct App {
     tray: tray::Tray,
     menu_rx: crossbeam_channel::Receiver<tray_icon::menu::MenuEvent>,
+    /// A message per theme, scale or display change. See [`tray::desk_changes`].
+    desk_rx: crossbeam_channel::Receiver<()>,
     /// `None` only transiently during re-registration (and after a failed
     /// restore, where hotkeys are dead until restart).
     hotkey_handle: Option<hotkey::HotkeyHandle>,
@@ -743,6 +747,12 @@ impl ApplicationHandler<Wake> for App {
             tracing::info!("settings subprocess exited; reloading config");
             self.settings_running = false;
             self.reload_config(el);
+        }
+
+        // The desk changed: the tray icon may want another ink or size. One
+        // re-probe however many broadcasts queued — a theme switch is several.
+        if self.desk_rx.try_iter().count() > 0 {
+            self.tray.refresh_icon();
         }
 
         while let Ok(ev) = self.menu_rx.try_recv() {
