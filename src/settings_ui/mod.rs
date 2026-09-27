@@ -502,6 +502,13 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl SettingsApp {
+    /// One frame of the whole window.
+    fn ui(&mut self, ctx: &egui::Context) {
         let (save_shortcut, close_shortcut) = ctx.input(|i| {
             (
                 i.modifiers.ctrl && i.key_pressed(egui::Key::S),
@@ -550,43 +557,35 @@ impl eframe::App for SettingsApp {
             }))
             .show(ctx, |ui| self.rail(ui));
 
-        egui::TopBottomPanel::bottom("footer")
-            .show_separator_line(false)
-            .exact_height(60.0)
-            .frame(
-                Frame::default()
-                    .fill(BG)
-                    .inner_margin(Margin::symmetric(28.0, 0.0)),
-            )
-            .show(ctx, |ui| self.footer(ui, ctx));
-
+        // The footer is a strip of the central panel, laid out *after* the
+        // pane, rather than a bottom panel of its own. egui's Tab order is the
+        // order widgets are added, and a bottom panel has to be added before
+        // the central one — which put Save and Close ahead of every control in
+        // the pane (#99).
         egui::CentralPanel::default()
-            .frame(Frame::default().fill(BG).inner_margin(Margin {
-                left: 28.0,
-                // Small on purpose: the scroll bar should sit near the window
-                // edge, not float in the middle — `bar_inner_margin` already
-                // keeps it clear of the content.
-                right: 10.0,
-                top: 24.0,
-                bottom: 8.0,
-            }))
+            .frame(Frame::default().fill(BG))
             .show(ctx, |ui| {
-                pane_header(ui, self.tab);
-                ui.add_space(20.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(
-                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
-                    )
-                    .show(ui, |ui| match self.tab {
-                        Tab::Recording => self.tab_recording(ui),
-                        Tab::Pill => self.tab_pill(ui),
-                        Tab::Transcription => self.tab_transcription(ui, ctx),
-                        Tab::Replacements => self.tab_replacements(ui),
-                        Tab::Output => self.tab_output(ui),
-                        Tab::History => self.tab_history(ui),
-                        Tab::System => self.tab_system(ui),
-                    });
+                let full = ui.max_rect();
+                let (pane, footer) = full.split_top_bottom_at_y(full.bottom() - FOOTER_H);
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pane), |ui| {
+                    Frame::default()
+                        .inner_margin(Margin {
+                            left: 28.0,
+                            // Small on purpose: the scroll bar should sit near
+                            // the window edge, not float in the middle —
+                            // `bar_inner_margin` already keeps it clear of the
+                            // content.
+                            right: 10.0,
+                            top: 24.0,
+                            bottom: 8.0,
+                        })
+                        .show(ui, |ui| self.pane(ui, ctx));
+                });
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer), |ui| {
+                    Frame::default()
+                        .inner_margin(Margin::symmetric(28.0, 0.0))
+                        .show(ui, |ui| self.footer(ui, ctx));
+                });
             });
 
         // Modals sit above everything when open.
@@ -594,9 +593,25 @@ impl eframe::App for SettingsApp {
         self.confirm_clear_view(ctx);
         self.unsaved_prompt_view(ctx);
     }
-}
 
-impl SettingsApp {
+    /// The selected tab's header and its scrolling rows.
+    fn pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        pane_header(ui, self.tab);
+        ui.add_space(20.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .show(ui, |ui| match self.tab {
+                Tab::Recording => self.tab_recording(ui),
+                Tab::Pill => self.tab_pill(ui),
+                Tab::Transcription => self.tab_transcription(ui, ctx),
+                Tab::Replacements => self.tab_replacements(ui),
+                Tab::Output => self.tab_output(ui),
+                Tab::History => self.tab_history(ui),
+                Tab::System => self.tab_system(ui),
+            });
+    }
+
     fn rail(&mut self, ui: &mut egui::Ui) {
         for &tab in Tab::ALL {
             if nav_item(ui, tab.label(), tab == self.tab) {
@@ -1817,5 +1832,83 @@ mod tests {
         rules_frame_animates(&ctx, vec![], &mut rules, &mut keys);
         rules_frame_animates(&ctx, typed("2"), &mut rules, &mut keys);
         assert_eq!(rules[0].from, "b12");
+    }
+
+    /// A window with nothing loaded from the machine: default config, no
+    /// keys, no history, no devices.
+    fn blank_app(tab: Tab) -> SettingsApp {
+        let cfg = Config::default();
+        let baseline = Snapshot {
+            cfg: cfg.clone(),
+            keys: ProviderKeys::default(),
+            autostart_enabled: false,
+        };
+        SettingsApp {
+            tab,
+            vocab_buffer: String::new(),
+            cfg,
+            keys: ProviderKeys::default(),
+            key_sources: Vec::new(),
+            autostart_enabled: false,
+            key_dialog: None,
+            baseline,
+            save_status: None,
+            download_state: Arc::new(Mutex::new(DownloadState::new(false))),
+            history: Vec::new(),
+            history_filter: String::new(),
+            confirm_clear_history: false,
+            unsaved_prompt: false,
+            close_confirmed: false,
+            input_devices: Vec::new(),
+            displays: Vec::new(),
+            rule_keys: RuleKeys::default(),
+        }
+    }
+
+    /// #99: Tab reads the window the way a person does — down the rail, then
+    /// the pane, then the footer — not rail, footer, pane, which is the order
+    /// the panels have to be *laid out* in.
+    #[test]
+    fn tab_reads_the_window_rail_then_pane_then_footer() {
+        let ctx = egui::Context::default();
+        install_style(&ctx);
+        let mut app = blank_app(Tab::System);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 560.0));
+        let mut frame = |events| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                max_texture_side: Some(2048),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.ui(ctx));
+        };
+        frame(vec![]);
+
+        let tab = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut regions = Vec::new();
+        // Seven rail items, System's one toggle, then Close — Save is off,
+        // with nothing to save.
+        for _ in 0..9 {
+            frame(vec![tab.clone()]);
+            let id = ctx.memory(|m| m.focused()).expect("tab focuses something");
+            let r = ctx.read_response(id).expect("focused widget").rect;
+            regions.push(if r.right() <= RAIL_W {
+                "rail"
+            } else if r.top() >= screen.bottom() - FOOTER_H {
+                "footer"
+            } else {
+                "pane"
+            });
+        }
+        let mut want = vec!["rail"; 7];
+        want.extend(["pane", "footer"]);
+        assert_eq!(regions, want);
     }
 }

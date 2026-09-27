@@ -20,6 +20,9 @@
 // - A field's validation message hangs beneath its row, in the control
 //   column (`field_error`), not inside the row: the row keeps its height, so
 //   the field stays level with its label whether or not there is an error.
+// - A focus ring is paint, never layout (`focus_ring`): it is drawn outside
+//   the control's rect, within egui's clip margin, so a focused control takes
+//   exactly the room an unfocused one does and nothing beside it moves.
 
 use super::theme::*;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -141,6 +144,22 @@ pub(super) fn group<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R)
     .inner
 }
 
+/// Ring `rect` when `resp` has keyboard focus. Only Tab gives these controls
+/// focus — a click doesn't — so the ring marks keyboard navigation and never
+/// lingers after a mouse click. `rounding` is the control's own corner radius;
+/// the ring's follows it out, so the two stay concentric.
+fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, rounding: f32) {
+    if !resp.has_focus() {
+        return;
+    }
+    let offset = FOCUS_RING_GAP + FOCUS_RING_W / 2.0;
+    ui.painter().rect_stroke(
+        rect.expand(offset),
+        Rounding::same(rounding + offset),
+        Stroke::new(FOCUS_RING_W, FOCUS_RING),
+    );
+}
+
 // ---- rail nav ----------------------------------------------------------
 
 /// One left-rail nav item. Selected gets a neutral filled pill; hover gets a
@@ -176,6 +195,7 @@ pub(super) fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
             .layout_no_wrap(label.to_string(), egui::FontId::proportional(13.5), color);
     let pos = egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0);
     ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+    focus_ring(ui, &resp, rect, RADIUS_SM);
 
     resp.clicked()
 }
@@ -239,6 +259,16 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
+    }
+    // The ring goes *inside* a focused row: rows sit 2px apart, so one drawn
+    // outside would run over its neighbours. Not the hover fill either — the
+    // mouse may be over a different row than the one Space would pick.
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(FOCUS_RING_W / 2.0),
+            Rounding::same(6.0),
+            Stroke::new(FOCUS_RING_W, FOCUS_RING),
+        );
     }
     let text_w = combo_item_text_w(rect.width());
     let (galley, elided) =
@@ -316,6 +346,7 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
         ga,
         Color32::PLACEHOLDER,
     );
+    focus_ring(ui, &resp, rect, RADIUS);
 
     resp.clicked()
 }
@@ -486,6 +517,7 @@ pub(super) fn mini_switch(ui: &mut egui::Ui, on: bool, id: egui::Id) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     paint_toggle(ui, rect, on, id, resp.hovered());
+    focus_ring(ui, &resp, rect, rect.height() / 2.0);
     resp.clicked()
 }
 
@@ -562,6 +594,9 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
         toggle_size,
     );
     paint_toggle(ui, toggle_rect, *value, id, resp.hovered());
+    // The whole row is the hit area, but the ring goes on the switch: that is
+    // the part that reads as the control, and the row runs edge to edge.
+    focus_ring(ui, &resp, toggle_rect, toggle_size.y / 2.0);
 }
 
 pub(super) fn paint_toggle(
@@ -643,6 +678,7 @@ pub(super) fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '
                 .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.5), ink);
         let pos = draw_rect.center() - galley.size() / 2.0;
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        focus_ring(ui, &resp, rect, RADIUS);
         if enabled {
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         } else {
@@ -679,6 +715,7 @@ pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
         );
         let pos = draw_rect.center() - galley.size() / 2.0;
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        focus_ring(ui, &resp, rect, RADIUS);
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 }
@@ -704,6 +741,7 @@ pub(super) fn ghost_button(text: &str, width: f32, height: f32) -> impl egui::Wi
                 .layout_no_wrap(text.to_string(), egui::FontId::proportional(13.0), color);
         let pos = rect.center() - galley.size() / 2.0;
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        focus_ring(ui, &resp, rect, RADIUS);
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 }
@@ -724,11 +762,18 @@ pub(super) fn divider(ui: &mut egui::Ui) {
 pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let mut scrim_clicked = false;
     let screen = ctx.screen_rect();
+    // Neither the scrim nor its Area is a Tab stop — both default to a
+    // focusable sense, and Space on a focused scrim cancels the dialog.
     egui::Area::new(egui::Id::new((id, "scrim")))
+        .sense(egui::Sense::hover())
         .order(egui::Order::Middle)
         .fixed_pos(screen.left_top())
         .show(ctx, |ui| {
-            let r = ui.allocate_rect(screen, egui::Sense::click());
+            let sense = egui::Sense {
+                focusable: false,
+                ..egui::Sense::click()
+            };
+            let r = ui.allocate_rect(screen, sense);
             ui.painter()
                 .rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(160));
             if r.clicked() {
@@ -736,14 +781,14 @@ pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut e
             }
         });
 
-    egui::Window::new(id)
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .movable(false)
+    // An Area in a Frame rather than a Window: a Window's Area senses clicks,
+    // which makes the card itself a Tab stop with no ring. A hover-only Area
+    // still keeps clicks on the card from reaching the scrim beneath.
+    egui::Area::new(egui::Id::new((id, "card")))
+        .sense(egui::Sense::hover())
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .frame(
+        .show(ctx, |ui| {
             Frame::default()
                 .fill(SIDEBAR_BG)
                 .stroke(border())
@@ -754,11 +799,11 @@ pub(super) fn modal_card(ctx: &egui::Context, id: &str, body: impl FnOnce(&mut e
                     blur: 48.0,
                     spread: 0.0,
                     color: Color32::from_black_alpha(160),
-                }),
-        )
-        .show(ctx, |ui| {
-            ui.set_width(360.0);
-            body(ui);
+                })
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    body(ui);
+                });
         });
     scrim_clicked
 }
@@ -947,6 +992,218 @@ mod tests {
             "error galley {} wider than the {CONTROL_W}px column",
             g.size().x
         );
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Every focusable custom control, top to bottom.
+    const CONTROLS: [&str; 7] = [
+        "nav",
+        "toggle row",
+        "mini switch",
+        "key opener",
+        "primary",
+        "destructive",
+        "ghost",
+    ];
+
+    /// One frame of `CONTROLS`, with a disabled Save among them. Returns
+    /// which ones were activated this frame, in order.
+    fn controls_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> [bool; CONTROLS.len()] {
+        let mut hit = [false; CONTROLS.len()];
+        let input = egui::RawInput {
+            events,
+            max_texture_side: Some(2048),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                hit[0] = nav_item(ui, "Recording", false);
+                let mut on = false;
+                toggle_row(ui, &mut on, "Launch at login", "Start Draft with Windows.");
+                hit[1] = on;
+                hit[2] = mini_switch(ui, false, egui::Id::new("mini"));
+                hit[3] = key_opener(ui, true);
+                // Disabled: nothing to do, so nothing to land on.
+                ui.add(primary_button("Save", false));
+                hit[4] = ui.add(primary_button("Apply", true)).clicked();
+                hit[5] = ui.add(destructive_button("Clear")).clicked();
+                hit[6] = ui.add(ghost_button("Close", 84.0, 34.0)).clicked();
+            });
+        });
+        hit
+    }
+
+    /// Tab walks the custom controls top to bottom — skipping a disabled
+    /// button — and Space or Enter on the focused one activates it, and only it.
+    #[test]
+    fn tab_reaches_every_custom_control_and_space_or_enter_activates_it() {
+        let ctx = font_ctx();
+        controls_frame(&ctx, vec![]);
+        for (i, name) in CONTROLS.iter().enumerate() {
+            controls_frame(&ctx, vec![key(egui::Key::Tab)]);
+            let press = if i % 2 == 0 {
+                egui::Key::Space
+            } else {
+                egui::Key::Enter
+            };
+            let hit = controls_frame(&ctx, vec![key(press)]);
+            let mut want = [false; CONTROLS.len()];
+            want[i] = true;
+            assert_eq!(hit, want, "tab #{} should land on the {name}", i + 1);
+        }
+    }
+
+    /// The scrim is a click target, not a control: Tab passes it by for the
+    /// dialog's own buttons, so Space can't land on it and cancel the dialog.
+    #[test]
+    fn tab_passes_over_a_modal_scrim_to_the_dialog() {
+        let ctx = font_ctx();
+        let frame = |events| {
+            let (mut dismissed, mut ok) = (false, false);
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    max_texture_side: Some(2048),
+                    ..Default::default()
+                },
+                |ctx| {
+                    dismissed = modal_card(ctx, "dialog", |ui| {
+                        ok = ui.add(ghost_button("OK", 84.0, 34.0)).clicked();
+                    });
+                },
+            );
+            (dismissed, ok)
+        };
+        // Two frames to settle: a Window's first is an invisible sizing pass.
+        frame(vec![]);
+        frame(vec![]);
+        frame(vec![key(egui::Key::Tab)]);
+        assert_eq!(
+            frame(vec![key(egui::Key::Space)]),
+            (false, true),
+            "the first Tab reaches OK, and Space presses it"
+        );
+    }
+
+    /// A click on the card stays with the dialog; only one on the scrim
+    /// around it dismisses.
+    #[test]
+    fn only_a_click_outside_the_card_dismisses_it() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(760.0, 560.0));
+        let click_at = |pos: egui::Pos2| {
+            let ctx = font_ctx();
+            let mut dismissed = false;
+            let clicks = [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ];
+            for events in [vec![], vec![]].into_iter().chain(clicks) {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    max_texture_side: Some(2048),
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    dismissed |= modal_card(ctx, "dialog", |ui| {
+                        ui.label("Clear history?");
+                    });
+                });
+            }
+            dismissed
+        };
+        assert!(!click_at(screen.center()), "a click on the card");
+        assert!(click_at(egui::pos2(20.0, 20.0)), "a click on the scrim");
+    }
+
+    /// Rects of every stroked rect shape painted with the focus-ring colour.
+    fn rings(out: &egui::FullOutput) -> Vec<egui::Rect> {
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.stroke.width > 0.0 && r.stroke.color == FOCUS_RING => {
+                    Some(r.rect.expand(r.stroke.width / 2.0))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A focused control draws one ring; an unfocused one draws none. The ring
+    /// is paint, not layout — the control keeps its rect — and stays within
+    /// egui's clip margin of it, so a control flush with a scroll area's edge
+    /// isn't left with half a ring.
+    #[test]
+    fn a_focused_control_is_ringed_without_moving_anything() {
+        let ctx = font_ctx();
+        // Where the layout cursor sits after each control: a ring that took
+        // room would move every one after it.
+        let run = |events| {
+            let mut after = Vec::new();
+            let out = ctx.run(
+                egui::RawInput {
+                    events,
+                    max_texture_side: Some(2048),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        nav_item(ui, "Recording", false);
+                        after.push(ui.cursor().min);
+                        toggle_row(ui, &mut false, "Launch at login", "Start with Windows.");
+                        after.push(ui.cursor().min);
+                        mini_switch(ui, false, egui::Id::new("mini"));
+                        after.push(ui.cursor().min);
+                        key_opener(ui, false);
+                        after.push(ui.cursor().min);
+                        ui.add(primary_button("Apply", true));
+                        after.push(ui.cursor().min);
+                        ui.add(destructive_button("Clear"));
+                        after.push(ui.cursor().min);
+                        ui.add(ghost_button("Close", 84.0, 34.0));
+                        after.push(ui.cursor().min);
+                    });
+                },
+            );
+            (out, after)
+        };
+        let (unfocused, layout) = run(vec![]);
+        assert!(rings(&unfocused).is_empty(), "no focus, no ring");
+        let margin = ctx.style().visuals.clip_rect_margin;
+
+        for name in CONTROLS {
+            let (out, after) = run(vec![key(egui::Key::Tab)]);
+            let id = ctx.memory(|m| m.focused()).expect("tab focuses something");
+            let rect = ctx.read_response(id).expect("focused widget").rect;
+            let rings = rings(&out);
+            assert_eq!(rings.len(), 1, "the focused {name} draws one ring");
+            assert!(
+                rect.expand(margin).contains_rect(rings[0]),
+                "the {name}'s ring {:?} reaches past {rect:?} + {margin}px",
+                rings[0]
+            );
+            assert_eq!(after, layout, "focusing the {name} moved the layout");
+        }
     }
 
     /// The head rounds up, so an odd budget favours the start.

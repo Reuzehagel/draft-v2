@@ -27,6 +27,10 @@ pub(super) const MUTED_FG: Color32 = Color32::from_rgb(161, 161, 161); // --mute
 /// Still at least 4.5:1 on the input fill (`text_meets_aa_contrast`).
 pub(super) const HINT_FG: Color32 = Color32::from_rgb(136, 136, 140);
 pub(super) const RING: Color32 = Color32::from_rgb(115, 115, 115); // --ring  0.556 (neutral focus)
+/// Keyboard focus ring around the custom controls (`widgets::focus_ring`).
+/// Opaque, like the borders, and at least 3:1 on every surface it sits on
+/// (`focus_ring_meets_non_text_contrast`).
+pub(super) const FOCUS_RING: Color32 = RING;
 pub(super) const PRIMARY: Color32 = Color32::from_rgb(132, 204, 22); // --primary (lime)
 pub(super) const PRIMARY_HOVER: Color32 = Color32::from_rgb(146, 214, 40);
 pub(super) const PRIMARY_PRESSED: Color32 = Color32::from_rgb(110, 172, 18);
@@ -63,6 +67,13 @@ pub(super) const CONTROL_W: f32 = 240.0;
 pub(super) const CONTROL_H: f32 = 32.0;
 pub(super) const RADIUS: f32 = 10.0; // shadcn --radius (0.625rem) — controls, buttons, popovers
 pub(super) const RADIUS_SM: f32 = 8.0; // nav items, row hover
+/// Gap between a control's edge and its focus ring's inner edge.
+pub(super) const FOCUS_RING_GAP: f32 = 1.25;
+/// Focus ring stroke width. Gap plus width stays inside egui's 3px clip
+/// margin, so a control flush with a scroll area's edge keeps its whole ring.
+pub(super) const FOCUS_RING_W: f32 = 1.5;
+/// Height of the Save/Close strip along the bottom of the pane.
+pub(super) const FOOTER_H: f32 = 60.0;
 
 /// Install the theme.
 ///
@@ -265,6 +276,16 @@ mod tests {
                 .map(|(name, ratio)| format!("{name}: {ratio:.2}:1"))
                 .collect();
             assert!(failing.is_empty(), "{theme:?} below 4.5:1 — {failing:#?}");
+        }
+    }
+
+    /// The focus ring is the only sign of where Tab has landed, so it clears
+    /// WCAG's 3:1 for UI components on every surface it is drawn over.
+    #[test]
+    fn focus_ring_meets_non_text_contrast() {
+        for (name, bg) in [("page", BG), ("sidebar/dialog", SIDEBAR_BG)] {
+            let ratio = contrast(FOCUS_RING, bg);
+            assert!(ratio >= 3.0, "focus ring on {name}: {ratio:.2}:1");
         }
     }
 }
