@@ -535,6 +535,8 @@ mod win {
             right: work.right,
             bottom: work.bottom,
         };
+        // SAFETY: `abd` is a live APPBARDATA with `cbSize` set; the call reads
+        // `uEdge` and `rc` from it and writes nothing past its end.
         unsafe { SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &mut abd) != 0 }
     }
 
@@ -552,6 +554,9 @@ mod win {
         }
         let mut abd = appbar_data();
         // Unlike `ABM_GETSTATE`, this one's return is a plain success flag.
+        //
+        // SAFETY: `abd` is a live APPBARDATA with `cbSize` set, which the call
+        // fills in place.
         if unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) } == 0 {
             return None;
         }
@@ -564,6 +569,8 @@ mod win {
 
     fn taskbar_autohides() -> bool {
         let mut abd = appbar_data();
+        // SAFETY: `abd` is a live APPBARDATA with `cbSize` set; this message
+        // only reads it.
         let state = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) } as u32;
         state & ABS_AUTOHIDE != 0
     }
@@ -579,16 +586,20 @@ mod win {
     /// foreground window, or it does not intersect any monitor — both of which
     /// the caller resolves through the fallback rather than guessing.
     pub fn foreground_monitor() -> Option<MonitorId> {
+        // SAFETY: no arguments.
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
             return None;
         }
+        // SAFETY: handle and flag only; a window destroyed since the line
+        // above yields no monitor rather than touching memory.
         let m = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
         (!m.is_invalid()).then_some(m.0 as MonitorId)
     }
 
     pub fn cursor_monitor() -> Option<MonitorId> {
         let pt = cursor_point()?;
+        // SAFETY: a point and a flag, by value.
         let m = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) };
         (!m.is_invalid()).then_some(m.0 as MonitorId)
     }
@@ -602,23 +613,36 @@ mod win {
 
     fn cursor_point() -> Option<POINT> {
         let mut pt = POINT::default();
+        // SAFETY: `pt` is a live local the call fills.
         unsafe { GetCursorPos(&mut pt) }.ok()?;
         Some(pt)
     }
 
     fn enum_monitors() -> Vec<HMONITOR> {
         let mut out: Vec<HMONITOR> = Vec::new();
-        unsafe {
-            let _ = EnumDisplayMonitors(
+        // SAFETY: `collect_monitor`'s contract — the LPARAM is `&mut out`,
+        // which outlives the call, and the enumeration is synchronous, so the
+        // callback never runs after it returns.
+        let ok = unsafe {
+            EnumDisplayMonitors(
                 None,
                 None,
                 Some(collect_monitor),
                 LPARAM(&mut out as *mut Vec<HMONITOR> as isize),
-            );
+            )
+        };
+        // Whatever was collected before a failure is still real, so it is
+        // returned — but a short list moves the pill, so say so.
+        if !ok.as_bool() {
+            tracing::warn!(found = out.len(), "could not enumerate every monitor");
         }
         out
     }
 
+    /// # Safety
+    ///
+    /// Called only by [`EnumDisplayMonitors`] from [`enum_monitors`], whose
+    /// LPARAM is a `*mut Vec<HMONITOR>` exclusively borrowed for the call.
     unsafe extern "system" fn collect_monitor(
         hmonitor: HMONITOR,
         _hdc: HDC,
@@ -640,6 +664,9 @@ mod win {
             },
             ..Default::default()
         };
+        // SAFETY: MONITORINFOEXW begins with a MONITORINFO, so the cast is a
+        // pointer to its first field; `cbSize` names the EX size, which is
+        // what tells the call it may also fill `szDevice`.
         let ok = unsafe {
             GetMonitorInfoW(
                 hmonitor,
@@ -664,6 +691,7 @@ mod win {
 
     fn monitor_dpi(hmonitor: HMONITOR) -> u32 {
         let (mut x, mut y) = (0u32, 0u32);
+        // SAFETY: `x` and `y` are live locals the call fills.
         match unsafe { GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) } {
             // Square pixels in every configuration Windows exposes; x is the
             // one every other DPI API reports.
@@ -701,6 +729,7 @@ mod win {
         // tell you to expect.
         for _ in 0..2 {
             let (mut n_paths, mut n_modes) = (0u32, 0u32);
+            // SAFETY: both counts are live locals the call fills.
             let sized = unsafe {
                 GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_paths, &mut n_modes)
             };
@@ -709,6 +738,9 @@ mod win {
             }
             let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); n_paths as usize];
             let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); n_modes as usize];
+            // SAFETY: each buffer holds exactly the count passed beside it, and
+            // the call writes no more than that count — it fails with
+            // ERROR_INSUFFICIENT_BUFFER instead, which is the retry above.
             let res = unsafe {
                 QueryDisplayConfig(
                     QDC_ONLY_ACTIVE_PATHS,
@@ -738,6 +770,8 @@ mod win {
             },
             ..Default::default()
         };
+        // SAFETY: `header` is the first field of `req`, and its `size` is the
+        // whole request's — the call writes only within that.
         let code = unsafe { DisplayConfigGetDeviceInfo(&mut req.header) };
         (code == 0).then(|| wide_to_string(&req.viewGdiDeviceName))
     }
@@ -752,6 +786,7 @@ mod win {
             },
             ..Default::default()
         };
+        // SAFETY: as in `source_name` — `header` leads `req` and sizes it.
         let code = unsafe { DisplayConfigGetDeviceInfo(&mut req.header) };
         if code != 0 {
             return None;

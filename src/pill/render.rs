@@ -149,13 +149,6 @@ fn clear_transparent(pm: &mut Pixmap) {
     pm.fill(Color::TRANSPARENT);
 }
 
-/// Draw one frame: the `geom`'s body centred in `pm`, with `bar_heights`
-/// (0..1 amplitudes) drawn across it at the Geom's bar opacity.
-///
-/// `scale` is the DPI/supersample factor. It governs the hairline's width and
-/// the transparent margin around the body, both of which are device-pixel
-/// quantities rather than proportional ones; every other length comes off the
-/// Geom, which is already in logical pixels and is multiplied up here.
 /// The stroke width and the body rect a `geom` draws at `scale`.
 ///
 /// The body's stroke centreline is inset by half the border width PLUS a ~1px
@@ -173,6 +166,14 @@ fn body_of(geom: &Geom, scale: f32) -> (f32, f32, f32) {
     )
 }
 
+/// Draw one frame: the `geom`'s body centred in `pm`, with `bar_heights`
+/// (0..1 amplitudes) drawn across it at the Geom's bar opacity.
+///
+/// `scale` is the DPI/supersample factor. It governs the hairline's width and
+/// the transparent margin around the body, both of which are device-pixel
+/// quantities rather than proportional ones; every other length comes off the
+/// Geom, which is already in logical pixels and is multiplied up here.
+///
 /// `style` is the third thing the Geom does not carry, and the only one the
 /// user chooses. It cannot be a Geom field — a body style is not interpolable,
 /// and a frame mid-morph belongs to no mode to read it off — so it arrives here

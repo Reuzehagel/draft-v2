@@ -280,7 +280,7 @@ mod win {
     pub fn probe() -> Probe {
         Probe {
             session_blocked: session_blocks_ui(),
-            foreground: unsafe { foreground() },
+            foreground: foreground(),
         }
     }
 
@@ -288,6 +288,7 @@ mod win {
     /// hide — losing the pill because shell32 was busy would be unrecoverable
     /// without a dictation.
     fn session_blocks_ui() -> bool {
+        // SAFETY: no arguments; the state comes back by value.
         match unsafe { SHQueryUserNotificationState() } {
             Ok(state) => blocks_ui(state),
             Err(e) => {
@@ -322,36 +323,45 @@ mod win {
     /// The foreground window as the guards need it, or `None` for the states
     /// the docs call unknown: no foreground window ("when a window is losing
     /// activation"), a window on no monitor, a rect that could not be read.
-    unsafe fn foreground() -> Option<Foreground> {
-        let hwnd = GetForegroundWindow();
+    fn foreground() -> Option<Foreground> {
+        // SAFETY: no arguments. The window it names can be destroyed at any
+        // moment after; every call below takes that handle by value and fails
+        // on a stale one rather than touching memory.
+        let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
             return None;
         }
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        // SAFETY: handle and flag only.
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
         if monitor.is_invalid() {
             return None;
         }
         let monitor_rect = monitor_rect(monitor)?;
         let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect).ok()?;
+        // SAFETY: `rect` is a live local the call fills.
+        unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
         Some(Foreground {
             monitor: monitor.0 as MonitorId,
             rect: from_win(rect),
             monitor_rect,
-            zoomed: IsZoomed(hwnd).as_bool(),
-            visible: IsWindowVisible(hwnd).as_bool(),
+            // SAFETY: handle only, answered by value.
+            zoomed: unsafe { IsZoomed(hwnd) }.as_bool(),
+            // SAFETY: as above.
+            visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
             shell: is_shell(hwnd),
         })
     }
 
     /// `rcMonitor` — the full monitor rect. Deliberately not `rcWork`: against
     /// the work area every maximized window covers its monitor.
-    unsafe fn monitor_rect(monitor: HMONITOR) -> Option<Rect> {
+    fn monitor_rect(monitor: HMONITOR) -> Option<Rect> {
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        GetMonitorInfoW(monitor, &mut info)
+        // SAFETY: `info` is a live MONITORINFO whose `cbSize` tells the call
+        // how much of it to fill.
+        unsafe { GetMonitorInfoW(monitor, &mut info) }
             .as_bool()
             .then(|| from_win(info.rcMonitor))
     }
@@ -364,17 +374,22 @@ mod win {
     /// `WS_EX_NOACTIVATE` and should never be foreground, but the settings
     /// subprocess genuinely takes focus — and it is a *different* PID, so it is
     /// caught by geometry and `IsZoomed` rather than here.
-    unsafe fn is_shell(hwnd: HWND) -> bool {
-        if hwnd == GetShellWindow() || hwnd == GetDesktopWindow() {
+    fn is_shell(hwnd: HWND) -> bool {
+        // SAFETY: no arguments; the handles are compared by value.
+        if hwnd == unsafe { GetShellWindow() } || hwnd == unsafe { GetDesktopWindow() } {
             return true;
         }
         let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == GetCurrentProcessId() {
+        // SAFETY: `pid` is a live local the call fills. A stale `hwnd` leaves
+        // it 0, which is nobody's process.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        // SAFETY: no arguments.
+        if pid == unsafe { GetCurrentProcessId() } {
             return true;
         }
         let mut buf = [0u16; 64];
-        let n = GetClassNameW(hwnd, &mut buf);
+        // SAFETY: the slice carries its own length, which bounds the write.
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) };
         if n <= 0 {
             return false;
         }
@@ -404,6 +419,10 @@ mod win {
         /// `None` on failure, which costs only reaction speed — the 1 s poll
         /// still sees every transition.
         pub fn install() -> Option<Self> {
+            // SAFETY: no module handle, so the callback must live in this
+            // process — `on_foreground` does, with WINEVENTPROC's signature,
+            // and touches only a static atomic, so it is sound whenever the
+            // system calls it. Unhooked in `Drop`.
             let hook = unsafe {
                 SetWinEventHook(
                     EVENT_SYSTEM_FOREGROUND,
@@ -432,13 +451,20 @@ mod win {
 
     impl Drop for ForegroundHook {
         fn drop(&mut self) {
-            let _ = unsafe { UnhookWinEvent(self.0) };
+            // SAFETY: the handle `install` got back, unhooked exactly once.
+            if !unsafe { UnhookWinEvent(self.0) }.as_bool() {
+                tracing::debug!("could not remove the foreground hook");
+            }
         }
     }
 
     /// Runs re-entrantly inside winit's message pump, so it does exactly one
     /// thing: raise the flag. Every Win32 query happens later, on the app
     /// loop's own terms.
+    ///
+    /// # Safety
+    ///
+    /// None beyond being called as a WINEVENTPROC: it reads no argument.
     unsafe extern "system" fn on_foreground(
         _hook: HWINEVENTHOOK,
         _event: u32,

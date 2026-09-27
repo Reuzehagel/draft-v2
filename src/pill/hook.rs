@@ -64,8 +64,8 @@ pub enum HookEvent {
     SessionReconnected,
 }
 
-/// The hook itself is Win32 all the way down — off Windows the pill window
-/// simply doesn't carry one, and no event is ever surfaced.
+/// The hook itself is Win32 all the way down, as is the pill window that
+/// carries it (`pill::window`).
 #[cfg(windows)]
 pub use win::PillHook;
 
@@ -179,6 +179,14 @@ mod win {
     /// The subclass procedure. Runs on the winit event-loop thread, inside
     /// `DispatchMessage`, so the sender it posts to is drained by the very loop
     /// that is calling it.
+    ///
+    /// # Safety
+    ///
+    /// Called only by the system, as `hwnd`'s wndproc, with the arguments of a
+    /// real message — so `lparam` is whatever that message documents it to be.
+    /// `hwnd`'s [`HOOK_PROP`], if present, is a live `HookState` put there by
+    /// [`PillHook::install`] and freed only by [`uninstall`], on this same
+    /// thread.
     unsafe extern "system" fn pill_wndproc(
         hwnd: HWND,
         msg: u32,
@@ -239,12 +247,23 @@ mod win {
 
     /// The hook's state for this window, or null if it is not installed —
     /// including when the HWND is already dead.
-    unsafe fn hook_state(hwnd: HWND) -> *const HookState {
-        GetPropW(hwnd, HOOK_PROP).0 as *const HookState
+    ///
+    /// Safe to *call*: GetPropW reads a handle-sized value off any HWND, stale
+    /// or not. Dereferencing the result is what needs the [`pill_wndproc`]
+    /// contract — only [`PillHook::install`] ever sets this property.
+    fn hook_state(hwnd: HWND) -> *const HookState {
+        // SAFETY: HOOK_PROP is a static wide string; GetPropW only reads it.
+        unsafe { GetPropW(hwnd, HOOK_PROP).0 as *const HookState }
     }
 
     /// Hand the message on to whoever owned the window before us. A window
     /// always has a wndproc, so `None` means the swap never happened.
+    ///
+    /// # Safety
+    ///
+    /// `prev` is the wndproc this window had before ours, and the rest is a
+    /// message as the system delivered it: whatever `lparam` points at is
+    /// only valid for as long as the message is being handled.
     unsafe fn call_prev(
         prev: WNDPROC,
         hwnd: HWND,
@@ -260,6 +279,12 @@ mod win {
 
     /// Read WM_POWERBROADCAST's `POWERBROADCAST_SETTING` payload. Every setting
     /// we register for carries a DWORD, so a shorter payload is not ours.
+    ///
+    /// # Safety
+    ///
+    /// `lparam` is the LPARAM of a WM_POWERBROADCAST/PBT_POWERSETTINGCHANGE
+    /// being handled right now: null, or a `POWERBROADCAST_SETTING` followed by
+    /// `DataLength` bytes of payload.
     unsafe fn read_power_setting(lparam: LPARAM) -> Option<(GUID, u32)> {
         let ptr = lparam.0 as *const POWERBROADCAST_SETTING;
         if ptr.is_null() {
@@ -279,6 +304,11 @@ mod win {
     /// of `PillHook::drop` and the WM_NCDESTROY safety net runs first takes the
     /// property with it, and the other finds nothing to do. Both run on the UI
     /// thread, so that check cannot race.
+    ///
+    /// # Safety
+    ///
+    /// On the thread that owns `hwnd`, and not from inside a [`pill_wndproc`]
+    /// that will read its state after this returns — the state is freed here.
     unsafe fn uninstall(hwnd: HWND) {
         let ptr = hook_state(hwnd) as *mut HookState;
         if ptr.is_null() {
@@ -293,7 +323,18 @@ mod win {
             return;
         }
         let prev = (*ptr).prev.map(|p| p as usize as isize).unwrap_or(0);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev);
+        // The previous value is our own wndproc, never 0 — so 0 is failure.
+        // Then the window is still ours, and still needs the state to forward
+        // with: freeing it would leave winit's wndproc unreachable. Leak it.
+        if SetWindowLongPtrW(hwnd, GWLP_WNDPROC, prev) == 0 {
+            tracing::error!(
+                error = %windows::core::Error::from_win32(),
+                "could not restore the pill's wndproc; leaving the hook installed"
+            );
+            return;
+        }
+        // A failure leaves a dangling property on a window about to die. The
+        // wndproc it served is already gone, so nothing will read it.
         let _ = RemovePropW(hwnd, HOOK_PROP);
         drop(Box::from_raw(ptr));
     }
@@ -326,11 +367,21 @@ mod win {
             // one sender, freed by whoever takes the hook off. Set before the
             // swap, so the first message already finds it.
             let state = Box::into_raw(Box::new(HookState { prev: None, tx }));
+            // SAFETY: stores the pointer as an opaque handle; nothing reads it
+            // until our wndproc is installed below.
             if let Err(e) = unsafe { SetPropW(hwnd, HOOK_PROP, HANDLE(state as *mut _)) } {
                 tracing::error!(error = %e, "could not attach the pill's hook state");
+                // SAFETY: `state` came from Box::into_raw above, and with the
+                // property unset nothing else holds it.
                 drop(unsafe { Box::from_raw(state) });
                 return hookless();
             }
+            // SAFETY: `pill_wndproc` has the WNDPROC signature and upholds its
+            // own contract for as long as it is installed: its state is on the
+            // window, and `Drop` (or WM_NCDESTROY) takes both off together. The
+            // transmute is isize → Option<fn>, same size, 0 ↔ None. `state` is
+            // ours alone until the first message, which cannot arrive before
+            // this block ends — there is no message pump in it.
             unsafe {
                 let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pill_wndproc_addr());
                 // `prev` is recorded after the swap, so in between it reads as
@@ -351,6 +402,8 @@ mod win {
 
             // GUID_SESSION_DISPLAY_STATUS, not GUID_MONITOR_POWER_ON (deprecated)
             // and not GUID_CONSOLE_DISPLAY_STATE (the session-0 choice).
+            // SAFETY: the GUID is a static the call only reads; the handle is
+            // unregistered in `Drop`, before the window it names is destroyed.
             let power = unsafe {
                 RegisterPowerSettingNotification(
                     HANDLE(hwnd.0),
@@ -366,6 +419,7 @@ mod win {
                 }
             };
 
+            // SAFETY: handle and flag only; unregistered in `Drop`.
             let session_notifications =
                 unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
             let session_notifications = match session_notifications {
@@ -391,15 +445,26 @@ mod win {
 
     impl Drop for PillHook {
         fn drop(&mut self) {
-            unsafe {
-                if let Some(power) = self.power.take() {
-                    let _ = UnregisterPowerSettingNotification(power);
+            // Failures to unregister are logged and nothing more: the window
+            // they name is about to go, and the registrations go with it.
+            if let Some(power) = self.power.take() {
+                // SAFETY: `power` is the handle `install` registered, taken so
+                // it is unregistered once.
+                if let Err(e) = unsafe { UnregisterPowerSettingNotification(power) } {
+                    tracing::debug!(error = %e, "could not unregister display-status notifications");
                 }
-                if self.session_notifications {
-                    let _ = WTSUnRegisterSessionNotification(self.hwnd);
-                }
-                uninstall(self.hwnd);
             }
+            if self.session_notifications {
+                // SAFETY: handle only, registered by `install` for this window.
+                if let Err(e) = unsafe { WTSUnRegisterSessionNotification(self.hwnd) } {
+                    tracing::debug!(error = %e, "could not unregister session notifications");
+                }
+            }
+            // SAFETY: the pill window owns this hook and drops it first, on the
+            // event-loop thread that owns the HWND. If that drop happens inside
+            // a message our wndproc forwarded, it is still safe: `pill_wndproc`
+            // copies `prev` out and is done with the state before forwarding.
+            unsafe { uninstall(self.hwnd) };
         }
     }
 
@@ -564,6 +629,8 @@ mod win {
         /// directly. "STATIC" is a predefined class with a wndproc of its own —
         /// which is the point: it is what the pass-through has to reach.
         fn message_window() -> HWND {
+            // SAFETY: static class and title strings; no parent but the
+            // message-only root, so nothing else holds the window.
             unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -584,6 +651,7 @@ mod win {
         }
 
         fn hook_installed(hwnd: HWND) -> bool {
+            // SAFETY: an integer read off a window this test owns.
             unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == pill_wndproc_addr() }
         }
 
@@ -595,21 +663,25 @@ mod win {
             assert!(hook_installed(hwnd), "subclass not installed");
 
             // Answered by the hook, never forwarded: MA_ACTIVATE is the hole.
+            // SAFETY: none of these messages carries a pointer.
             let answer = unsafe { SendMessageW(hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)) };
             assert_eq!(answer.0, MA_NOACTIVATE as isize);
             assert!(rx.try_recv().is_err(), "a click is not an app-loop event");
 
             // Surfaced to the app loop.
+            // SAFETY: as above.
             unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0)) };
             assert_eq!(rx.try_recv(), Ok(HookEvent::DisplayChanged));
 
             // Everything else still reaches STATIC's own wndproc — which is the
             // only thing that knows this window's text is 5 characters long.
+            // SAFETY: as above.
             let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)) };
             assert_eq!(len.0, "draft".len() as isize);
 
             drop(hook);
             assert!(!hook_installed(hwnd), "subclass outlived the hook");
+            // SAFETY: the window this test created, destroyed once.
             unsafe { DestroyWindow(hwnd).expect("destroy test window") };
         }
 
@@ -622,6 +694,7 @@ mod win {
             let hwnd = message_window();
             let hook = PillHook::install(hwnd, tx);
             assert!(hook_installed(hwnd), "hook not installed");
+            // SAFETY: the window this test created, destroyed once.
             unsafe { DestroyWindow(hwnd).expect("destroy test window") };
             drop(hook);
         }

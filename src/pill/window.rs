@@ -65,7 +65,6 @@ pub struct PillWindow {
     /// Held only for its `Drop` — and declared first so it runs first: the
     /// subclass has to come off while the HWND is still alive, and dropping
     /// `window` is what destroys it.
-    #[cfg(windows)]
     #[allow(dead_code)]
     hook: crate::pill::hook::PillHook,
     window: Window,
@@ -85,7 +84,6 @@ pub struct PillWindow {
     /// The last frame drawn, so it can be pushed again when the system drops
     /// the layered surface. `None` before the first frame.
     last: Option<Frame>,
-    #[cfg(windows)]
     layered: LayeredSurface,
 }
 
@@ -129,11 +127,7 @@ impl PillWindow {
         // the window somewhere close, but the exact client size it lands on is
         // negotiated with the DPI Windows thinks the window is on — which is
         // not necessarily the home monitor's until the window is actually there.
-        #[cfg(windows)]
-        {
-            let hwnd = hwnd_from_window(&window)?;
-            unsafe { place(hwnd, &home) };
-        }
+        place(hwnd_from_window(&window)?, &home);
 
         // Off the home monitor's placement, not `window.inner_size()`: the
         // buffers and the scale `render` draws at have to come from the same
@@ -144,15 +138,10 @@ impl PillWindow {
             Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE).ok_or_else(|| anyhow!("hires pixmap"))?;
         let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
 
-        #[cfg(windows)]
         let layered = LayeredSurface::new(&window, w, h)?;
-        #[cfg(windows)]
         let hook = crate::pill::hook::PillHook::install(layered.hwnd, hook_tx);
-        #[cfg(not(windows))]
-        let _ = hook_tx;
 
         Ok(Self {
-            #[cfg(windows)]
             hook,
             window,
             home,
@@ -160,7 +149,6 @@ impl PillWindow {
             hires,
             mid,
             last: None,
-            #[cfg(windows)]
             layered,
         })
     }
@@ -191,34 +179,32 @@ impl PillWindow {
             self.home = prev;
             return Err(e);
         }
-        #[cfg(windows)]
-        unsafe {
-            place(self.layered.hwnd, &home)
-        };
+        place(self.layered.hwnd, &home);
         // The surface is at the wrong resolution for the new rect; re-rendering
         // the frame already on screen fixes that.
         self.repush()
     }
 
+    /// Show the pill without letting it take focus, and without going through
+    /// winit — `Window::set_visible` funnels into `WindowFlags::apply_diff`, which
+    /// rewrites GWL_EXSTYLE absolutely and would drop every bit
+    /// [`apply_pill_ex_styles`] set.
+    ///
+    /// The cost is that winit's cached flags still say "hidden": it was created
+    /// `with_visible(false)` and nothing told winit otherwise. That is only safe
+    /// because nothing calls a winit mutator on the pill — `apply_diff` runs off
+    /// winit's own flag changes, so with no such calls there is no diff to apply.
+    /// Adding one would both clobber the ex-styles and hide the window.
     pub fn show(&self) {
-        #[cfg(windows)]
-        unsafe {
-            show_no_activate(self.layered.hwnd)
-        };
-        #[cfg(not(windows))]
-        self.window.set_visible(true);
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+        show_window(self.layered.hwnd, SW_SHOWNOACTIVATE);
     }
 
     /// Take the pill off screen without destroying it — the window survives so
     /// a later reveal doesn't have to rebuild a layered window.
     pub fn hide(&self) {
-        #[cfg(windows)]
-        unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-            let _ = ShowWindow(self.layered.hwnd, SW_HIDE);
-        };
-        #[cfg(not(windows))]
-        self.window.set_visible(false);
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+        show_window(self.layered.hwnd, SW_HIDE);
     }
 
     /// Draw one frame: whatever geometry the adapter's motion says the pill is
@@ -271,10 +257,7 @@ impl PillWindow {
     /// ex-styles after a failed present restores it rather than forcing
     /// click-through back on under buttons the pill is showing (#89).
     pub fn set_click_through(&mut self, on: bool) {
-        #[cfg(windows)]
         self.layered.set_click_through(on);
-        #[cfg(not(windows))]
-        let _ = on;
     }
 
     /// The winit id of the pill's window, so the app loop can tell its mouse
@@ -364,15 +347,11 @@ impl PillWindow {
             let hires = Pixmap::new(w * SUPERSAMPLE, h * SUPERSAMPLE)
                 .ok_or_else(|| anyhow!("hires pixmap"))?;
             let mid = Pixmap::new(w * 2, h * 2).ok_or_else(|| anyhow!("mid pixmap"))?;
-            #[cfg(windows)]
             self.layered.dib.resize(w, h)?;
             self.pixmap = pixmap;
             self.hires = hires;
             self.mid = mid;
-            #[cfg(windows)]
-            unsafe {
-                place(self.layered.hwnd, &self.home)
-            };
+            place(self.layered.hwnd, &self.home);
         }
         Ok(())
     }
@@ -398,15 +377,10 @@ impl PillWindow {
         self.pixmap
             .draw_pixmap(0, 0, self.mid.as_ref(), &paint, half, None);
 
-        #[cfg(windows)]
-        {
-            self.layered.present(&self.pixmap)?;
-        }
-        Ok(())
+        self.layered.present(&self.pixmap)
     }
 }
 
-#[cfg(windows)]
 struct LayeredSurface {
     hwnd: windows::Win32::Foundation::HWND,
     dib: Dib,
@@ -417,13 +391,14 @@ struct LayeredSurface {
     click_through: bool,
 }
 
-#[cfg(windows)]
 impl LayeredSurface {
     fn new(window: &Window, w: u32, h: u32) -> Result<Self> {
         let hwnd = hwnd_from_window(window)?;
         // Born click-through: a new pill shows no buttons.
         let click_through = true;
-        unsafe { apply_pill_ex_styles(hwnd, click_through) };
+        if let Err(e) = apply_pill_ex_styles(hwnd, click_through) {
+            tracing::error!(error = %e, "could not set the pill's ex-styles");
+        }
         Ok(Self {
             hwnd,
             dib: Dib::new(w, h)?,
@@ -434,16 +409,17 @@ impl LayeredSurface {
     /// Record and write WS_EX_TRANSPARENT — see [`PillWindow::set_click_through`].
     /// The one place `click_through` changes, so the record and the bit move
     /// together.
+    ///
+    /// A failed write is logged, not returned: the record is already right, so
+    /// the next re-arm puts the bit where it belongs — and a pill stuck
+    /// click-through, or stuck catching clicks, is worth a line in the log.
     fn set_click_through(&mut self, on: bool) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-        };
         self.click_through = on;
-        unsafe {
-            let cur = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32;
-            let next = with_click_through(cur, on);
-            if next != cur {
-                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next as isize);
+        let cur = read_ex_style(self.hwnd);
+        let next = with_click_through(cur, on);
+        if next != cur {
+            if let Err(e) = write_ex_style(self.hwnd, next) {
+                tracing::error!(error = %e, on, "could not flip the pill's click-through");
             }
         }
     }
@@ -463,28 +439,29 @@ impl LayeredSurface {
         // re-arm ONLY on failure — and re-assert the whole pill set, since the
         // same write also took NOACTIVATE, TOOLWINDOW and TRANSPARENT with it.
         // TRANSPARENT goes back as the mode wants it, not as the pill started.
-        unsafe {
-            if self.update_layered().is_err() {
-                use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
-                tracing::debug!(
-                    ex_style = format_args!("{:#x}", GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)),
-                    "layered present failed; re-arming pill ex-styles"
-                );
-                rearm_ex_styles(self.hwnd, self.click_through);
-                self.update_layered()?;
+        if self.update_layered().is_err() {
+            tracing::debug!(
+                ex_style = format_args!("{:#x}", read_ex_style(self.hwnd)),
+                "layered present failed; re-arming pill ex-styles"
+            );
+            if let Err(e) = rearm_ex_styles(self.hwnd, self.click_through) {
+                tracing::error!(error = %e, "could not re-arm the pill's ex-styles");
             }
+            self.update_layered()?;
         }
         Ok(())
     }
 
-    unsafe fn update_layered(&self) -> Result<()> {
+    fn update_layered(&self) -> Result<()> {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::Graphics::Gdi::{
             GetDC, ReleaseDC, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
         };
         use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
-        let screen_dc = GetDC(None);
+        // SAFETY: GetDC(None) takes no pointers; the screen DC it returns is
+        // released below on every path, since nothing between can return.
+        let screen_dc = unsafe { GetDC(None) };
         let size = windows::Win32::Foundation::SIZE {
             cx: self.dib.w as i32,
             cy: self.dib.h as i32,
@@ -496,23 +473,32 @@ impl LayeredSurface {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let res = UpdateLayeredWindow(
-            self.hwnd,
-            screen_dc,
-            None,
-            Some(&size),
-            self.dib.dc.0,
-            Some(&src_pt),
-            windows::Win32::Foundation::COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-        ReleaseDC(None, screen_dc);
+        // SAFETY: the pointers are to locals that outlive the call. The source
+        // DC is the DIB's own, alive as long as `self`, with its bitmap
+        // selected and exactly `size` pixels large. A stale `hwnd` fails the
+        // call rather than touching memory; a null `screen_dc` only means the
+        // default palette, which a 32bpp alpha push never consults.
+        let res = unsafe {
+            UpdateLayeredWindow(
+                self.hwnd,
+                screen_dc,
+                None,
+                Some(&size),
+                self.dib.dc.0,
+                Some(&src_pt),
+                windows::Win32::Foundation::COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            )
+        };
+        // SAFETY: `screen_dc` came from GetDC(None) above and is released once.
+        // The count it returns says nothing actionable: a DC that would not
+        // release has nothing left to retry with.
+        unsafe { ReleaseDC(None, screen_dc) };
         res.map_err(|e| anyhow!("UpdateLayeredWindow: {e}"))
     }
 }
 
-#[cfg(windows)]
 fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window
@@ -535,7 +521,6 @@ fn hwnd_from_window(window: &Window) -> Result<windows::Win32::Foundation::HWND>
 /// setting the bit through SetWindowLongPtrW does not restack the window. The
 /// actual z-order comes from `WindowLevel::AlwaysOnTop` at creation and would
 /// need a SetWindowPos(HWND_TOPMOST) to restore if it were ever lost.
-#[cfg(windows)]
 const PILL_EX_STYLE: u32 = {
     use windows::Win32::UI::WindowsAndMessaging::{
         WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
@@ -554,13 +539,11 @@ const PILL_EX_STYLE: u32 = {
 /// mode: it lands where `click_through` says. A re-arm while the pill is
 /// showing buttons — the bar, or a click-started session's check — would
 /// otherwise switch their clicks off until the next mode change (#89).
-#[cfg(windows)]
 fn with_pill_ex_style(cur: u32, click_through: bool) -> u32 {
     with_click_through(cur | PILL_EX_STYLE, click_through)
 }
 
 /// `cur` with WS_EX_TRANSPARENT set or cleared, and nothing else touched.
-#[cfg(windows)]
 fn with_click_through(cur: u32, on: bool) -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::WS_EX_TRANSPARENT;
     if on {
@@ -572,7 +555,6 @@ fn with_click_through(cur: u32, on: bool) -> u32 {
 
 /// The same value with WS_EX_LAYERED knocked out, for the first half of the
 /// re-arm (see [`rearm_ex_styles`]).
-#[cfg(windows)]
 fn without_layered(cur: u32) -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
     cur & !WS_EX_LAYERED.0
@@ -580,32 +562,56 @@ fn without_layered(cur: u32) -> u32 {
 
 /// Re-assert every pill ex-style bit, dropping WS_EX_LAYERED first so the
 /// window genuinely re-enters layered mode rather than seeing a no-op write.
-#[cfg(windows)]
-unsafe fn rearm_ex_styles(hwnd: windows::Win32::Foundation::HWND, click_through: bool) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-    };
-    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, without_layered(cur) as isize);
-    // Re-read rather than reusing `cur`: the write above is itself a window
-    // state change, and reusing the stale value would make the second write
-    // absolute again — the very hazard this is here to close.
-    apply_pill_ex_styles(hwnd, click_through);
+fn rearm_ex_styles(
+    hwnd: windows::Win32::Foundation::HWND,
+    click_through: bool,
+) -> windows::core::Result<()> {
+    write_ex_style(hwnd, without_layered(read_ex_style(hwnd)))?;
+    // Re-read rather than reusing the first read: the write above is itself a
+    // window state change, and reusing the stale value would make the second
+    // write absolute again — the very hazard this is here to close.
+    apply_pill_ex_styles(hwnd, click_through)
 }
 
 /// OR the pill's ex-style bits onto whatever GWL_EXSTYLE holds right now, with
 /// WS_EX_TRANSPARENT as `click_through` says.
-#[cfg(windows)]
-unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND, click_through: bool) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE,
-    };
-    let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    SetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE,
-        with_pill_ex_style(cur, click_through) as isize,
-    );
+fn apply_pill_ex_styles(
+    hwnd: windows::Win32::Foundation::HWND,
+    click_through: bool,
+) -> windows::core::Result<()> {
+    write_ex_style(hwnd, with_pill_ex_style(read_ex_style(hwnd), click_through))
+}
+
+/// GWL_EXSTYLE as it stands, or 0 on a dead window. Not an error of its own:
+/// every read here is followed by a write that reports one — except a
+/// click-through clear that finds nothing to clear, and a dead window has no
+/// clicks to route anyway.
+fn read_ex_style(hwnd: windows::Win32::Foundation::HWND) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_EXSTYLE};
+    // SAFETY: GWL_EXSTYLE is a plain integer read; any HWND is sound to pass,
+    // and a stale one returns 0 rather than touching memory.
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
+}
+
+/// Write GWL_EXSTYLE, and say whether it took.
+///
+/// SetWindowLongPtrW returns the *previous* value, so 0 is an error only if
+/// the last-error code says so — a window whose ex-style really was 0 returns
+/// it too. Hence clearing the code first, as the docs prescribe.
+fn write_ex_style(hwnd: windows::Win32::Foundation::HWND, value: u32) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWL_EXSTYLE};
+    // SAFETY: GWL_EXSTYLE is a plain integer, not a pointer the system will
+    // later call or dereference — unlike GWLP_WNDPROC, which only `pill::hook`
+    // writes. A stale HWND fails the call. The last-error calls touch only
+    // this thread's error slot.
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        if SetWindowLongPtrW(hwnd, GWL_EXSTYLE, value as isize) == 0 {
+            return GetLastError().ok();
+        }
+    }
+    Ok(())
 }
 
 /// Put the window at its home monitor's placement, size and all, in one call.
@@ -618,65 +624,71 @@ unsafe fn apply_pill_ex_styles(hwnd: windows::Win32::Foundation::HWND, click_thr
 /// Size travels with the position because a move between monitors is usually
 /// also a scale change, and the two arriving as one call means the window is
 /// never briefly the old size in the new place.
-#[cfg(windows)]
-unsafe fn place(hwnd: windows::Win32::Foundation::HWND, home: &HomeMonitor) {
+fn place(hwnd: windows::Win32::Foundation::HWND, home: &HomeMonitor) {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
     };
     let rect = home.placement();
     // HWND_TOPMOST rather than SWP_NOZORDER: the pill is always-on-top, and
     // this is the one call in its life that could quietly restack it.
-    if let Err(e) = SetWindowPos(
-        hwnd,
-        HWND_TOPMOST,
-        rect.left,
-        rect.top,
-        rect.width().max(1),
-        rect.height().max(1),
-        SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-    ) {
+    //
+    // SAFETY: plain integers and handles, no pointers; a stale HWND fails the
+    // call, which is logged.
+    let placed = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            rect.width().max(1),
+            rect.height().max(1),
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        )
+    };
+    if let Err(e) = placed {
         tracing::error!(error = %e, "could not place the pill on its home monitor");
     }
 }
 
-/// Show the pill without letting it take focus, and without going through
-/// winit — `Window::set_visible` funnels into `WindowFlags::apply_diff`, which
-/// rewrites GWL_EXSTYLE absolutely and would drop every bit
-/// [`apply_pill_ex_styles`] just set.
-///
-/// The cost is that winit's cached flags still say "hidden": it was created
-/// `with_visible(false)` and nothing told winit otherwise. That is only safe
-/// because nothing calls a winit mutator on the pill — `apply_diff` runs off
-/// winit's own flag changes, so with no such calls there is no diff to apply.
-/// Adding one would both clobber the ex-styles and hide the window.
-#[cfg(windows)]
-unsafe fn show_no_activate(hwnd: windows::Win32::Foundation::HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
-    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+/// `ShowWindow`, with its return value given the attention it deserves: none.
+/// It reports whether the window was *previously* visible, not whether the
+/// call worked, so there is no failure in it to log.
+fn show_window(
+    hwnd: windows::Win32::Foundation::HWND,
+    cmd: windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::ShowWindow;
+    // SAFETY: plain handle and command, no pointers; a stale HWND is a no-op.
+    let _was_visible = unsafe { ShowWindow(hwnd, cmd) };
 }
 
 /// A memory DC, deleted on drop.
-#[cfg(windows)]
 struct MemDc(windows::Win32::Graphics::Gdi::HDC);
 
-#[cfg(windows)]
 impl Drop for MemDc {
     fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::Graphics::Gdi::DeleteDC(self.0);
+        // SAFETY: `MemDc` owns the DC — it is only built around a fresh
+        // CreateCompatibleDC — so it is deleted exactly once, here.
+        let deleted = unsafe { windows::Win32::Graphics::Gdi::DeleteDC(self.0) };
+        if !deleted.as_bool() {
+            // A GDI handle leaked per resize runs the process into its quota,
+            // at which point no surface can be built at all.
+            tracing::warn!("could not delete the pill's memory DC");
         }
     }
 }
 
 /// A GDI bitmap, deleted on drop.
-#[cfg(windows)]
 struct Bitmap(windows::Win32::Graphics::Gdi::HBITMAP);
 
-#[cfg(windows)]
 impl Drop for Bitmap {
     fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.0);
+        // SAFETY: `Bitmap` owns the handle — it is only built around a fresh
+        // CreateDIBSection — so it is deleted exactly once, here. `Dib` drops
+        // its DC first, so the bitmap is no longer selected into it.
+        let deleted = unsafe { windows::Win32::Graphics::Gdi::DeleteObject(self.0) };
+        if !deleted.as_bool() {
+            tracing::warn!("could not delete the pill's DIB section");
         }
     }
 }
@@ -684,7 +696,6 @@ impl Drop for Bitmap {
 /// The layered surface's pixels: a top-down 32-bit DIB section selected into
 /// its own memory DC. It owns both handles, so the DC, the bitmap and `bits`
 /// cannot come apart, and no early return can leak one.
-#[cfg(windows)]
 struct Dib {
     /// Declared before `bitmap` so it drops first: the bitmap is selected into
     /// it, and GDI refuses to delete a selected bitmap. Deleting the DC
@@ -698,54 +709,67 @@ struct Dib {
     h: u32,
 }
 
-#[cfg(windows)]
 impl Dib {
     fn new(w: u32, h: u32) -> Result<Self> {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
             BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         };
-        unsafe {
+        // SAFETY: no pointers in; the screen DC is released on the next line
+        // whatever CreateCompatibleDC made of it (a null one still yields a
+        // screen-compatible memory DC).
+        let dc = unsafe {
             let screen_dc = GetDC(None);
             let dc = CreateCompatibleDC(screen_dc);
             ReleaseDC(None, screen_dc);
-            if dc.is_invalid() {
-                return Err(anyhow!("CreateCompatibleDC failed"));
-            }
-            let dc = MemDc(dc);
-
-            let bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    // Negative height = top-down DIB so byte order matches our tiny-skia row order.
-                    biHeight: -(h as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(dc.0, &bi, DIB_RGB_COLORS, &mut bits, None, 0)
-                .map_err(|e| anyhow!("CreateDIBSection: {e}"))?;
-            if bitmap.is_invalid() {
-                return Err(anyhow!("CreateDIBSection returned null"));
-            }
-            let bitmap = Bitmap(bitmap);
-            if bits.is_null() {
-                return Err(anyhow!("CreateDIBSection returned no pixels"));
-            }
-            SelectObject(dc.0, bitmap.0);
-            Ok(Self {
-                dc,
-                bitmap,
-                bits: bits as *mut u8,
-                w,
-                h,
-            })
+            dc
+        };
+        if dc.is_invalid() {
+            return Err(anyhow!("CreateCompatibleDC failed"));
         }
+        let dc = MemDc(dc);
+
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                // Negative height = top-down DIB so byte order matches our tiny-skia row order.
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `bi` is a complete BITMAPINFO for a BI_RGB DIB (no colour
+        // table follows it), and `bits` is a live local the call writes once.
+        let bitmap = unsafe { CreateDIBSection(dc.0, &bi, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .map_err(|e| anyhow!("CreateDIBSection: {e}"))?;
+        if bitmap.is_invalid() {
+            return Err(anyhow!("CreateDIBSection returned null"));
+        }
+        let bitmap = Bitmap(bitmap);
+        if bits.is_null() {
+            return Err(anyhow!("CreateDIBSection returned no pixels"));
+        }
+        // SAFETY: both handles are live and owned by locals that outlive the
+        // call. The DC's previous bitmap is the stock 1x1 one, which needs no
+        // restoring: deleting a memory DC does not delete stock objects.
+        let prev = unsafe { SelectObject(dc.0, bitmap.0) };
+        if prev.is_invalid() {
+            // Unselected, UpdateLayeredWindow would push the DC's stock 1x1
+            // bitmap — a pill that is there and draws nothing.
+            return Err(anyhow!("SelectObject could not select the DIB section"));
+        }
+        Ok(Self {
+            dc,
+            bitmap,
+            bits: bits as *mut u8,
+            w,
+            h,
+        })
     }
 
     /// All or nothing: the new DIB is built before the old one is released,
@@ -760,11 +784,16 @@ impl Dib {
 
     fn pixels(&mut self) -> &mut [u8] {
         let len = self.w as usize * self.h as usize * 4;
+        // SAFETY: `bits` is CreateDIBSection's non-null buffer for a `w`x`h`
+        // 32bpp DIB — exactly `len` bytes, with no row padding at 4 bytes a
+        // pixel — and lives as long as `self.bitmap`, which `self` owns. The
+        // `&mut self` borrow makes this the only view of it; GDI reads it only
+        // inside UpdateLayeredWindow, which never overlaps this borrow.
         unsafe { std::slice::from_raw_parts_mut(self.bits, len) }
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -833,6 +862,17 @@ mod tests {
         assert_eq!(with_click_through(off, true), cur);
     }
 
+    // SetWindowLongPtrW answers failure with a 0 that is also a legitimate
+    // previous value; the write has to tell the two apart, or a pill whose
+    // styles never landed logs nothing (#105).
+    #[test]
+    fn an_ex_style_write_to_no_window_is_an_error() {
+        let none = windows::Win32::Foundation::HWND(std::ptr::null_mut());
+        assert!(write_ex_style(none, PILL_EX_STYLE).is_err());
+        assert!(apply_pill_ex_styles(none, true).is_err());
+        assert!(rearm_ex_styles(none, false).is_err());
+    }
+
     // The re-arm's first write must drop LAYERED and nothing else — clearing
     // NOACTIVATE for even one message would let the pill take focus.
     #[test]
@@ -847,7 +887,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod dib_tests {
     use super::*;
     use std::sync::Mutex;
@@ -858,6 +898,7 @@ mod dib_tests {
     static GDI: Mutex<()> = Mutex::new(());
 
     fn gdi_objects() -> u32 {
+        // SAFETY: the pseudo-handle for this process, no pointers.
         unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
     }
 

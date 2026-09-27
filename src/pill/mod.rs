@@ -1,3 +1,8 @@
+// Every `unsafe` block here states the invariant it relies on, and every
+// `unsafe fn` the contract its caller owes (#105). Clippy holds the line for
+// the blocks and for public fns; a private `unsafe fn` is on the reviewer.
+#![warn(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
+
 pub mod adapter;
 pub mod core;
 pub mod fullscreen;
