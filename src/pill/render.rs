@@ -23,13 +23,11 @@
 // with its own clock — a flash outlives the hover under it — so it arrives as a
 // `Fade`.
 
-use crate::pill::core::{
-    check_centre, Action, BodyStyle, Button, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTON,
-    CHECK_BUTTONS, CHECK_CLAIM, CHECK_GLYPH_BOX, GLYPH_BOX, UNIFIED_SLOT_W,
-};
+use crate::pill::core::{Action, BodyStyle, Button, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTONS};
 use crate::pill::geom::{
-    label_centre_y, pill_centre_y, Geom, Rgb, Slot, BODY, HAIRLINE, HAIRLINE_A, LABEL_H,
-    LABEL_PAD_X, LABEL_PX, LABEL_TEXT, LABEL_TEXT_A, PILL_FILL_A,
+    check_centre, label_centre_y, pill_centre_y, Geom, Rgb, Slot, BODY, CHECK_BUTTON, CHECK_CLAIM,
+    CHECK_GLYPH_BOX, GLYPH_BOX, HAIRLINE, HAIRLINE_A, LABEL_H, LABEL_PAD_X, LABEL_PX, LABEL_TEXT,
+    LABEL_TEXT_A, PILL_FILL_A, UNIFIED_SLOT_W,
 };
 use crate::pill::icons;
 use crate::pill::label::Fade;
@@ -505,7 +503,7 @@ fn draw_hit_strip(pm: &mut Pixmap, scale: f32, progress: f32) {
         BodyStyle::Islands.slab(0).0 * scale,
         BodyStyle::Islands.slab(BUTTON_COUNT - 1).1 * scale,
     );
-    let h = crate::pill::core::BAR_H * scale;
+    let h = crate::pill::geom::BAR_H * scale;
     let (cx, cy) = centre(pm, scale);
     let Some(rect) = Rect::from_ltrb(cx + lo, cy - h / 2.0, cx + hi, cy + h / 2.0) else {
         return;
@@ -830,8 +828,8 @@ pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pill::core::{Origin, PillMode, CLICK_W};
-    use crate::pill::geom::{ENVELOPE_H, ENVELOPE_W};
+    use crate::pill::core::{Origin, PillMode};
+    use crate::pill::geom::{CLICK_W, ENVELOPE_H, ENVELOPE_W};
     use crate::pill::BAR_COUNT;
     use tiny_skia::PremultipliedColorU8;
 
@@ -1310,7 +1308,7 @@ mod tests {
         let confirm = frame(CLICK_REC, &FLAT);
         let (_, disc) = glyph_box(
             &confirm,
-            cx + crate::pill::core::check_centre(CLICK_W, 1),
+            cx + crate::pill::geom::check_centre(CLICK_W, 1),
             cy(&confirm, 1.0),
             7,
         );
@@ -1394,7 +1392,7 @@ mod tests {
         let lit = bar(&slots);
         let cy = cy(&lit, 1.0);
         // Inside the Copy island, clear of its glyph: the indicator's fill.
-        let x = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(0)) as u32;
+        let x = (ENVELOPE_W as f32 / 2.0 + crate::pill::geom::island_centre(0)) as u32;
         let inside =
             |pm: &Pixmap, dx: i32| brightest(pm.pixel((x as i32 + dx) as u32, cy).unwrap());
         assert!(
@@ -1403,7 +1401,7 @@ mod tests {
         );
         // The other two are untouched.
         for i in [1usize, 2] {
-            let ox = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(i)) as u32;
+            let ox = (ENVELOPE_W as f32 / 2.0 + crate::pill::geom::island_centre(i)) as u32;
             let (a, b) = (
                 brightest(lit.pixel(ox - 12, cy).unwrap()),
                 brightest(dark.pixel(ox - 12, cy).unwrap()),
@@ -1420,7 +1418,7 @@ mod tests {
         let mut slots = NO_SLOTS;
         slots[0].enabled = false;
         let dead = bar(&slots);
-        let cx = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(0)) as u32;
+        let cx = (ENVELOPE_W as f32 / 2.0 + crate::pill::geom::island_centre(0)) as u32;
         let cy = cy(&live, 1.0);
         // The brightest pixel anywhere in the glyph box, which is the glyph.
         let glyph = |pm: &Pixmap| {
@@ -1438,7 +1436,7 @@ mod tests {
         );
         assert!(glyph(&dead) > 20, "the disabled glyph vanished");
         // And only that button dims: Settings is untouched.
-        let sx = (ENVELOPE_W as f32 / 2.0 + crate::pill::core::island_centre(2)) as u32;
+        let sx = (ENVELOPE_W as f32 / 2.0 + crate::pill::geom::island_centre(2)) as u32;
         let settings = |pm: &Pixmap| {
             (sx - 11..sx + 11)
                 .flat_map(|x| (cy - 11..cy + 11).map(move |y| (x, y)))
@@ -1485,9 +1483,9 @@ mod tests {
         // The middle of each gap: between Copy and Dictate, and between
         // Dictate and Settings.
         for (i, b) in BUTTONS.iter().enumerate().take(BUTTONS.len() - 1) {
-            let mid_x = (crate::pill::core::island_centre(i)
+            let mid_x = (crate::pill::geom::island_centre(i)
                 + b.w / 2.0
-                + crate::pill::core::BAR_GAP / 2.0)
+                + crate::pill::geom::BAR_GAP / 2.0)
                 + ENVELOPE_W as f32 / 2.0;
             let p = out.pixel(mid_x.round() as u32, cy).unwrap();
             assert!(p.alpha() > 0, "gap {i} is a hole: {p:?}");
@@ -1541,7 +1539,7 @@ mod tests {
     /// every drawn row above the button bar's top edge, which is the only thing
     /// up there that is not the pill.
     fn label_rows(pm: &Pixmap) -> Vec<u32> {
-        let bar_top = pill_centre_y(pm.height() as f32, 1.0) - crate::pill::core::BAR_H / 2.0;
+        let bar_top = pill_centre_y(pm.height() as f32, 1.0) - crate::pill::geom::BAR_H / 2.0;
         (0..bar_top as u32)
             .filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).unwrap().alpha() > 8))
             .collect()
@@ -1573,7 +1571,7 @@ mod tests {
             "chip spans {top}..{bottom}, wanted {want} +- {}",
             LABEL_H / 2.0
         );
-        let bar_top = pill_centre_y(ENVELOPE_H as f32, 1.0) - crate::pill::core::BAR_H / 2.0;
+        let bar_top = pill_centre_y(ENVELOPE_H as f32, 1.0) - crate::pill::geom::BAR_H / 2.0;
         assert!(bottom < bar_top, "the chip touches the bar");
         // Dark body, light text: the two things that make it readable on any
         // desktop, checked as the pill's own body is.

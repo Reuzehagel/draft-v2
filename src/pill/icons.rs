@@ -292,7 +292,8 @@ fn arc_to(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pill::core::{BUTTONS, CHECK_BUTTONS, CHECK_GLYPH_BOX, GLYPH_BOX};
+    use crate::pill::core::{BUTTONS, CHECK_BUTTONS};
+    use crate::pill::geom::{CHECK_GLYPH_BOX, GLYPH_BOX};
 
     /// Every glyph either button list names parses, and lands inside its box.
     /// A path that silently failed would be a button with no icon on it.

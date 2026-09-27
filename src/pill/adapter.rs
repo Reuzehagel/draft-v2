@@ -299,7 +299,7 @@ impl<W: PillPort> PillAdapter<W> {
             return false;
         };
         let reach = if expanded {
-            self.reach(r, self.body_style.bar_width(), pill::core::BAR_H)
+            self.reach(r, self.body_style.bar_width(), pill::geom::BAR_H)
         } else {
             self.reach(r, pill::geom::NUB_W, pill::geom::NUB_H)
         };

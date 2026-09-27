@@ -21,10 +21,17 @@
 //   than the pill, because the label lives above it. Nothing is resized, moved,
 //   or reallocated to run an animation.
 //
+// It is also where every positional number lives: the button bar's islands,
+// the unified body's slots and the click-started pill's discs, their centres,
+// and the hit slabs the Pill core asks about a click. The core says *which*
+// buttons are up; this says where they are.
+//
 // Pure: no winit, no Win32, no `Instant::now()`. `Motion::at` takes the `now`
 // it is asked about, exactly like the cores do.
 
-use crate::pill::core::{BodyStyle, Origin, PillMode, BAR_H, CLICK_H, CLICK_W};
+use crate::pill::core::{
+    BodyStyle, Button, Origin, PillMode, BUTTONS, BUTTON_COUNT, CENTRE, CHECK_BUTTONS,
+};
 use std::time::{Duration, Instant};
 
 /// The pill's resting silhouette — what `Idle` renders and what `Hidden` keeps
@@ -116,6 +123,249 @@ pub fn label_centre_y(surface_h: f32, scale: f32, body_h: f32) -> f32 {
 /// past it.
 pub const SESSION_W: f32 = 62.0;
 pub const SESSION_H: f32 = 28.0;
+
+// --- The button bar's layout -------------------------------------------
+
+/// The bar's height, and the cap every island's height is taken against.
+pub const BAR_H: f32 = 32.0;
+
+/// Bare desktop between islands. There is no enclosing body to gap *within*:
+/// the expanded pill is three separate shapes with the desktop showing between
+/// them.
+pub const BAR_GAP: f32 = 3.0;
+
+/// The 24-unit grid every glyph is drawn in, as a box in logical pixels. The
+/// same in all three buttons — see [`Button`].
+pub const GLYPH_BOX: f32 = 22.0;
+
+impl Button {
+    /// An island is as tall as it is wide, capped at the bar's height. One
+    /// expression, and both shapes fall out of it: a 32 button is a circle, a
+    /// 48 button is a stadium.
+    pub fn height(&self) -> f32 {
+        self.w.min(BAR_H)
+    }
+
+    /// Fully rounded at its own height, at every width.
+    pub fn radius(&self) -> f32 {
+        self.height() / 2.0
+    }
+}
+
+/// Button `i`'s centre on the islands bar, as an offset from the pill's centre.
+/// Negative is left.
+///
+/// The bar is centred on the pill, which — with an odd count — is what puts
+/// Dictate exactly under the cursor that opened it.
+pub fn island_centre(i: usize) -> f32 {
+    let mut x = -BodyStyle::Islands.bar_width() / 2.0;
+    for b in &BUTTONS[..i] {
+        x += b.w + BAR_GAP;
+    }
+    x + BUTTONS[i].w / 2.0
+}
+
+/// A unified slot's width: the uniform region one button gets inside the one
+/// body. Every button gets the same one, which *is* the style — there is no
+/// wider slab for Dictate to be found by.
+///
+/// Not [`Slot`], which is a button's hover state riding
+/// beside the Geom. This is a length.
+pub const UNIFIED_SLOT_W: f32 = 32.0;
+
+/// Clear space between the outermost slot and the unified body's edge. The
+/// bar's inert end padding, with a body drawn under it.
+pub const UNIFIED_PAD: f32 = 4.0;
+
+impl BodyStyle {
+    /// The expanded pill's total width. Both arms are derived from [`BUTTONS`],
+    /// so a fourth button widens either style without a second edit.
+    pub fn bar_width(self) -> f32 {
+        match self {
+            BodyStyle::Islands => {
+                BUTTONS.iter().map(|b| b.w).sum::<f32>() + BAR_GAP * (BUTTONS.len() - 1) as f32
+            }
+            BodyStyle::Unified => BUTTON_COUNT as f32 * UNIFIED_SLOT_W + 2.0 * UNIFIED_PAD,
+        }
+    }
+
+    /// How wide button `i` is drawn. Its own island under Islands; the uniform
+    /// [`UNIFIED_SLOT_W`] under Unified, whatever the island would have been.
+    pub fn button_w(self, i: usize) -> f32 {
+        match self {
+            BodyStyle::Islands => BUTTONS[i].w,
+            BodyStyle::Unified => UNIFIED_SLOT_W,
+        }
+    }
+
+    /// Button `i`'s centre inside a body `body_w` wide, `progress` through its
+    /// fold-out — the one derivation both the renderer and the hit regions ask,
+    /// so the two cannot drift.
+    pub fn centre(self, body_w: f32, progress: f32, i: usize) -> f32 {
+        match self {
+            // The flankers slide out from *behind* Dictate, so their offset is
+            // the growth progress times their settled one. The body they sit
+            // beside is not theirs to measure from — it is one island of three.
+            BodyStyle::Islands => island_centre(i) * progress.clamp(0.0, 1.0),
+            // One body, so the slots are measured inward from whatever edge it
+            // has this frame — the derivation [`check_centre`] makes, with the
+            // same consequence: on a body too narrow to hold them they stack at
+            // the centre and separate as it widens. Progress does not enter,
+            // because the body's own width already carries it.
+            BodyStyle::Unified => {
+                // A bar with one button has no spacing to derive and would
+                // divide by zero here. Stated as a compile-time assertion
+                // rather than a runtime guard: [`BUTTON_COUNT`] is a constant,
+                // so a branch for it would be a dead one — and the bar needs a
+                // centre and two flanks under either body anyway.
+                const { assert!(BUTTON_COUNT > 1) };
+                let outer = (body_w / 2.0 - UNIFIED_PAD - UNIFIED_SLOT_W / 2.0).max(0.0);
+                let step = 2.0 * outer / (BUTTON_COUNT - 1) as f32;
+                -outer + step * i as f32
+            }
+        }
+    }
+
+    /// Button `i`'s centre on the settled bar.
+    pub fn settled_centre(self, i: usize) -> f32 {
+        self.centre(self.bar_width(), 1.0, i)
+    }
+
+    /// Button `i`'s hit region: **a slab, not a circle**. Full bar height, and
+    /// end to end across the bar, so nothing between two buttons is a dead zone
+    /// the hover flickers off in.
+    ///
+    /// Under Islands that means the island plus half the desktop either side.
+    /// Under Unified the slots already abut, so each is exactly its own region.
+    /// Either way the outer ends stop at the last button: past it is the end
+    /// padding, which is inert — it holds the pill expanded with nothing lit.
+    /// The one difference the style makes is what a click there does *not* do:
+    /// bare desktop passes it through, a body swallows it.
+    pub fn slab(self, i: usize) -> (f32, f32) {
+        let c = self.settled_centre(i);
+        let half = self.button_w(i) / 2.0;
+        match self {
+            BodyStyle::Islands => {
+                let lo = if i == 0 { 0.0 } else { BAR_GAP / 2.0 };
+                let hi = if i + 1 == BUTTON_COUNT {
+                    0.0
+                } else {
+                    BAR_GAP / 2.0
+                };
+                (c - half - lo, c + half + hi)
+            }
+            BodyStyle::Unified => (c - half, c + half),
+        }
+    }
+
+    /// Which button `(x, y)` — an offset from the pill's centre, in logical
+    /// pixels — is over, disregarding whether it is live.
+    ///
+    /// The vertical half is what "full bar height" actually means, and it is
+    /// checked rather than assumed: until #46 the window *was* the bar's height
+    /// and there was nowhere else to be, but the envelope now holds a label
+    /// above the pill, and a cursor up there is over the window without being
+    /// over a button.
+    pub(super) fn slab_at(self, x: f32, y: f32) -> Option<usize> {
+        if y.abs() > BAR_H / 2.0 {
+            return None;
+        }
+        (0..BUTTON_COUNT).find(|&i| {
+            let (lo, hi) = self.slab(i);
+            x >= lo && x < hi
+        })
+    }
+}
+
+// --- The click-started pill ---------------------------------------------
+//
+// A mouse-started session has no "release the key" gesture, so it carries the
+// two buttons that gesture stood for. They are **not the button bar**: the bar
+// is three islands over bare desktop, and this is one body with two discs
+// inside it — the pill a session is running in, not a menu.
+//
+// Everything below is a number the ticket states, and the layout is asserted
+// against the sum it was stated as:
+//
+//     7 + 20 + 12 + 34 bars + 12 + 20 + 7 = 112
+
+/// The click-started pill's body: **always one**, never the bar's three
+/// islands.
+pub const CLICK_W: f32 = 112.0;
+pub const CLICK_H: f32 = 32.0;
+
+/// Clear space between the body's edge and the outer edge of a button.
+pub const CHECK_PAD: f32 = 7.0;
+
+/// Cancel and confirm are 20px circles — **smaller than any hover-bar button**,
+/// because these sit *inside* a body rather than being one.
+pub const CHECK_BUTTON: f32 = 20.0;
+
+/// Clear space between a button and the bar row it flanks.
+pub const CHECK_GAP: f32 = 12.0;
+
+/// What one button claims of the body's half-width: itself, its padding, and
+/// the clear space between it and the waveform.
+///
+/// The one number the renderer needs to place both the discs and the row, so
+/// it is derived here rather than reconstructed there — the layout changes in
+/// one file or it drifts between two.
+pub const CHECK_CLAIM: f32 = CHECK_PAD + CHECK_BUTTON + CHECK_GAP;
+
+/// The glyph box cancel and confirm draw in — the button itself, unlike the
+/// bar's, whose [`GLYPH_BOX`] is smaller than every island it sits in.
+///
+/// These are 20px discs inside a 32px body rather than islands *being* the
+/// body, so there is no island padding to hold a mark clear of: the disc's own
+/// edge is what does that, and a box smaller than the disc would leave a 20px
+/// circle with a 14px mark rattling around in it.
+pub const CHECK_GLYPH_BOX: f32 = CHECK_BUTTON;
+
+/// Button `i`'s centre inside a body `body_w` wide, as an offset from the
+/// pill's centre. Negative is left, which is cancel.
+///
+/// Takes the width rather than assuming [`CLICK_W`] because the renderer asks
+/// it about a body mid-morph: measured inward from whatever edge the body has
+/// this frame, the pair sit under the bar's centre island at the start of the
+/// fold and at their settled places by the end. One derivation, two callers.
+pub fn check_centre(body_w: f32, i: usize) -> f32 {
+    let x = (body_w / 2.0 - CHECK_PAD - CHECK_BUTTON / 2.0).max(0.0);
+    if i == 0 {
+        -x
+    } else {
+        x
+    }
+}
+
+/// Button `i`'s hit region, on the bar's own doctrine: full body height,
+/// spanning the button plus half the gap on its *inner* side, so the desktop
+/// between a button and the waveform belongs to the button rather than being a
+/// dead zone. The outer ends stop at the button — past it is [`CHECK_PAD`],
+/// which is inert.
+///
+/// Always at the settled width: a hit region is only ever asked about a pill
+/// that has arrived, since the check is not clickable mid-morph.
+pub fn check_slab(i: usize) -> (f32, f32) {
+    let c = check_centre(CLICK_W, i);
+    let half = CHECK_BUTTON / 2.0;
+    if i == 0 {
+        (c - half, c + half + CHECK_GAP / 2.0)
+    } else {
+        (c - half - CHECK_GAP / 2.0, c + half)
+    }
+}
+
+/// Which of the two `(x, y)` — an offset from the pill's centre, in logical
+/// pixels — is over.
+pub(super) fn check_slab_at(x: f32, y: f32) -> Option<usize> {
+    if y.abs() > CLICK_H / 2.0 {
+        return None;
+    }
+    (0..CHECK_BUTTONS.len()).find(|&i| {
+        let (lo, hi) = check_slab(i);
+        x >= lo && x < hi
+    })
+}
 
 /// The pill's near-black body. Dark enough to read as an overlay rather than a
 /// widget on every desktop; the light hairline is what makes it findable on a
@@ -251,7 +501,7 @@ impl Geom {
             PillMode::Expanded {
                 style: BodyStyle::Islands,
             } => {
-                let dictate = &crate::pill::core::BUTTONS[crate::pill::core::CENTRE];
+                let dictate = &BUTTONS[CENTRE];
                 Geom {
                     w: dictate.w,
                     h: dictate.height(),
@@ -490,7 +740,7 @@ pub struct Slot {
 /// second input beside the [`Geom`]. An array rather than a slice, so a
 /// mismatched length is a compile error rather than a button quietly drawn at
 /// its defaults.
-pub type Slots = [Slot; crate::pill::core::BUTTON_COUNT];
+pub type Slots = [Slot; BUTTON_COUNT];
 
 /// Live, unlit — what a button is when nobody has said otherwise. Deliberately
 /// not `derive`d: a defaulted `enabled: false` would draw every glyph faint.
@@ -831,9 +1081,9 @@ mod tests {
         let pill = pill_centre_y(h, scale);
         // The tallest thing the pill is ever drawn as, which is the one that
         // pushes the chip closest to the top of the surface.
-        let label = label_centre_y(h, scale, crate::pill::core::BAR_H);
+        let label = label_centre_y(h, scale, BAR_H);
         assert!(label < pill, "the label is not above the pill");
-        let bar_top = pill - crate::pill::core::BAR_H / 2.0;
+        let bar_top = pill - BAR_H / 2.0;
         assert!(label + LABEL_H / 2.0 < bar_top, "the chip touches the bar");
         assert!(
             label - LABEL_H / 2.0 > 0.0,
@@ -928,14 +1178,12 @@ mod tests {
     #[test]
     fn the_unified_body_marks_no_button_as_primary() {
         let unified = BodyStyle::Unified;
-        let widths: Vec<f32> = (0..crate::pill::core::BUTTON_COUNT)
-            .map(|i| unified.button_w(i))
-            .collect();
+        let widths: Vec<f32> = (0..BUTTON_COUNT).map(|i| unified.button_w(i)).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
         assert_eq!(Geom::of(UNIFIED).check, 0.0, "a disc at rest");
         // ...where the islands bar's centre is exactly the wider slab.
         let islands = BodyStyle::Islands;
-        assert!(islands.button_w(crate::pill::core::CENTRE) > islands.button_w(0));
+        assert!(islands.button_w(CENTRE) > islands.button_w(0));
     }
 
     /// The handover under unified: **the same MORPH**, between two uniform-slot
@@ -1388,5 +1636,140 @@ mod tests {
             },
             g
         );
+    }
+
+    /// Every number about the expanded bar, derived from the list rather than
+    /// written down twice.
+    #[test]
+    fn the_bar_derives_the_settled_islands_from_its_button_list() {
+        assert_eq!(BodyStyle::Islands.bar_width(), 118.0);
+        let islands: Vec<(f32, f32)> = (0..BUTTONS.len())
+            .map(|i| {
+                let c = island_centre(i);
+                (c - BUTTONS[i].w / 2.0, c + BUTTONS[i].w / 2.0)
+            })
+            .collect();
+        assert_eq!(islands, vec![(-59.0, -27.0), (-24.0, 24.0), (27.0, 59.0)]);
+        // A circle and a stadium out of one expression, both fully rounded.
+        let heights: Vec<f32> = BUTTONS.iter().map(|b| b.height()).collect();
+        assert_eq!(heights, vec![32.0, 32.0, 32.0]);
+        assert_eq!(BUTTONS[1].radius(), 16.0);
+        // The glyph box is not the button: same box in a 32 and a 48 island.
+        assert_eq!(GLYPH_BOX, 22.0);
+    }
+
+    /// Slabs, not circles: each spans its island plus half the desktop either
+    /// side, and the ends stop at the island.
+    #[test]
+    fn the_slabs_cover_the_bar_end_to_end() {
+        let islands = BodyStyle::Islands;
+        assert_eq!(islands.slab(0), (-59.0, -25.5));
+        assert_eq!(islands.slab(1), (-25.5, 25.5));
+        assert_eq!(islands.slab(2), (25.5, 59.0));
+        // No overlaps and no seams: every point between the ends belongs to
+        // exactly one button.
+        for i in 1..BUTTONS.len() {
+            assert_eq!(islands.slab(i - 1).1, islands.slab(i).0);
+        }
+    }
+
+    /// The unified body, as the ticket states it: **104x32, three uniform 32
+    /// slots**, and a glyph box that is the bar's own 22.
+    ///
+    /// The sum is what has to keep adding up, so it is written as one:
+    /// `4 + 32 + 32 + 32 + 4 = 104`.
+    #[test]
+    fn the_unified_body_is_three_uniform_slots_in_one_body() {
+        let unified = BodyStyle::Unified;
+        assert_eq!(
+            UNIFIED_PAD + BUTTON_COUNT as f32 * UNIFIED_SLOT_W + UNIFIED_PAD,
+            unified.bar_width()
+        );
+        assert_eq!(unified.bar_width(), 104.0);
+        assert_eq!(UNIFIED_SLOT_W, 32.0);
+        // The glyph box is the bar's, unchanged: the style is about the body,
+        // not about the marks in it.
+        assert_eq!(GLYPH_BOX, 22.0);
+        // Three equals. Not one number written three times — the widths are
+        // asked per button, and Dictate is asked with the rest.
+        let widths: Vec<f32> = (0..BUTTON_COUNT).map(|i| unified.button_w(i)).collect();
+        assert_eq!(widths, vec![32.0; BUTTON_COUNT]);
+        assert_eq!(unified.button_w(CENTRE), unified.button_w(0));
+        // ...where the islands bar marks its centre by being half again wider.
+        assert!(BodyStyle::Islands.button_w(CENTRE) > BodyStyle::Islands.button_w(0));
+        // Evenly spaced, centred, and Dictate under the cursor that opened it.
+        let centres: Vec<f32> = (0..BUTTON_COUNT)
+            .map(|i| unified.settled_centre(i))
+            .collect();
+        assert_eq!(centres, vec![-32.0, 0.0, 32.0]);
+    }
+
+    /// The slots abut, so the whole body between the outer pair belongs to a
+    /// button — and the pad past them is inert, exactly as the bar's end
+    /// padding is.
+    #[test]
+    fn the_unified_slabs_abut_across_the_body() {
+        let unified = BodyStyle::Unified;
+        assert_eq!(unified.slab(0), (-48.0, -16.0));
+        assert_eq!(unified.slab(1), (-16.0, 16.0));
+        assert_eq!(unified.slab(2), (16.0, 48.0));
+        for i in 1..BUTTON_COUNT {
+            assert_eq!(unified.slab(i - 1).1, unified.slab(i).0);
+        }
+        // The outermost slabs stop at their slots, short of the body's edge.
+        let half = unified.bar_width() / 2.0;
+        assert!(unified.slab(0).0 > -half && unified.slab(BUTTON_COUNT - 1).1 < half);
+    }
+
+    /// Mid-fold-out the slots are measured inward from the body's own edge, so
+    /// they stack at the centre on a nub-sized body and separate as it widens —
+    /// the unified reading of "the flankers slide out from behind Dictate".
+    #[test]
+    fn the_unified_slots_separate_as_the_body_widens() {
+        let unified = BodyStyle::Unified;
+        // On the nub there is not even room for one slot: everything is at the
+        // centre, and nothing is drawn off the end of a 36px body.
+        for i in 0..BUTTON_COUNT {
+            assert_eq!(unified.centre(NUB_W, 1.0, i), 0.0);
+        }
+        // And it is monotone the whole way out, at every button.
+        let mut prev = vec![0.0_f32; BUTTON_COUNT];
+        for step in 0..=100 {
+            let w = NUB_W + (unified.bar_width() - NUB_W) * step as f32 / 100.0;
+            for (i, was) in prev.iter_mut().enumerate() {
+                let c = unified.centre(w, 1.0, i);
+                assert!(c.abs() >= was.abs(), "slot {i} came back in at width {w}");
+                assert!(c.abs() <= unified.settled_centre(i).abs() + 1e-3);
+                *was = c;
+            }
+        }
+        assert_eq!(prev, vec![-32.0, 0.0, 32.0]);
+    }
+
+    /// The layout, as the ticket writes it: `7 + 20 + 12 + 34 + 12 + 20 + 7`.
+    /// Stated as that sum rather than as the numbers it produces, because the
+    /// sum is the thing that has to keep adding up.
+    #[test]
+    fn the_click_started_pill_adds_up_to_its_body() {
+        // The waveform gets whatever the two buttons have not claimed.
+        let row = CLICK_W - 2.0 * CHECK_CLAIM;
+        assert_eq!(row, 34.0);
+        assert_eq!(
+            CHECK_PAD + CHECK_BUTTON + CHECK_GAP + row + CHECK_GAP + CHECK_BUTTON + CHECK_PAD,
+            CLICK_W
+        );
+        assert_eq!((CLICK_W, CLICK_H), (112.0, 32.0));
+        // Circles, and smaller than any button the hover bar carries.
+        for b in &CHECK_BUTTONS {
+            assert_eq!((b.w, b.height(), b.radius()), (20.0, 20.0, 10.0));
+            assert!(BUTTONS.iter().all(|bar| bar.w > b.w), "{:?}", b.action);
+        }
+        assert_eq!(
+            (check_centre(CLICK_W, 0), check_centre(CLICK_W, 1)),
+            (-39.0, 39.0)
+        );
+        // The claim each button makes is the pad, the button and the gap — the
+        // one number the renderer places both the discs and the row from.
+        assert_eq!(CHECK_CLAIM, 39.0);
     }
 }
