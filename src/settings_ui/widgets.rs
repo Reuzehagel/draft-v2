@@ -23,6 +23,11 @@
 // - A focus ring is paint, never layout (`focus_ring`): it is drawn outside
 //   the control's rect, within egui's clip margin, so a focused control takes
 //   exactly the room an unfocused one does and nothing beside it moves.
+// - Every control has a screen reader name. The custom widgets here announce
+//   themselves, and a control inside a `row` is named after the row's label.
+//   Anything else — a raw `TextEdit` outside a row, a button whose text only
+//   makes sense beside what it acts on ("Copy", "Remove") — is named at the
+//   call site with `name_control`.
 
 use super::focus_trap;
 use super::theme::*;
@@ -165,7 +170,7 @@ fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, rounding: 
 
 /// Tell a screen reader what `resp`'s control is. `info` is what egui already
 /// knows how to say; `refine` then edits the node egui built from it, for what
-/// `WidgetInfo` has no field for — a switch's role, a tab's selection, a value.
+/// `WidgetInfo` has no field for — a switch's role, a selection, a value.
 /// Both are no-ops unless a screen reader has switched AccessKit on.
 fn announce(
     resp: &egui::Response,
@@ -223,11 +228,41 @@ fn announce_switch(resp: &egui::Response, on: bool, label: &str, caption: Option
 
 /// A button whose name is its text.
 fn announce_button(resp: &egui::Response, enabled: bool, text: &str) {
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text));
+}
+
+/// One of several choices, announced with `role` and whether it is the one
+/// chosen.
+fn announce_choice(resp: &egui::Response, role: egui::accesskit::Role, selected: bool, text: &str) {
     announce(
         resp,
-        || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, text),
-        |_| {},
+        || egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, text),
+        |node| {
+            node.set_role(role);
+            node.set_selected(selected);
+        },
     );
+}
+
+/// Give a control a screen reader name other than the one it would announce
+/// itself by — a field outside a `row`, which has no row label to be named
+/// by, or a button whose text only makes sense beside what it acts on
+/// ("Copy", "Remove").
+pub(super) fn name_control(resp: &egui::Response, name: &str) {
+    resp.ctx
+        .accesskit_node_builder(resp.id, |node| node.set_name(name));
+}
+
+/// Announce a progress bar: what is in progress, how far along, and the
+/// status line painted beside it.
+pub(super) fn announce_progress(resp: &egui::Response, name: &str, fraction: f32, status: &str) {
+    resp.ctx.accesskit_node_builder(resp.id, |node| {
+        node.set_name(name);
+        node.set_min_numeric_value(0.0);
+        node.set_max_numeric_value(100.0);
+        node.set_numeric_value((fraction * 100.0).round() as f64);
+        node.set_value(status);
+    });
 }
 
 // ---- rail nav ----------------------------------------------------------
@@ -238,15 +273,15 @@ pub(super) fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    // A tab rather than a toggled button: the rail picks one pane of several,
-    // and a screen reader says which is selected.
-    announce(
+    // Announced with AccessKit's Tab role rather than as a toggled button: a
+    // rail item picks one pane of several, and that role is how a screen
+    // reader says which one is selected. A click selects it this frame, though
+    // the caller only switches pane after.
+    announce_choice(
         &resp,
-        || egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, label),
-        |node| {
-            node.set_role(egui::accesskit::Role::Tab);
-            node.set_selected(selected);
-        },
+        egui::accesskit::Role::Tab,
+        selected || resp.clicked(),
+        label,
     );
     let id = ui.make_persistent_id(("nav", label));
 
@@ -303,7 +338,13 @@ pub(super) fn combo<T: PartialEq + Clone>(
                 }
             }
         });
-    name_by_row(ui, r.response.id, |node| node.set_value(selected_text));
+    // The option chosen this frame, not the text the caller computed before
+    // it; a value no option carries ("Not connected") keeps the caller's text.
+    let value = options
+        .iter()
+        .find(|(val, _)| *val == *current)
+        .map_or(selected_text, |(_, label)| label);
+    name_by_row(ui, r.response.id, |node| node.set_value(value));
     r.response.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
@@ -338,14 +379,7 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     // The full text, not the elided galley: the cut is for the eye only.
-    announce(
-        &resp,
-        || egui::WidgetInfo::labeled(egui::WidgetType::SelectableLabel, true, text),
-        |node| {
-            node.set_role(egui::accesskit::Role::ListBoxOption);
-            node.set_selected(selected);
-        },
-    );
+    announce_choice(&resp, egui::accesskit::Role::ListBoxOption, selected, text);
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, Rounding::same(6.0), SELECTED_BG);
@@ -447,18 +481,22 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
 // ---- rows --------------------------------------------------------------
 
 /// Single-line text input forced to a fixed width and height so every input
-/// in the window lines up. An `invalid` field keeps its metrics and swaps its
-/// border — idle, hovered and focused alike — for the destructive colour; the
-/// message itself goes beneath the row, in `field_error`.
+/// in the window lines up. A field with an `error` keeps its metrics and swaps
+/// its border — idle, hovered and focused alike — for the destructive colour;
+/// the message itself is painted beneath the row, in `field_error`.
+///
+/// A screen reader hears the error as the field's description, in place of
+/// the row's caption: AccessKit's own invalid flag is set too, but its Windows
+/// adapter doesn't pass it on to Narrator.
 pub(super) fn text_input(
     ui: &mut egui::Ui,
     text: &mut String,
     placeholder: &str,
     width: f32,
-    invalid: bool,
+    error: Option<&str>,
 ) -> egui::Response {
     ui.scope(|ui| {
-        if invalid {
+        if error.is_some() {
             let v = ui.visuals_mut();
             v.widgets.inactive.bg_stroke.color = DESTRUCTIVE;
             v.widgets.hovered.bg_stroke.color = DESTRUCTIVE;
@@ -471,16 +509,16 @@ pub(super) fn text_input(
                 .hint_text(hint(placeholder))
                 .vertical_align(egui::Align::Center),
         );
-        name_by_row(ui, resp.id, |node| node.set_placeholder(placeholder));
+        name_by_row(ui, resp.id, |node| {
+            node.set_placeholder(placeholder);
+            if let Some(msg) = error {
+                node.set_invalid(egui::accesskit::Invalid::True);
+                node.set_description(msg);
+            }
+        });
         resp
     })
     .inner
-}
-
-/// Name a text field that sits outside a `row`, so has no row to be named by.
-pub(super) fn name_field(resp: &egui::Response, name: &str) {
-    resp.ctx
-        .accesskit_node_builder(resp.id, |node| node.set_name(name));
 }
 
 /// A validation message hung beneath a row, in the control column: laid out
@@ -576,7 +614,15 @@ pub(super) fn split_row(
 /// scopes them to the rule with `push_id`. They must be explicit: egui derives
 /// an auto id from a running per-frame counter, which shifts when an earlier
 /// row goes away.
-pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Replacement) -> bool {
+///
+/// `number` is the rule's 1-based place in the list. Every rule's controls
+/// look alike, so a screen reader hears it on each ("Rule 2 hears", "Remove
+/// rule 2") to know which rule it is in.
+pub(super) fn replacement_editor(
+    ui: &mut egui::Ui,
+    rule: &mut crate::config::Replacement,
+    number: usize,
+) -> bool {
     let mut remove = false;
     let field_w = 140.0;
     ui.horizontal(|ui| {
@@ -584,7 +630,7 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
         // and doesn't wrap in the narrow window.
         ui.spacing_mut().item_spacing.x = 0.0;
         let id = ui.make_persistent_id("repl_enabled");
-        if mini_switch(ui, rule.enabled, "Rule enabled", id) {
+        if mini_switch(ui, rule.enabled, &format!("Rule {number}"), id) {
             rule.enabled = !rule.enabled;
         }
         ui.add_space(10.0);
@@ -595,7 +641,7 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
                 .hint_text(hint("hears…"))
                 .vertical_align(egui::Align::Center),
         );
-        name_field(&from, "Hears");
+        name_control(&from, &format!("Rule {number} hears"));
         ui.add_space(8.0);
         ui.label(RichText::new("→").size(15.0).color(MUTED_FG));
         ui.add_space(8.0);
@@ -606,9 +652,11 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
                 .hint_text(hint("writes…"))
                 .vertical_align(egui::Align::Center),
         );
-        name_field(&to, "Writes");
+        name_control(&to, &format!("Rule {number} writes"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(ghost_button("Remove", 72.0, CONTROL_H)).clicked() {
+            let resp = ui.add(ghost_button("Remove", 72.0, CONTROL_H));
+            name_control(&resp, &format!("Remove rule {number}"));
+            if resp.clicked() {
                 remove = true;
             }
         });
@@ -617,9 +665,11 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
     ui.horizontal(|ui| {
         // Indent the flags so they sit under the fields, clear of the switch.
         ui.add_space(46.0);
-        ui.checkbox(&mut rule.whole_word, "Whole word");
+        let whole = ui.checkbox(&mut rule.whole_word, "Whole word");
+        name_control(&whole, &format!("Rule {number} whole word"));
         ui.add_space(14.0);
-        ui.checkbox(&mut rule.case_sensitive, "Match case");
+        let case = ui.checkbox(&mut rule.case_sensitive, "Match case");
+        name_control(&case, &format!("Rule {number} match case"));
     });
     remove
 }
@@ -630,7 +680,8 @@ pub(super) fn replacement_editor(ui: &mut egui::Ui, rule: &mut crate::config::Re
 pub(super) fn mini_switch(ui: &mut egui::Ui, on: bool, label: &str, id: egui::Id) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(32.0, 18.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    announce_switch(&resp, on, label, None);
+    // A click flips it this frame, though the caller only flips the value after.
+    announce_switch(&resp, on != resp.clicked(), label, None);
     paint_toggle(ui, rect, on, id, resp.hovered());
     focus_ring(ui, &resp, rect, rect.height() / 2.0);
     resp.clicked()
@@ -1401,7 +1452,8 @@ mod tests {
         assert_eq!(mini.toggled(), Some(Toggled::False));
     }
 
-    /// Rail items are tabs, and the current pane's is the selected one.
+    /// A rail item is announced with the Tab role, and the current pane's is
+    /// the selected one.
     #[test]
     fn a_rail_item_reports_whether_it_is_selected() {
         let nodes = a11y_nodes(|ui| {
@@ -1436,9 +1488,9 @@ mod tests {
         assert_eq!(combo.description(), Some("Hold the key, or tap to toggle."));
     }
 
-    /// An option in an open dropdown says whether it is the current one.
+    /// An option row says whether it is the current value.
     #[test]
-    fn a_dropdown_option_reports_whether_it_is_selected() {
+    fn an_option_row_reports_whether_it_is_selected() {
         let nodes = a11y_nodes(|ui| {
             combo_item(ui, "Hold", false);
             combo_item(ui, "Toggle", true);
@@ -1460,7 +1512,7 @@ mod tests {
                     &mut "Ctrl+Backslash".into(),
                     "Ctrl+Backslash",
                     CONTROL_W,
-                    false,
+                    None,
                 );
             });
             row(
@@ -1475,6 +1527,46 @@ mod tests {
         named(&nodes, Role::TextInput, "Hotkey");
         let opener = named(&nodes, Role::Button, "API key");
         assert_eq!(opener.value(), Some("Configured"));
+    }
+
+    /// A rejected field says why, in place of the row's caption.
+    #[test]
+    fn an_invalid_field_reports_its_error() {
+        let nodes = a11y_nodes(|ui| {
+            row(ui, "Hotkey", "Push-to-talk key combination.", |ui| {
+                text_input(ui, &mut "Ctrl+".into(), "", CONTROL_W, Some("No key"));
+            });
+        });
+        let field = named(&nodes, Role::TextInput, "Hotkey");
+        assert_eq!(field.description(), Some("No key"));
+        assert_eq!(field.invalid(), Some(egui::accesskit::Invalid::True));
+    }
+
+    /// Every rule's controls look alike, so each says which rule it is in.
+    #[test]
+    fn a_rule_s_controls_say_which_rule_they_belong_to() {
+        let nodes = a11y_nodes(|ui| {
+            let mut rule = crate::config::Replacement::default();
+            ui.push_id(1, |ui| replacement_editor(ui, &mut rule, 2));
+        });
+        named(&nodes, Role::Switch, "Rule 2");
+        named(&nodes, Role::TextInput, "Rule 2 hears");
+        named(&nodes, Role::TextInput, "Rule 2 writes");
+        named(&nodes, Role::CheckBox, "Rule 2 whole word");
+        named(&nodes, Role::CheckBox, "Rule 2 match case");
+        named(&nodes, Role::Button, "Remove rule 2");
+    }
+
+    /// A progress bar says what is in progress and how far along it is.
+    #[test]
+    fn a_progress_bar_reports_how_far_along_it_is() {
+        let nodes = a11y_nodes(|ui| {
+            let bar = ui.add(egui::ProgressBar::new(0.42));
+            announce_progress(&bar, "Downloading local model", 0.42, "280 of 670 MB");
+        });
+        let bar = named(&nodes, Role::ProgressIndicator, "Downloading local model");
+        assert_eq!(bar.numeric_value(), Some(42.0));
+        assert_eq!(bar.value(), Some("280 of 670 MB"));
     }
 
     /// Buttons say what they do, and a Save with nothing to save says it is

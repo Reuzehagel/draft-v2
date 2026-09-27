@@ -444,7 +444,7 @@ fn replacement_rows(
         }
         let key = keys.key(i);
         if ui
-            .push_id(("repl_rule", key), |ui| replacement_editor(ui, rule))
+            .push_id(("repl_rule", key), |ui| replacement_editor(ui, rule, i + 1))
             .inner
         {
             remove = Some(i);
@@ -942,13 +942,14 @@ impl SettingsApp {
                         .as_ref()
                         .map(|p| (format_progress_label(p), progress_fraction(p)))
                         .unwrap_or_else(|| ("Starting download…".into(), 0.0));
-                    ui.add(
+                    let bar = ui.add(
                         egui::ProgressBar::new(pct)
                             .desired_width(CONTROL_W)
                             .desired_height(6.0)
                             .rounding(Rounding::same(3.0))
                             .fill(PRIMARY),
                     );
+                    announce_progress(&bar, "Downloading local model", pct, &label);
                     ui.add_space(5.0);
                     ui.label(RichText::new(label).size(11.5).color(MUTED_FG).monospace());
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -1049,7 +1050,7 @@ impl SettingsApp {
                     .desired_width(f32::INFINITY)
                     .hint_text(hint("e.g.  Janssen\n      kubectl\n      Reson8")),
             );
-            name_field(&resp, "Custom vocabulary");
+            name_control(&resp, "Custom vocabulary");
             if resp.changed() {
                 self.cfg.vocabulary = self
                     .vocab_buffer
@@ -1162,7 +1163,7 @@ impl SettingsApp {
                     .hint_text(hint("Search transcripts…"))
                     .vertical_align(egui::Align::Center),
             );
-            name_field(&search, "Search transcripts");
+            name_control(&search, "Search transcripts");
             ui.add_space(10.0);
 
             // Case-insensitive substring match over text and provider. Computed
@@ -1203,7 +1204,13 @@ impl SettingsApp {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(ghost_button("Copy", copy_w, 28.0)).clicked() {
+                        let resp = ui.add(ghost_button("Copy", copy_w, 28.0));
+                        // Every entry's button reads "Copy"; say whose it is.
+                        name_control(
+                            &resp,
+                            &format!("Copy transcript, {}", relative_time(now, entry.ts)),
+                        );
+                        if resp.clicked() {
                             copy = Some(entry.text.clone());
                         }
                     });
@@ -1336,7 +1343,7 @@ impl SettingsApp {
                             .hint_text(hint("paste key…"))
                             .vertical_align(egui::Align::Center),
                     );
-                    name_field(&field, &format!("{} API key", dlg.provider.label()));
+                    name_control(&field, &format!("{} API key", dlg.provider.label()));
                     ui.add_space(8.0);
                     let eye = if dlg.reveal { "Hide" } else { "Show" };
                     if ui.add(ghost_button(eye, show_w, CONTROL_H)).clicked() {
@@ -1537,7 +1544,7 @@ fn hotkey_row(
     error: Option<&str>,
 ) {
     row(ui, label, caption, |ui| {
-        if text_input(ui, spec, placeholder, CONTROL_W, error.is_some()).changed() {
+        if text_input(ui, spec, placeholder, CONTROL_W, error).changed() {
             ui.ctx().request_repaint();
         }
     });
