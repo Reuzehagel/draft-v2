@@ -8,6 +8,7 @@ pub mod openai_compat;
 pub mod parakeet;
 pub mod parakeet_download;
 pub mod reson8;
+pub mod vocabulary;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -153,48 +154,54 @@ fn build_primary(cfg: &crate::config::Config, timeout: Duration) -> Option<Arc<d
     }
     use crate::config::Provider;
     use openai_compat::OpenAiCompatTranscriber;
-    // Baked in at construction so no downstream caller can forget to pass it
-    // and silently disable biasing on prompt-capable providers.
-    let vocab = || vocab_prompt(&cfg.vocabulary);
+    // Normalised once and baked in at construction, so no downstream caller
+    // can forget to pass it and silently disable biasing.
+    let vocab = vocabulary::hint_terms(&cfg.vocabulary);
     match cfg.provider {
         Provider::LocalParakeet => local_parakeet(),
         Provider::Mistral => {
             let key = crate::secrets::load_key(Provider::Mistral)?;
-            arc(mistral::MistralTranscriber::new(key, timeout), "Mistral")
+            arc(
+                mistral::MistralTranscriber::new(key, timeout, &vocab),
+                "Mistral",
+            )
         }
         Provider::Reson8 => {
             let key = crate::secrets::load_key(Provider::Reson8)?;
-            arc(reson8::Reson8Transcriber::new(key, timeout), "Reson8")
+            arc(
+                reson8::Reson8Transcriber::new(key, timeout, &vocab),
+                "Reson8",
+            )
         }
         Provider::Groq => {
             let key = crate::secrets::load_key(Provider::Groq)?;
-            arc(OpenAiCompatTranscriber::groq(key, timeout, vocab()), "Groq")
+            arc(OpenAiCompatTranscriber::groq(key, timeout, &vocab), "Groq")
         }
         Provider::Openai => {
             let key = crate::secrets::load_key(Provider::Openai)?;
             arc(
-                OpenAiCompatTranscriber::openai(key, timeout, vocab()),
+                OpenAiCompatTranscriber::openai(key, timeout, &vocab),
                 "OpenAI",
             )
         }
         Provider::Elevenlabs => {
             let key = crate::secrets::load_key(Provider::Elevenlabs)?;
             arc(
-                elevenlabs::ElevenLabsTranscriber::new(key, timeout),
+                elevenlabs::ElevenLabsTranscriber::new(key, timeout, &vocab),
                 "ElevenLabs",
             )
         }
     }
 }
 
-/// Build the free-text vocabulary hint for prompt-based providers (OpenAI,
-/// Groq) from the user's term list. Whisper's prompt window is ~224 tokens;
-/// stay well under it by skipping terms past a character budget — and say so,
-/// rather than silently truncating mid-term.
+/// Render the vocabulary hint as Groq's free-text Whisper prompt: the terms
+/// comma-joined in list order. Whisper's prompt window is ~224 tokens; stay
+/// well under it with a character budget that terms nearer the top claim
+/// first. A term that no longer fits is skipped and logged, never truncated
+/// mid-term; a shorter one after it may still fit.
 pub fn vocab_prompt(terms: &[String]) -> Option<String> {
     const MAX_CHARS: usize = 600;
     let mut out = String::new();
-    let mut dropped = 0usize;
     for term in terms {
         let term = term.trim();
         if term.is_empty() {
@@ -202,20 +209,18 @@ pub fn vocab_prompt(terms: &[String]) -> Option<String> {
         }
         let sep = if out.is_empty() { 0 } else { 2 };
         if out.len() + sep + term.len() > MAX_CHARS {
-            dropped += 1;
+            tracing::warn!(
+                provider = "groq",
+                term,
+                reason = "past the prompt's character budget",
+                "vocabulary term not sent"
+            );
             continue;
         }
         if sep > 0 {
             out.push_str(", ");
         }
         out.push_str(term);
-    }
-    if dropped > 0 {
-        tracing::warn!(
-            dropped,
-            "custom vocabulary exceeds the provider prompt budget; \
-             later terms were not sent"
-        );
     }
     (!out.is_empty()).then_some(out)
 }

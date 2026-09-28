@@ -875,9 +875,9 @@ impl SettingsApp {
             ui.label(
                 RichText::new(
                     "Words your provider keeps mishearing — names, jargon, \
-                     product terms. One per line. OpenAI and Groq take these \
-                     as a hint; other providers ignore them, so use a \
-                     replacement rule there instead.",
+                     product terms. One per line, up to 100; put the ones \
+                     that matter most first. The local model ignores these, \
+                     so use a replacement rule there instead.",
                 )
                 .size(11.5)
                 .color(MUTED_FG),
@@ -892,6 +892,10 @@ impl SettingsApp {
             name_control(&resp, "Custom vocabulary");
             if resp.changed() {
                 self.form.vocabulary_edited();
+            }
+            if let Some(caption) = self.form.vocabulary_count().caption() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(caption).size(11.5).color(MUTED_FG));
             }
         });
     }
