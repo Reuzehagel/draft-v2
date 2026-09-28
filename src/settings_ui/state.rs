@@ -6,6 +6,7 @@
 
 use crate::config::{Config, Provider};
 use crate::secrets::{self, KeySource, KeyWrite};
+use crate::transcribe::vocabulary;
 
 /// Picker order for the Provider dropdown, and the set of Providers the window
 /// knows. Which of them take an API key is `secrets::slot_name`'s to say.
@@ -118,6 +119,25 @@ impl Store for SystemStore {
     }
 }
 
+/// The vocabulary's unique terms, and how many of them are used.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct VocabularyCount {
+    pub used: usize,
+    pub total: usize,
+}
+
+impl VocabularyCount {
+    /// The note under the vocabulary box, when some terms go unused.
+    pub fn caption(&self) -> Option<String> {
+        (self.total > self.used).then(|| {
+            format!(
+                "{} terms — only the first {} are used.",
+                self.total, self.used
+            )
+        })
+    }
+}
+
 /// Everything the Settings window edits, and what it last loaded or saved.
 pub(super) struct Form {
     pub cfg: Config,
@@ -208,6 +228,16 @@ impl Form {
             .filter(|l| !l.is_empty())
             .map(String::from)
             .collect();
+    }
+
+    /// How many vocabulary terms a Provider is handed, of how many the list
+    /// holds — counted by the same normalisation the transcription path uses.
+    pub fn vocabulary_count(&self) -> VocabularyCount {
+        let total = vocabulary::unique_terms(&self.cfg.vocabulary).len();
+        VocabularyCount {
+            used: total.min(vocabulary::MAX_TERMS),
+            total,
+        }
     }
 
     /// Writes everything out; `Err` is the message to show. Stops at the first
@@ -457,6 +487,44 @@ mod tests {
         form.vocab_buffer.push('\n');
         form.vocabulary_edited();
         assert!(!form.is_dirty());
+    }
+
+    fn with_vocabulary(terms: impl IntoIterator<Item = String>) -> Form {
+        let cfg = Config {
+            vocabulary: terms.into_iter().collect(),
+            ..Config::default()
+        };
+        Form::new(cfg, [], false)
+    }
+
+    #[test]
+    fn a_hundred_and_one_terms_are_captioned() {
+        let form = with_vocabulary((0..101).map(|i| format!("term{i}")));
+        assert_eq!(
+            form.vocabulary_count(),
+            VocabularyCount {
+                used: 100,
+                total: 101
+            }
+        );
+        assert_eq!(
+            form.vocabulary_count().caption().as_deref(),
+            Some("101 terms — only the first 100 are used.")
+        );
+    }
+
+    #[test]
+    fn a_hundred_terms_are_not_captioned() {
+        let form = with_vocabulary((0..100).map(|i| format!("term{i}")));
+        assert_eq!(form.vocabulary_count().caption(), None);
+    }
+
+    #[test]
+    fn repeats_do_not_count_toward_the_caption() {
+        let terms = (0..100).map(|i| format!("term{i}"));
+        let form = with_vocabulary(terms.clone().chain(terms.take(20)));
+        assert_eq!(form.vocabulary_count().total, 100);
+        assert_eq!(form.vocabulary_count().caption(), None);
     }
 
     #[test]

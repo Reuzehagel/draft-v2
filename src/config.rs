@@ -26,9 +26,11 @@ pub struct Config {
     /// "scratch that", "all caps") out of the transcript before paste.
     pub voice_commands: bool,
     /// Custom vocabulary: proper nouns and jargon the recognizer should bias
-    /// toward. Sent natively to providers that take a hint (OpenAI and Groq's
-    /// `prompt` field); providers without biasing support ignore it — use a
-    /// replacement rule there instead.
+    /// toward, most important first. Normalised (trimmed, blanks and repeats
+    /// dropped) and capped at the first 100 terms by
+    /// `transcribe::vocabulary::hint_terms`, then sent in each cloud
+    /// Provider's native field; local Parakeet ignores it — use a replacement
+    /// rule there instead. Kept as written: a longer list is never trimmed.
     pub vocabulary: Vec<String>,
     /// When the cloud provider errors out (network down, timeout, 5xx),
     /// transcribe locally with Parakeet instead of losing the dictation.
