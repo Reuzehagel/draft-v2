@@ -58,3 +58,44 @@ impl Buffer {
         f(&buf[start..])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ramp(from: usize, to: usize) -> Vec<f32> {
+        (from..to).map(|i| i as f32).collect()
+    }
+
+    /// Past the cap the *oldest* audio goes and what's kept stays in order —
+    /// the end of a long dictation is what the user just said.
+    #[test]
+    fn past_the_cap_the_oldest_samples_are_dropped() {
+        let b = Buffer::new(4, 10);
+        b.extend(&ramp(0, 6));
+        b.extend(&ramp(6, 13));
+        assert_eq!(b.take(), ramp(3, 13));
+    }
+
+    /// One chunk at least as large as the cap replaces everything with its own
+    /// tail, rather than panicking in the shift.
+    #[test]
+    fn a_chunk_larger_than_the_cap_keeps_its_own_tail() {
+        let b = Buffer::new(4, 10);
+        b.extend(&ramp(0, 5));
+        b.extend(&ramp(100, 125));
+        assert_eq!(b.take(), ramp(115, 125));
+    }
+
+    /// The meter asks for more than a short capture holds; it gets what there
+    /// is, newest last. `take` drains, so the next session starts empty.
+    #[test]
+    fn the_tail_is_what_there_is_and_take_drains() {
+        let b = Buffer::new(4, 10);
+        b.extend(&ramp(0, 3));
+        assert_eq!(b.with_tail(1024, <[f32]>::to_vec), ramp(0, 3));
+        assert_eq!(b.with_tail(2, <[f32]>::to_vec), ramp(1, 3));
+        assert_eq!(b.take(), ramp(0, 3));
+        assert!(b.take().is_empty());
+    }
+}

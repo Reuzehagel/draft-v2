@@ -99,3 +99,34 @@ fn newer_than(latest: &str, current: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::newer_than;
+
+    /// Numeric, not lexical: 2.10 is after 2.9.
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(newer_than("2.10.0", "2.9.0"));
+        assert!(!newer_than("2.9.0", "2.10.0"));
+        assert!(newer_than("3.0.0", "2.99.99"));
+    }
+
+    /// A missing component is zero, so a short tag neither announces an update
+    /// for the release you're on nor hides a real one.
+    #[test]
+    fn a_short_version_reads_its_missing_parts_as_zero() {
+        assert!(!newer_than("2.2", "2.2.0"));
+        assert!(!newer_than("2.2.0", "2.2"));
+        assert!(!newer_than("2.2", "2.2.5"));
+        assert!(newer_than("2.2.1", "2.2"));
+    }
+
+    #[test]
+    fn the_same_version_is_not_an_update() {
+        assert!(!newer_than(
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+}

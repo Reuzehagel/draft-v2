@@ -136,8 +136,24 @@ fn wait_for_modifier_release() {
 }
 
 fn type_unicode(text: &str, on_sent: impl FnOnce()) -> Result<()> {
-    // Per character: one keydown + one keyup with KEYEVENTF_UNICODE.
-    // Surrogate pairs need to be emitted as two separate inputs.
+    let inputs = unicode_inputs(text);
+    if inputs.is_empty() {
+        on_sent();
+        return Ok(());
+    }
+    wait_for_modifier_release();
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n as usize != inputs.len() {
+        anyhow::bail!("SendInput sent {} of {} unicode events", n, inputs.len());
+    }
+    on_sent();
+    Ok(())
+}
+
+/// The keystrokes that type `text`. Per character: one keydown + one keyup
+/// with KEYEVENTF_UNICODE; surrogate pairs need to be emitted as two separate
+/// inputs.
+fn unicode_inputs(text: &str) -> Vec<INPUT> {
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.encode_utf16().count() * 2);
     let mut utf16 = [0u16; 2];
     for ch in text.chars() {
@@ -158,17 +174,7 @@ fn type_unicode(text: &str, on_sent: impl FnOnce()) -> Result<()> {
             }
         }
     }
-    if inputs.is_empty() {
-        on_sent();
-        return Ok(());
-    }
-    wait_for_modifier_release();
-    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if n as usize != inputs.len() {
-        anyhow::bail!("SendInput sent {} of {} unicode events", n, inputs.len());
-    }
-    on_sent();
-    Ok(())
+    inputs
 }
 
 fn send_ctrl_v() -> Result<()> {
@@ -221,5 +227,68 @@ fn unicode_event(unit: u16, key_up: bool) -> INPUT {
                 dwExtraInfo: 0,
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (wVk, wScan, key up) for each input — what the target app sees.
+    fn keys(text: &str) -> Vec<(u16, u16, bool)> {
+        unicode_inputs(text)
+            .iter()
+            .map(|i| {
+                // SAFETY: `unicode_inputs` builds only INPUT_KEYBOARD inputs,
+                // so `ki` is the variant that was written.
+                let ki = unsafe { i.Anonymous.ki };
+                assert_eq!(i.r#type, INPUT_KEYBOARD);
+                (ki.wVk.0, ki.wScan, ki.dwFlags.contains(KEYEVENTF_KEYUP))
+            })
+            .collect()
+    }
+
+    /// Each character is a press and a release of its own code unit.
+    #[test]
+    fn a_character_is_typed_as_its_unicode_unit() {
+        assert_eq!(
+            keys("hé"),
+            [
+                (0, 'h' as u16, false),
+                (0, 'h' as u16, true),
+                (0, 0xE9, false),
+                (0, 0xE9, true)
+            ]
+        );
+    }
+
+    /// A line break is a real Return, whichever convention the transcript
+    /// uses: a CRLF must not become two lines.
+    #[test]
+    fn a_line_break_is_one_return_whatever_its_convention() {
+        let ret = VK_RETURN.0;
+        let expected = [(ret, 0, false), (ret, 0, true)];
+        assert_eq!(keys("\n"), expected);
+        assert_eq!(keys("\r\n"), expected);
+    }
+
+    /// Outside the BMP a character is two UTF-16 units, sent in order.
+    #[test]
+    fn an_emoji_is_typed_as_its_surrogate_pair() {
+        assert_eq!(
+            keys("😀"),
+            [
+                (0, 0xD83D, false),
+                (0, 0xD83D, true),
+                (0, 0xDE00, false),
+                (0, 0xDE00, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_to_type_is_no_input() {
+        assert!(unicode_inputs("").is_empty());
+        assert!(unicode_inputs("\r").is_empty());
     }
 }

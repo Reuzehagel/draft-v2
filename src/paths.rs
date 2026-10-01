@@ -41,3 +41,32 @@ pub fn atomic_write(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Resul
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Config and history are both rewritten through here, over a file that
+    /// already exists — the rename has to replace it, not fail on it, and the
+    /// temp sibling must not be left lying next to the user's config.
+    #[test]
+    fn an_atomic_write_replaces_the_file_and_leaves_no_temp_behind() {
+        let dir = std::env::temp_dir().join("draft-paths-tests");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "hotkey = \"old\"\nprovider = \"groq\"\n").unwrap();
+
+        atomic_write(&path, "hotkey = \"new\"\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hotkey = \"new\"\n"
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.toml"]);
+    }
+}
