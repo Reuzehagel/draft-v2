@@ -44,6 +44,11 @@
 
     <Media Id="1" Cabinet="draft.cab" EmbedCab="yes" />
 
+    <!-- The mark, for Add/Remove Programs and the Start menu shortcut: the
+         same file build.rs embeds in the exes (drawn by src/mark.rs). -->
+    <Icon Id="DraftIcon" SourceFile="assets\draft.ico" />
+    <Property Id="ARPPRODUCTICON" Value="DraftIcon" />
+
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">
         <Directory Id="ProgramsFolder" Name="Programs">
@@ -77,6 +82,7 @@
                       Name="Draft"
                       Description="Push-to-talk speech-to-text"
                       Target="[APPLICATIONFOLDER]draft.exe"
+                      Icon="DraftIcon"
                       WorkingDirectory="APPLICATIONFOLDER" />
             <RemoveFolder Id="RemoveShortcutFolder" On="uninstall" />
             <RegistryValue Root="HKCU"

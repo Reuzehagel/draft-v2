@@ -13,14 +13,12 @@
 // [`desk_changes`]); neither is polled.
 
 use anyhow::Result;
-use tiny_skia::{FillRule, LineCap, Paint, Pixmap, Stroke, Transform};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIcon, TrayIconBuilder,
 };
 
 use crate::config::Provider;
-use crate::pill::icons::parse;
 
 pub struct Tray {
     icon: TrayIcon,
@@ -129,92 +127,13 @@ fn ink(taskbar: Taskbar) -> [u8; 3] {
     }
 }
 
-/// The icon as straight RGBA, `look.px` square: a microphone in the one ink.
-///
-/// Laid out in whole pixels rather than scaled from a fixed grid, because a
-/// scaled grid is only sharp at the size it was drawn for — at 150% every
-/// 1px stroke of a 16px design lands on half pixels and blurs. Here the stroke
-/// is a whole number of pixels at every size, and every edge that runs along
-/// an axis (the stand, the cradle's sides and its foot) sits on a pixel
-/// boundary. Only the curves are anti-aliased.
+/// The icon as straight RGBA, `look.px` square: the mark (`crate::mark`) in
+/// the one ink, drawn at exactly the size the tray shows it.
 fn icon_rgba(look: Look) -> Vec<u8> {
-    let px = look.px;
-    let s = px as f32;
-    let u = s / 16.0;
-    // Stroke width, in whole pixels.
-    let w = u.round().max(1.0);
-    // A centre that puts a `w`-wide vertical stroke on pixel boundaries: half
-    // a pixel off the middle when the stroke is odd.
-    let cx = ((s - w) / 2.0).floor() + w / 2.0;
-    // Margin top and bottom, and the stand's length.
-    let t = u.round().max(1.0);
-    let stand = (2.0 * u).round();
-    // The cradle. An integer radius keeps its sides on pixel boundaries; its
-    // foot's bottom edge is where the stand starts.
-    let r = (5.0 * u).round();
-    let foot = s - t - stand;
-    let cy = foot - w / 2.0 - r;
-    let sides_top = (cy - 0.3 * r).round();
-    // The capsule: half the cradle's inner width, as Lucide's `mic` has it.
-    let gap = ((r - w / 2.0) / 2.0).round().max(1.0);
-    let half = r - w / 2.0 - gap;
-    let capsule_bottom = cy + (0.4 * r).round();
-
-    let capsule = format!(
-        "M{l} {y1}a{half} {half} 0 0 1 {cw} 0V{y2}a{half} {half} 0 0 1 -{cw} 0z",
-        l = cx - half,
-        y1 = t + half,
-        cw = 2.0 * half,
-        y2 = capsule_bottom - half,
-    );
-    let cradle = format!(
-        "M{l} {sides_top}V{cy}a{r} {r} 0 0 0 {d} 0V{sides_top}",
-        l = cx - r,
-        d = 2.0 * r,
-    );
-    let stem = format!("M{cx} {foot}V{end}", end = s - t);
-
-    let mut pm = Pixmap::new(px, px).expect("non-zero icon size");
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(255, 255, 255, 255);
-    paint.anti_alias = true;
-    if let Some(path) = parse(&capsule) {
-        pm.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-    }
-    let stroke = Stroke {
-        width: w,
-        line_cap: LineCap::Butt,
-        ..Stroke::default()
-    };
-    for d in [cradle, stem] {
-        if let Some(path) = parse(&d) {
-            pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-        }
-    }
-
-    // Drawn in opaque white, so each pixel's alpha is its coverage.
-    let mut coverage: Vec<u8> = pm.pixels().iter().map(|p| p.alpha()).collect();
-    // The right half is the left one mirrored about the stand. The rasteriser's
-    // anti-aliasing of a curve isn't mirror-exact, and at 16px a 30/255
-    // difference between the cradle's two sides is a visibly lopsided icon.
-    let axis2 = (2.0 * cx) as u32 - 1;
-    for y in 0..px {
-        let row = &mut coverage[(y * px) as usize..((y + 1) * px) as usize];
-        for x in (axis2 / 2 + 1)..px {
-            row[x as usize] = axis2.checked_sub(x).map_or(0, |m| row[m as usize]);
-        }
-    }
-
     // The ink goes under the coverage unpremultiplied, which is what
     // `Icon::from_rgba` takes.
     let [r, g, b] = ink(look.taskbar);
-    coverage
+    crate::mark::tray(look.px)
         .into_iter()
         .flat_map(|a| match a {
             0 => [0; 4],
@@ -402,6 +321,7 @@ mod win {
 mod tests {
     use super::*;
     use crate::config::Provider;
+    use tiny_skia::Pixmap;
 
     fn status() -> Status {
         Status {
@@ -479,10 +399,6 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
-    fn alpha(rgba: &[u8], px: u32, x: u32, y: u32) -> u8 {
-        rgba[((y * px + x) * 4 + 3) as usize]
-    }
-
     #[test]
     fn the_ink_stands_out_from_either_taskbar() {
         for t in TASKBARS {
@@ -517,90 +433,6 @@ mod tests {
                 taskbar: Taskbar::Dark,
             });
             assert_eq!(rgba.len(), (px * px * 4) as usize, "{px}px");
-        }
-    }
-
-    #[test]
-    fn the_glyph_fills_most_of_the_icon_and_stays_off_its_edges() {
-        for px in SIZES {
-            let rgba = icon_rgba(Look {
-                px,
-                taskbar: Taskbar::Dark,
-            });
-            let inked: Vec<(u32, u32)> = (0..px)
-                .flat_map(|y| (0..px).map(move |x| (x, y)))
-                .filter(|&(x, y)| alpha(&rgba, px, x, y) > 0)
-                .collect();
-            let (min_x, max_x) = (
-                inked.iter().map(|p| p.0).min().unwrap(),
-                inked.iter().map(|p| p.0).max().unwrap(),
-            );
-            let (min_y, max_y) = (
-                inked.iter().map(|p| p.1).min().unwrap(),
-                inked.iter().map(|p| p.1).max().unwrap(),
-            );
-            assert!(min_x > 0 && min_y > 0, "{px}px touches the top/left edge");
-            assert!(
-                max_x < px - 1 && max_y < px - 1,
-                "{px}px touches the bottom/right edge"
-            );
-            // Tall enough to read as an icon, not a dot.
-            assert!(max_y - min_y + 1 >= px * 3 / 4, "{px}px: too short");
-        }
-    }
-
-    /// The lowest row with any ink, which is the foot of the stand.
-    fn stand_row(rgba: &[u8], px: u32) -> u32 {
-        (0..px)
-            .rev()
-            .find(|&y| (0..px).any(|x| alpha(rgba, px, x, y) > 0))
-            .expect("an empty icon")
-    }
-
-    #[test]
-    fn the_stand_is_a_solid_column_at_every_size() {
-        // Crispness where it is checkable: the stand is the one purely axis-
-        // aligned stroke, so at every size it must be fully opaque pixels with
-        // fully clear ones either side — no half-covered column of blur.
-        for px in SIZES {
-            let rgba = icon_rgba(Look {
-                px,
-                taskbar: Taskbar::Dark,
-            });
-            let row = stand_row(&rgba, px);
-            let cols: Vec<u8> = (0..px).map(|x| alpha(&rgba, px, x, row)).collect();
-            assert!(
-                cols.iter().all(|&a| a == 0 || a == 255),
-                "{px}px stand row blurs: {cols:?}"
-            );
-            assert!(cols.contains(&255), "{px}px has no stand: {cols:?}");
-        }
-    }
-
-    #[test]
-    fn the_glyph_is_symmetric_about_its_stand() {
-        // The layout's centre is chosen to put the stand on pixel boundaries,
-        // which is half a pixel off the icon's middle for odd strokes. Whatever
-        // it lands on, the microphone has to be symmetric about it.
-        for px in SIZES {
-            let rgba = icon_rgba(Look {
-                px,
-                taskbar: Taskbar::Dark,
-            });
-            let row = stand_row(&rgba, px);
-            let stand: Vec<u32> = (0..px).filter(|&x| alpha(&rgba, px, x, row) > 0).collect();
-            // Twice the axis, so an axis between two pixels stays an integer.
-            let axis2 = stand[0] + stand[stand.len() - 1];
-            for y in 0..px {
-                for x in 0..px {
-                    let Some(mirror) = axis2.checked_sub(x).filter(|&m| m < px) else {
-                        assert_eq!(alpha(&rgba, px, x, y), 0, "{px}px ({x},{y})");
-                        continue;
-                    };
-                    let (a, b) = (alpha(&rgba, px, x, y), alpha(&rgba, px, mirror, y));
-                    assert_eq!(a, b, "{px}px ({x},{y})");
-                }
-            }
         }
     }
 

@@ -1,0 +1,2 @@
+// The first icon in the exe is the one Windows shows for it.
+1 ICON "draft.ico"
