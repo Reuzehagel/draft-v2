@@ -73,7 +73,13 @@ pub fn run() -> anyhow::Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([760.0, 560.0])
         .with_min_inner_size([680.0, 460.0])
-        .with_title("Draft — Settings");
+        .with_title("Draft — Settings")
+        // Without one eframe shows egui's logo in the title bar and taskbar.
+        .with_icon(egui::IconData {
+            rgba: crate::mark::app_rgba(64),
+            width: 64,
+            height: 64,
+        });
 
     let options = eframe::NativeOptions {
         viewport,

@@ -92,3 +92,6 @@ strip = "symbols"
 
 [profile.dev]
 opt-level = 1
+
+[build-dependencies]
+embed-resource = "3.0.11"

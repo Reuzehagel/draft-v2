@@ -14,6 +14,7 @@ mod alloc_count;
 mod autostart;
 mod hotkey;
 mod llm;
+mod mark;
 mod paste;
 mod pill;
 mod session;
