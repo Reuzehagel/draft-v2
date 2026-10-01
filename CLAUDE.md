@@ -8,6 +8,8 @@ There is no CI — run `cargo test`, `cargo clippy` and `cargo fmt --check` loca
 
 `#[ignore]`d tests are tools that write files instead of asserting: `cargo test -- --ignored tray::tests::preview` draws the tray icon at every scale, on both taskbars, to `target/tray-preview/`. The pill's preview and frame bench are in `src/pill/CLAUDE.md`.
 
+To look at the settings window, `cargo build` then `Start-Process .\target\debug\draft.exe -ArgumentList '--settings-preview' -Wait` (from the repo root): it opens the real window over your config, shows each pane, and saves them to `target/settings-preview/` as `01-recording.png`… before closing itself. It only looks — nothing is edited or saved.
+
 `cargo test` and `cargo clippy` build the test harness, not `target/debug/draft.exe` — `cargo build` before launching. Launch the exe from PowerShell (`Start-Process .\draft.exe`); from Git Bash it exits 127 with no output. The single-instance gate means the user's running Draft must be closed first, or the new process exits at once.
 
 ## Branches and PRs
