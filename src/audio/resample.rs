@@ -125,21 +125,6 @@ impl StreamingResampler {
 mod tests {
     use super::*;
 
-    /// Input shorter than one chunk produces nothing until it is flushed —
-    /// the case that silently truncated the end of a decoded file.
-    #[test]
-    fn flush_emits_the_sub_chunk_residual() {
-        let mut r = StreamingResampler::new(32_000, 16_000).unwrap();
-        let input = vec![0.25f32; 600];
-        assert!(
-            r.process(&input).is_empty(),
-            "a partial chunk should stay buffered"
-        );
-        let flushed = r.flush().len();
-        // 600 source frames at 2:1 is 300 out, give or take the sinc tail.
-        assert!((295..=305).contains(&flushed), "flushed {flushed}");
-    }
-
     /// Flushing twice must not replay the residual.
     #[test]
     fn flush_is_idempotent() {

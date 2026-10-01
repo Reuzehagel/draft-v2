@@ -198,15 +198,12 @@ fn build_primary(cfg: &crate::config::Config, timeout: Duration) -> Option<Arc<d
 /// comma-joined in list order. Whisper's prompt window is ~224 tokens; stay
 /// well under it with a character budget that terms nearer the top claim
 /// first. A term that no longer fits is skipped and logged, never truncated
-/// mid-term; a shorter one after it may still fit.
+/// mid-term; a shorter one after it may still fit. `terms` is the normalised
+/// vocabulary hint (`vocabulary::hint_terms`): already trimmed, no blanks.
 pub fn vocab_prompt(terms: &[String]) -> Option<String> {
     const MAX_CHARS: usize = 600;
     let mut out = String::new();
     for term in terms {
-        let term = term.trim();
-        if term.is_empty() {
-            continue;
-        }
         let sep = if out.is_empty() { 0 } else { 2 };
         if out.len() + sep + term.len() > MAX_CHARS {
             tracing::warn!(
@@ -352,15 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn vocab_prompt_joins_and_skips_blanks() {
-        let terms: Vec<String> = vec!["Reson8".into(), "   ".into(), "egui".into()];
-        assert_eq!(vocab_prompt(&terms).as_deref(), Some("Reson8, egui"));
-    }
-
-    #[test]
     fn vocab_prompt_empty_is_none() {
         assert_eq!(vocab_prompt(&[]), None);
-        assert_eq!(vocab_prompt(&["  ".into()]), None);
     }
 
     #[test]
