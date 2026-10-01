@@ -238,3 +238,62 @@ pub fn shape_bars(raw: &[f32], out: &mut [f32]) {
         *o = (v * mult).clamp(0.0, 1.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BANDS: usize = 9;
+
+    fn tone(hz: f32, amp: f32) -> Buffer {
+        let b = Buffer::new(FFT_SIZE, FFT_SIZE * 4);
+        let samples: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| amp * (std::f32::consts::TAU * hz * i as f32 / TARGET_SR as f32).sin())
+            .collect();
+        b.extend(&samples);
+        b
+    }
+
+    fn targets(buffer: &Buffer) -> Vec<f32> {
+        let mut m = BandMeter::new(BANDS);
+        m.compute_band_targets(buffer);
+        m.targets.clone()
+    }
+
+    fn loudest(levels: &[f32]) -> usize {
+        (0..levels.len())
+            .max_by(|&a, &b| levels[a].total_cmp(&levels[b]))
+            .unwrap()
+    }
+
+    /// The bars are a spectrum, low on the left: a low voice lights the low
+    /// bands, a high one the high bands, and each tone lights a band of its own.
+    #[test]
+    fn a_tone_lights_the_band_its_pitch_falls_in() {
+        let low = targets(&tone(150.0, 0.3));
+        let mid = targets(&tone(700.0, 0.3));
+        let high = targets(&tone(3_000.0, 0.3));
+        let (l, m, h) = (loudest(&low), loudest(&mid), loudest(&high));
+        assert!(l < m && m < h, "bands {l}, {m}, {h} should rise with pitch");
+        assert!(low[l] > 0.5, "a speaking-level tone reads well up the bar");
+    }
+
+    /// Silence, or no audio yet, raises no band — what the pill shows then is
+    /// the idle wave alone.
+    #[test]
+    fn silence_raises_no_band() {
+        assert!(targets(&tone(700.0, 0.0)).iter().all(|&t| t == 0.0));
+        assert!(targets(&Buffer::new(0, 16)).iter().all(|&t| t == 0.0));
+    }
+
+    /// Louder speech, taller bars — up to the top and no further.
+    #[test]
+    fn a_louder_tone_reads_taller_and_never_past_full() {
+        let quiet = targets(&tone(700.0, 0.01));
+        let loud = targets(&tone(700.0, 0.3));
+        let band = loudest(&loud);
+        assert!(loud[band] > quiet[band]);
+        let clipped = targets(&tone(700.0, 1.0));
+        assert!(clipped.iter().all(|&t| (0.0..=1.0).contains(&t)));
+    }
+}

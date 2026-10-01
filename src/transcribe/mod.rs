@@ -362,4 +362,26 @@ mod tests {
         assert!(p.starts_with("term000xxxxxxxxxx, term001xxxxxxxxxx"));
         assert!(!p.ends_with(','));
     }
+
+    /// What every cloud Provider is sent: a 16-bit mono WAV at the given rate,
+    /// full scale mapped to i16's range, and anything past full scale clipped
+    /// rather than wrapped round to the opposite sign.
+    #[test]
+    fn a_capture_encodes_as_16_bit_mono_wav_and_clips_past_full_scale() {
+        let samples = [0.0, 0.5, -0.5, 1.0, -1.0, 1.7, -3.0];
+        let bytes = samples_to_wav_bytes(&samples, 16_000).unwrap();
+
+        let mut r = hound::WavReader::new(Cursor::new(bytes)).expect("a readable WAV");
+        let spec = r.spec();
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (1, 16_000, 16)
+        );
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        let read: Vec<i16> = r.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(
+            read,
+            [0, 16_383, -16_383, i16::MAX, -i16::MAX, i16::MAX, -i16::MAX]
+        );
+    }
 }
