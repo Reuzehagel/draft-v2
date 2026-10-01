@@ -66,6 +66,15 @@ const MODEL_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--settings-preview") {
+        // A developer's tool: every settings pane, saved as a PNG.
+        let _log_guard = logging::init()?;
+        let dir = args
+            .get(i + 1)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "target/settings-preview".into());
+        return settings_ui::preview::run(dir);
+    }
     if args.iter().any(|a| a == "--settings") {
         // Settings subprocess: own event loop, no single-instance gate,
         // no tray, no hotkey. Runs eframe and writes config when saved.

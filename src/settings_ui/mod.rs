@@ -16,6 +16,7 @@
 // - `format`   — worked-out text: relative times, download progress.
 // - `download` — the model download's shared state and worker.
 // - `focus_trap` — keeps Tab inside an open dialog.
+// - `preview`  — `--settings-preview`: every pane, saved as a PNG.
 // - here       — the app: panes, dialogs, and the frame that draws them.
 // Read the header comments of `theme` and `widgets` before adding UI; they
 // document the layout invariants (measure-then-allocate, bounded
@@ -24,6 +25,7 @@
 mod download;
 mod focus_trap;
 mod format;
+pub mod preview;
 mod state;
 mod theme;
 mod widgets;
@@ -51,44 +53,10 @@ pub fn run() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let app = SettingsApp {
-        tab: Tab::Recording,
-        form: Form::load(cfg),
-        key_dialog: None,
-        save_status: None,
-        download_state: Arc::new(Mutex::new(DownloadState::new(
-            parakeet_download::is_present(),
-        ))),
-        history: crate::history::load(),
-        history_filter: String::new(),
-        confirm_clear_history: false,
-        unsaved_prompt: false,
-        close_confirmed: false,
-        input_devices: crate::audio::capture::input_device_names(),
-        displays: pinnable_displays(),
-        rule_keys: RuleKeys::default(),
-        focus_trap: FocusTrap::default(),
-    };
-
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([760.0, 560.0])
-        .with_min_inner_size([680.0, 460.0])
-        .with_title("Draft — Settings")
-        // Without one eframe shows egui's logo in the title bar and taskbar.
-        .with_icon(egui::IconData {
-            rgba: crate::mark::app_rgba(64),
-            width: 64,
-            height: 64,
-        });
-
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
-
+    let app = SettingsApp::open(cfg);
     eframe::run_native(
         "Draft Settings",
-        options,
+        native_options(),
         Box::new(|cc| {
             install_style(&cc.egui_ctx);
             Ok(Box::new(app))
@@ -96,6 +64,25 @@ pub fn run() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
+}
+
+/// The window `run` and `preview::run` both open — one size, one title, so a
+/// preview shows what the user sees.
+fn native_options() -> eframe::NativeOptions {
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([680.0, 460.0])
+        .with_min_inner_size([620.0, 400.0])
+        .with_title("Draft — Settings")
+        // Without one eframe shows egui's logo in the title bar and taskbar.
+        .with_icon(egui::IconData {
+            rgba: crate::mark::app_rgba(64),
+            width: 64,
+            height: 64,
+        });
+    eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    }
 }
 
 /// Tell the user why Settings didn't open. A plain message box rather than an
@@ -193,19 +180,19 @@ impl Tab {
 
     fn subtitle(self) -> &'static str {
         match self {
-            Tab::Recording => "How Draft listens for your voice.",
-            Tab::Pill => "The overlay that shows what Draft is doing.",
-            Tab::Transcription => "Where your speech becomes text.",
-            Tab::Replacements => "Fix misheard words and expand shorthand before pasting.",
-            Tab::Output => "How the transcript reaches your cursor.",
-            Tab::History => "Recent transcripts — recover anything a paste missed.",
-            Tab::System => "Startup and app behaviour.",
+            Tab::Recording => "How you start and stop dictating.",
+            Tab::Pill => "The indicator at the bottom of your screen.",
+            Tab::Transcription => "The service that turns your speech into text.",
+            Tab::Replacements => "Corrections made to every transcript before it's pasted.",
+            Tab::Output => "How transcripts reach the app you're typing in.",
+            Tab::History => "Every transcript, so you can recover one that didn't paste.",
+            Tab::System => "How Draft starts.",
         }
     }
 }
 
 /// Why Save is off while there are edits, said wherever Save is offered.
-const HOTKEY_BLOCKS_SAVE: &str = "A hotkey needs fixing before you can save.";
+const HOTKEY_BLOCKS_SAVE: &str = "Fix the hotkey before saving.";
 
 /// What one Esc closes: the topmost surface only — a **popup**, else a
 /// **modal card**, else the window.
@@ -353,9 +340,35 @@ fn replacement_rows(
 }
 
 impl SettingsApp {
+    /// The window as it opens over `cfg`: the first pane, nothing edited, and
+    /// the devices, displays and history read once, now.
+    fn open(cfg: Config) -> Self {
+        SettingsApp {
+            tab: Tab::Recording,
+            form: Form::load(cfg),
+            key_dialog: None,
+            save_status: None,
+            download_state: Arc::new(Mutex::new(DownloadState::new(
+                parakeet_download::is_present(),
+            ))),
+            history: crate::history::load(),
+            history_filter: String::new(),
+            confirm_clear_history: false,
+            unsaved_prompt: false,
+            close_confirmed: false,
+            input_devices: crate::audio::capture::input_device_names(),
+            displays: pinnable_displays(),
+            rule_keys: RuleKeys::default(),
+            focus_trap: FocusTrap::default(),
+        }
+    }
+
     fn save(&mut self) {
         self.save_status = Some(match self.form.save(&mut SystemStore) {
-            Ok(()) => (true, "Saved. Applies when this window closes.".into()),
+            Ok(()) => (
+                true,
+                "Saved. Changes apply when you close this window.".into(),
+            ),
             Err(msg) => (false, msg),
         });
     }
@@ -434,7 +447,7 @@ impl SettingsApp {
             .frame(Frame::default().fill(SIDEBAR_BG).inner_margin(Margin {
                 left: 12.0,
                 right: 12.0,
-                top: 18.0,
+                top: 14.0,
                 bottom: 14.0,
             }))
             .show(ctx, |ui| inert_if(ui, inert, |ui| self.rail(ui)));
@@ -453,20 +466,29 @@ impl SettingsApp {
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pane), |ui| {
                         Frame::default()
                             .inner_margin(Margin {
-                                left: 28.0,
+                                left: 24.0,
                                 // Small on purpose: the scroll bar should sit
                                 // near the window edge, not float in the
                                 // middle — `bar_inner_margin` already keeps it
                                 // clear of the content.
                                 right: 10.0,
-                                top: 24.0,
+                                top: 18.0,
                                 bottom: 8.0,
                             })
                             .show(ui, |ui| self.pane(ui, ctx));
                     });
+                    // The footer ends where the pane's content column does —
+                    // its right margin plus the scroll gutter — so Save lines
+                    // up under the controls.
+                    let gutter = scroll_gutter(ui);
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(footer), |ui| {
                         Frame::default()
-                            .inner_margin(Margin::symmetric(28.0, 0.0))
+                            .inner_margin(Margin {
+                                left: 24.0,
+                                right: 10.0 + gutter,
+                                top: 0.0,
+                                bottom: 0.0,
+                            })
                             .show(ui, |ui| self.footer(ui, ctx));
                     });
                 })
@@ -482,18 +504,26 @@ impl SettingsApp {
     /// The selected tab's header and its scrolling rows.
     fn pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         pane_header(ui, self.tab);
-        ui.add_space(20.0);
+        ui.add_space(14.0);
+        // The scroll bar's room is kept whether or not the pane scrolls, so
+        // the control column ends at the same x on every pane — a short pane
+        // would otherwise run its controls into the space a long one gives the
+        // bar.
+        let content_w = ui.available_width() - scroll_gutter(ui);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-            .show(ui, |ui| match self.tab {
-                Tab::Recording => self.tab_recording(ui),
-                Tab::Pill => self.tab_pill(ui),
-                Tab::Transcription => self.tab_transcription(ui, ctx),
-                Tab::Replacements => self.tab_replacements(ui),
-                Tab::Output => self.tab_output(ui),
-                Tab::History => self.tab_history(ui),
-                Tab::System => self.tab_system(ui),
+            .show(ui, |ui| {
+                ui.set_max_width(content_w);
+                match self.tab {
+                    Tab::Recording => self.tab_recording(ui),
+                    Tab::Pill => self.tab_pill(ui),
+                    Tab::Transcription => self.tab_transcription(ui, ctx),
+                    Tab::Replacements => self.tab_replacements(ui),
+                    Tab::Output => self.tab_output(ui),
+                    Tab::History => self.tab_history(ui),
+                    Tab::System => self.tab_system(ui),
+                }
             });
     }
 
@@ -526,7 +556,7 @@ impl SettingsApp {
             hotkey_row(
                 ui,
                 "Hotkey",
-                "Push-to-talk key combination.",
+                "The key combination that starts dictation.",
                 &mut self.form.cfg.hotkey,
                 "Ctrl+Backslash",
                 errs.dictate.as_deref(),
@@ -535,7 +565,7 @@ impl SettingsApp {
             row(
                 ui,
                 "Microphone",
-                "Which input device Draft records from.",
+                "The input device Draft records from.",
                 |ui| {
                     let selected = self
                         .form
@@ -560,7 +590,7 @@ impl SettingsApp {
                 },
             );
             divider(ui);
-            row(ui, "Activation", "Hold the key, or tap to toggle.", |ui| {
+            row(ui, "Activation", "Hold: record while the hotkey is held down.\nToggle: press once to start, and again to stop.", |ui| {
                 let sel = match self.form.cfg.activation {
                     Activation::Hold => "Hold",
                     Activation::Toggle => "Toggle",
@@ -581,7 +611,7 @@ impl SettingsApp {
                     ui,
                     &mut self.form.cfg.double_press_lock,
                     "Double-press to lock",
-                    "Tap the hotkey twice quickly to keep recording hands-free.",
+                    "Press the hotkey twice quickly to keep recording without holding it down.",
                 );
             }
         });
@@ -593,16 +623,16 @@ impl SettingsApp {
                 ui,
                 &mut self.form.cfg.push_to_command,
                 "Push-to-command",
-                "Hold a second hotkey and speak an instruction instead of \
-                 dictating — the AI's answer is pasted at your cursor. \
-                 Uses Groq; add its API key under Transcription.",
+                "A second hotkey for instructions instead of dictation: say \
+                 what you want, and the AI's answer is pasted at your cursor. \
+                 Uses Groq, so set a Groq API key under Transcription.",
             );
             if self.form.cfg.push_to_command {
                 divider(ui);
                 hotkey_row(
                     ui,
                     "Command hotkey",
-                    "Same syntax as the main hotkey.",
+                    "The key combination for spoken instructions.",
                     &mut self.form.cfg.command_hotkey,
                     "Ctrl+Shift+Backslash",
                     errs.command.as_deref(),
@@ -622,10 +652,9 @@ impl SettingsApp {
                 ui,
                 &mut self.form.cfg.pill.resident,
                 "Keep the pill on screen",
-                "A small marker sits at the bottom of your screen whenever Draft \
-                 is running, so you can tell at a glance that it's alive. Turn \
-                 this off and the pill only appears while you're dictating — the \
-                 hotkey works exactly the same either way.",
+                "Show a small marker at the bottom of your screen whenever \
+                 Draft is running. When this is off, the pill appears only \
+                 while you dictate.",
             );
             // Gated on residency, where the monitor row below is deliberately
             // not: the button bar only ever appears on hover, and there is
@@ -641,8 +670,10 @@ impl SettingsApp {
             divider(ui);
             row(
                 ui,
-                "Show it on",
-                "Which display the pill appears on.",
+                "Display",
+                "Which display the pill appears on: the one with your focused \
+                 window, the one with your mouse, your primary display, or one \
+                 you choose.",
                 |ui| {
                     let sel = self.form.cfg.pill.monitor.label();
                     let options: Vec<(MonitorPolicy, &str)> = ALL_MONITOR_POLICIES
@@ -682,11 +713,9 @@ impl SettingsApp {
         toggle_row(
             ui,
             &mut unified,
-            "Put the buttons in one bar",
-            "When you point at the pill it opens into buttons — normally three \
-             separate shapes with your desktop showing between them. Turn this \
-             on to put them in a single bar instead. Same buttons, same \
-             actions, just a different shape.",
+            "Join the buttons into one bar",
+            "Hovering over the pill shows its buttons as three separate \
+             shapes. Turn this on to join them into a single bar.",
         );
         self.form.cfg.pill.body_style = if unified {
             PillBodyStyle::Unified
@@ -713,7 +742,7 @@ impl SettingsApp {
             (Some(_), None) => "Not connected".to_string(),
             (None, None) => "Choose a display…".to_string(),
         };
-        row(ui, "Display", "Pinned by the monitor itself, not by its slot — reordering your displays won't move the pill.", |ui| {
+        row(ui, "Pinned display", "The display the pill stays on. It's remembered by the monitor itself, so rearranging your displays won't move the pill.", |ui| {
             let options: Vec<(Option<String>, &str)> = self
                 .displays
                 .iter()
@@ -731,7 +760,7 @@ impl SettingsApp {
 
     fn tab_transcription(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         group(ui, |ui| {
-            row(ui, "Provider", "Where your audio is transcribed.", |ui| {
+            row(ui, "Provider", "The service that transcribes your speech. Local runs on this PC; the others send your audio to the cloud.", |ui| {
                 let sel = self.form.cfg.provider.label();
                 let options: Vec<(Provider, &str)> =
                     ALL_PROVIDERS.iter().map(|&p| (p, p.label())).collect();
@@ -745,7 +774,7 @@ impl SettingsApp {
                 row(
                     ui,
                     "API key",
-                    "Stored in Windows Credential Manager.",
+                    "Your key for this Provider, kept in Windows Credential Manager.",
                     |ui| {
                         // One full-width control, so it lines up with the Provider
                         // dropdown above. Opens the editor; the secret itself is
@@ -769,10 +798,10 @@ impl SettingsApp {
                 toggle_row(
                     ui,
                     &mut self.form.cfg.fallback_to_local,
-                    "Offline fallback",
-                    "If the cloud call fails, the local model transcribes \
-                     instead, so the dictation isn't lost. Requires the \
-                     downloaded Parakeet model.",
+                    "Fall back to the local model",
+                    "If the Provider fails, transcribe on this PC instead, so \
+                     the dictation isn't lost. Needs the local model, which \
+                     you can download by choosing Local as the Provider.",
                 );
             }
         });
@@ -780,19 +809,13 @@ impl SettingsApp {
 
     fn parakeet_row(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut state = download::lock(&self.download_state);
-        split_row(
+        row(
             ui,
-            |ui| {
-                ui.label(RichText::new("Local model").size(13.5).color(FG));
-                ui.label(
-                    RichText::new("Parakeet TDT 0.6B (int8) — runs entirely on this PC.")
-                        .size(11.5)
-                        .color(MUTED_FG),
-                );
-            },
+            "Local model",
+            "Parakeet TDT 0.6B (int8). Runs entirely on this PC.",
             |ui| {
                 if state.model_present && !state.running {
-                    installed_badge(ui, "Installed (~670 MB)");
+                    installed_badge(ui, "Installed · 670 MB");
                 } else if state.running {
                     let (label, pct) = state
                         .progress
@@ -812,11 +835,7 @@ impl SettingsApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(150));
                 } else {
                     if ui
-                        .add(ghost_button(
-                            "Download model (~670 MB)",
-                            CONTROL_W,
-                            CONTROL_H,
-                        ))
+                        .add(ghost_button("Download · 670 MB", CONTROL_W, CONTROL_H))
                         .clicked()
                     {
                         state.start();
@@ -838,9 +857,9 @@ impl SettingsApp {
         group(ui, |ui| {
             ui.label(
                 RichText::new(
-                    "Rules run top to bottom on every transcript before it's pasted. \
-                     Each rule's output feeds the next. Use them to fix words your \
-                     provider mishears, or to expand shorthand.",
+                    "Rules run in order on every transcript, each on the \
+                     previous rule's result. Use them to fix words that come \
+                     out wrong, or to expand shorthand.",
                 )
                 .size(12.0)
                 .color(MUTED_FG),
@@ -862,10 +881,7 @@ impl SettingsApp {
             if !self.form.cfg.replacements.is_empty() {
                 ui.add_space(16.0);
             }
-            if ui
-                .add(ghost_button("Add replacement", 160.0, CONTROL_H))
-                .clicked()
-            {
+            if ui.add(ghost_button("Add rule", 96.0, CONTROL_H)).clicked() {
                 self.form
                     .cfg
                     .replacements
@@ -880,10 +896,10 @@ impl SettingsApp {
             ui.add_space(2.0);
             ui.label(
                 RichText::new(
-                    "Words your provider keeps mishearing — names, jargon, \
-                     product terms. One per line, up to 100; put the ones \
-                     that matter most first. The local model ignores these, \
-                     so use a replacement rule there instead.",
+                    "Names, jargon and other terms your Provider gets wrong, \
+                     one per line. Only the first 100 are used, so put the \
+                     important ones first. The local model ignores this list; \
+                     use a rule above instead.",
                 )
                 .size(11.5)
                 .color(MUTED_FG),
@@ -911,11 +927,12 @@ impl SettingsApp {
             row(
                 ui,
                 "Paste mode",
-                "Use Type for hosts that swallow Ctrl+V.",
+                "Clipboard pastes with Ctrl+V. Type enters the text as \
+                 keystrokes, for apps that ignore Ctrl+V.",
                 |ui| {
                     let sel = match self.form.cfg.paste_mode {
                         PasteMode::Clipboard => "Clipboard (Ctrl+V)",
-                        PasteMode::Unicode => "Type (Unicode)",
+                        PasteMode::Unicode => "Type as keystrokes",
                     };
                     combo(
                         ui,
@@ -924,7 +941,7 @@ impl SettingsApp {
                         sel,
                         &[
                             (PasteMode::Clipboard, "Clipboard (Ctrl+V)"),
-                            (PasteMode::Unicode, "Type (Unicode)"),
+                            (PasteMode::Unicode, "Type as keystrokes"),
                         ],
                     );
                 },
@@ -933,23 +950,24 @@ impl SettingsApp {
             toggle_row(
                 ui,
                 &mut self.form.cfg.append_trailing_space,
-                "Append trailing space",
-                "Adds one space after each transcript so the next word doesn't smash into it.",
+                "Add a space after each transcript",
+                "So the next thing you dictate or type doesn't run into it.",
             );
             divider(ui);
             toggle_row(
                 ui,
                 &mut self.form.cfg.restore_clipboard,
                 "Restore clipboard",
-                "Put your previous clipboard back after pasting.",
+                "Put back whatever was on your clipboard before the paste.",
             );
             divider(ui);
             toggle_row(
                 ui,
                 &mut self.form.cfg.voice_commands,
                 "Voice commands",
-                "Saying \"new line\", \"new paragraph\", \"scratch that\", or \
-                 \"all caps\" formats the transcript instead of appearing in it.",
+                "Say \"new line\", \"new paragraph\", \"scratch that\" or \
+                 \"all caps\" to format the transcript instead of typing the \
+                 words.",
             );
         });
     }
@@ -965,9 +983,9 @@ impl SettingsApp {
             ui.horizontal(|ui| {
                 let count = self.history.len();
                 let summary = match count {
-                    0 => "Nothing recorded yet.".to_string(),
-                    1 => "1 transcript.".to_string(),
-                    n => format!("{n} transcripts (newest first)."),
+                    0 => "No transcripts yet.".to_string(),
+                    1 => "1 transcript".to_string(),
+                    n => format!("{n} transcripts, newest first"),
                 };
                 ui.label(RichText::new(summary).size(12.0).color(MUTED_FG));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -987,9 +1005,9 @@ impl SettingsApp {
             if self.history.is_empty() {
                 ui.label(
                     RichText::new(
-                        "Transcripts appear here the moment they're produced — even if the \
-                         paste lands in the wrong place. Use Copy to put one back on your \
-                         clipboard.",
+                        "Every transcript is saved here as soon as it's ready, \
+                         even if the paste goes to the wrong place. Use Copy to \
+                         get one back.",
                     )
                     .size(12.0)
                     .color(MUTED_FG)
@@ -1090,7 +1108,7 @@ impl SettingsApp {
                 ui,
                 &mut self.form.autostart_enabled,
                 "Start with Windows",
-                "Launches Draft automatically on sign-in (HKCU registry entry).",
+                "Start Draft when you sign in to Windows.",
             );
         });
     }
@@ -1111,7 +1129,7 @@ impl SettingsApp {
                     self.save();
                 }
                 ui.add_space(8.0);
-                if ui.add(ghost_button("Close", 84.0, 34.0)).clicked() {
+                if ui.add(ghost_button("Close", 76.0, BUTTON_H)).clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
 
@@ -1171,7 +1189,7 @@ impl SettingsApp {
                 let desc = if configured {
                     "A key is already saved. Enter a new one to replace it."
                 } else {
-                    "Paste your key. It is stored in Windows Credential Manager."
+                    "Paste your API key. It's kept in Windows Credential Manager."
                 };
                 ui.label(RichText::new(desc).size(12.0).color(MUTED_FG));
                 ui.add_space(16.0);
@@ -1183,7 +1201,7 @@ impl SettingsApp {
                         [field_w, CONTROL_H],
                         egui::TextEdit::singleline(&mut dlg.buffer)
                             .password(!dlg.reveal)
-                            .hint_text(hint("paste key…"))
+                            .hint_text(hint("Paste key"))
                             .vertical_align(egui::Align::Center),
                     );
                     name_control(&field, &format!("{} API key", dlg.provider.label()));
@@ -1196,7 +1214,7 @@ impl SettingsApp {
 
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    if configured && ui.add(ghost_button("Remove", 84.0, 34.0)).clicked() {
+                    if configured && ui.add(ghost_button("Remove", 76.0, BUTTON_H)).clicked() {
                         act = Act::Remove(dlg.provider);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1205,7 +1223,7 @@ impl SettingsApp {
                             act = Act::Commit(dlg.provider, dlg.buffer.clone());
                         }
                         ui.add_space(8.0);
-                        if ui.add(ghost_button("Cancel", 84.0, 34.0)).clicked() {
+                        if ui.add(ghost_button("Cancel", 76.0, BUTTON_H)).clicked() {
                             act = Act::Cancel;
                         }
                     });
@@ -1252,27 +1270,22 @@ impl SettingsApp {
             );
             ui.add_space(4.0);
             let msg = match self.history.len() {
-                1 => "This permanently deletes the 1 saved transcript. \
-                      You won't be able to recover it."
-                    .to_string(),
-                n => format!(
-                    "This permanently deletes all {n} saved transcripts. \
-                     You won't be able to recover them."
-                ),
+                1 => "This deletes the saved transcript. It can't be undone.".to_string(),
+                n => format!("This deletes all {n} saved transcripts. It can't be undone."),
             };
             ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
             ui.add_space(18.0);
             // Pin the row height: an unconstrained right_to_left layout
             // fills the window's whole available rect and balloons it.
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 34.0),
+                Vec2::new(ui.available_width(), BUTTON_H),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     if ui.add(destructive_button("Clear")).clicked() {
                         act = Act::Confirm;
                     }
                     ui.add_space(8.0);
-                    if ui.add(ghost_button("Cancel", 84.0, 34.0)).clicked() {
+                    if ui.add(ghost_button("Cancel", 76.0, BUTTON_H)).clicked() {
                         act = Act::Cancel;
                     }
                 },
@@ -1321,26 +1334,26 @@ impl SettingsApp {
             );
             ui.add_space(4.0);
             let msg = if can_save {
-                "Your changes will be lost if you don't save them.".to_string()
+                "If you don't save, your changes will be lost.".to_string()
             } else {
-                format!("{HOTKEY_BLOCKS_SAVE} Discard closes without your changes.")
+                format!("{HOTKEY_BLOCKS_SAVE} Discard closes without saving.")
             };
             ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
             ui.add_space(18.0);
             // Pin the row height, as in the clear-history confirmation.
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 34.0),
+                Vec2::new(ui.available_width(), BUTTON_H),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     if ui.add(primary_button("Save", can_save)).clicked() && can_save {
                         act = Act::Save;
                     }
                     ui.add_space(8.0);
-                    if ui.add(ghost_button("Discard", 84.0, 34.0)).clicked() {
+                    if ui.add(ghost_button("Discard", 76.0, BUTTON_H)).clicked() {
                         act = Act::Discard;
                     }
                     ui.add_space(8.0);
-                    if ui.add(ghost_button("Cancel", 84.0, 34.0)).clicked() {
+                    if ui.add(ghost_button("Cancel", 76.0, BUTTON_H)).clicked() {
                         act = Act::Cancel;
                     }
                 },
@@ -1396,9 +1409,15 @@ fn hotkey_row(
     }
 }
 
+/// The width a pane's scroll bar takes, with its gap to the content.
+fn scroll_gutter(ui: &egui::Ui) -> f32 {
+    let s = &ui.spacing().scroll;
+    s.bar_width + s.bar_inner_margin
+}
+
 fn pane_header(ui: &mut egui::Ui, tab: Tab) {
-    ui.label(RichText::new(tab.label()).size(21.0).strong().color(FG));
-    ui.add_space(3.0);
+    ui.label(RichText::new(tab.label()).size(18.0).strong().color(FG));
+    ui.add_space(2.0);
     ui.label(RichText::new(tab.subtitle()).size(12.5).color(MUTED_FG));
 }
 

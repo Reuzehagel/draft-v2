@@ -2,9 +2,13 @@
 // app state in here; anything stateful stays out (in mod.rs, or download.rs).
 //
 // Layout invariants that keep this UI from regressing:
+// - A settings row is one line, ROW_H tall: the label centred on its
+//   control, the caption a tooltip over the label (`row`, `toggle_row`).
+//   A pane is an even ladder of rows; text that must stay visible — a
+//   section's explanation — is a paragraph between groups, not a caption.
 // - Measure, then allocate. Text that wraps next to other content is laid
-//   out as a galley against the width that is actually free for it (see
-//   `toggle_row`); never a fixed-height row with full-width wrapping text.
+//   out as a galley against the width that is actually free for it; never a
+//   fixed-height row with full-width wrapping text.
 // - A `right_to_left` layout expands to fill whatever rect it is given.
 //   Only open one inside something already bounded (a `horizontal`, or an
 //   `allocate_ui_with_layout` with a pinned size) or it balloons the parent.
@@ -271,7 +275,7 @@ pub(super) fn announce_progress(resp: &egui::Response, name: &str, fraction: f32
 /// faint wash. No accent colour. Returns true on click.
 pub(super) fn nav_item(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 32.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 28.0), egui::Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     // Announced with AccessKit's Tab role rather than as a toggled button: a
     // rail item picks one pane of several, and that role is how a screen
@@ -443,7 +447,7 @@ pub(super) fn key_opener(ui: &mut egui::Ui, configured: bool) -> bool {
     let mut x = rect.left() + 12.0;
     if configured {
         ui.painter()
-            .circle_filled(egui::pos2(x + 1.0, rect.center().y), 3.0, PRIMARY);
+            .circle_filled(egui::pos2(x + 1.0, rect.center().y), 3.0, SUCCESS);
         x += 12.0;
     }
     let (status, scolor) = if configured {
@@ -555,56 +559,59 @@ fn field_error_galley(ctx: &egui::Context, msg: &str) -> std::sync::Arc<egui::Ga
     ctx.fonts(|f| f.layout_job(job))
 }
 
-/// One label/value row. Label column is capped so long captions can't slide
-/// under the control on the right.
+/// One label/control row, ROW_H tall: the label on one line, centred on the
+/// control, and the caption in a tooltip over the label. The control gets a
+/// bounded rect on the right, so its `right_to_left` can't balloon the row.
 pub(super) fn row(
     ui: &mut egui::Ui,
     label: &str,
     caption: &str,
     control: impl FnOnce(&mut egui::Ui),
 ) {
-    split_row(
-        ui,
-        |ui| {
-            ui.label(RichText::new(label).size(13.5).color(FG));
-            ui.label(RichText::new(caption).size(11.5).color(MUTED_FG));
-        },
-        |ui| {
-            // Held only while the control is laid out, so a control after the
-            // row can't pick up its label.
-            let row = RowLabel {
-                label: label.to_owned(),
-                caption: caption.to_owned(),
-            };
-            ui.data_mut(|d| d.insert_temp(row_label_id(), row));
-            control(ui);
-            ui.data_mut(|d| d.remove::<RowLabel>(row_label_id()));
-        },
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), egui::Sense::hover());
+    let label_w = (rect.width() - CONTROL_W - 24.0).max(0.0);
+    let galley = elided_galley(
+        ui.ctx(),
+        label,
+        egui::FontId::proportional(LABEL_SIZE),
+        FG,
+        label_w,
     );
-}
+    let label_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0),
+        galley.size(),
+    );
+    ui.painter()
+        .galley(label_rect.min, galley, Color32::PLACEHOLDER);
+    ui.interact(
+        label_rect,
+        ui.make_persistent_id(("row_label", label)),
+        egui::Sense::hover(),
+    )
+    .on_hover_text(caption);
 
-/// Two-column row: label column left, control claims the remaining width and
-/// right-aligns so controls share a right edge.
-pub(super) fn split_row(
-    ui: &mut egui::Ui,
-    left: impl FnOnce(&mut egui::Ui),
-    right: impl FnOnce(&mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        let total = ui.available_width();
-        let label_w = (total - CONTROL_W - 24.0).clamp(120.0, 280.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(label_w, 0.0),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.set_max_width(label_w);
-                left(ui);
-            },
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            right(ui);
-        });
-    });
+    // A child that allocates nothing in `ui`: the row above already took its
+    // ROW_H, and `allocate_new_ui` would move the cursor back up to the
+    // control's own bottom edge, shortening the row by the control's margin.
+    let control_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + label_w + 24.0, rect.top()),
+        rect.max,
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(control_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    // Held only while the control is laid out, so a control after the row
+    // can't pick up its label.
+    let row = RowLabel {
+        label: label.to_owned(),
+        caption: caption.to_owned(),
+    };
+    child.data_mut(|d| d.insert_temp(row_label_id(), row));
+    control(&mut child);
+    child.data_mut(|d| d.remove::<RowLabel>(row_label_id()));
 }
 
 /// One editable find/replace rule: an enable switch, the from/to fields, the
@@ -624,7 +631,7 @@ pub(super) fn replacement_editor(
     number: usize,
 ) -> bool {
     let mut remove = false;
-    let field_w = 140.0;
+    let field_w = 120.0;
     ui.horizontal(|ui| {
         // Drive gaps with explicit spacing so the row width is predictable
         // and doesn't wrap in the narrow window.
@@ -687,44 +694,32 @@ pub(super) fn mini_switch(ui: &mut egui::Ui, on: bool, label: &str, id: egui::Id
     resp.clicked()
 }
 
-/// Full-row clickable toggle. The whole label/caption strip is the hit area;
-/// hover gives a faint highlight so the affordance reads.
+/// Full-row clickable toggle, ROW_H tall like `row`: the label on one line,
+/// the caption in a tooltip. The whole row is the hit area; hover gives a
+/// faint highlight so the affordance reads.
 ///
-/// Layout invariant: the text column is measured against the width that
-/// remains AFTER reserving the toggle and a gutter, and the row is allocated
-/// at the measured height. Never lay text across the full row width with a
-/// fixed row height — long captions then slide under the toggle and overflow
-/// the row.
+/// The label is elided against the width left after the toggle and a gutter,
+/// so it can never slide under the switch.
 pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, caption: &str) {
-    let toggle_size = Vec2::new(36.0, 20.0);
+    let toggle_size = Vec2::new(32.0, 18.0);
     // Space between the text column and the toggle.
     let gutter = 24.0;
 
     let id = ui.make_persistent_id(("toggle_row", label));
     let total_w = ui.available_width();
     let text_w = total_w - toggle_size.x - gutter;
+    let label_galley = elided_galley(
+        ui.ctx(),
+        label,
+        egui::FontId::proportional(LABEL_SIZE),
+        FG,
+        text_w,
+    );
 
-    // Measure first, then allocate exactly that.
-    let label_galley = egui::WidgetText::from(RichText::new(label).size(13.5).color(FG))
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Wrap),
-            text_w,
-            egui::TextStyle::Body,
-        );
-    let caption_galley = egui::WidgetText::from(RichText::new(caption).size(11.5).color(MUTED_FG))
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Wrap),
-            text_w,
-            egui::TextStyle::Body,
-        );
-    let line_gap = 4.0;
-    let text_h = label_galley.size().y + line_gap + caption_galley.size().y;
-    let row_h = text_h.max(toggle_size.y) + 6.0;
-
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, row_h), egui::Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, ROW_H), egui::Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(caption);
     if resp.clicked() {
         *value = !*value;
     }
@@ -734,22 +729,15 @@ pub(super) fn toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str, capti
         .animate_bool_with_time(id.with("hover"), resp.hovered(), 0.12);
     if hover_t > 0.0 {
         ui.painter().rect_filled(
-            rect.expand2(Vec2::new(8.0, 2.0)),
+            rect.expand2(Vec2::new(8.0, 0.0)),
             Rounding::same(RADIUS_SM),
             Color32::from_white_alpha((hover_t * 7.0) as u8),
         );
     }
 
-    let text_top = rect.top() + 3.0;
-    let label_h = label_galley.size().y;
     ui.painter().galley(
-        egui::pos2(rect.left(), text_top),
+        egui::pos2(rect.left(), rect.center().y - label_galley.size().y / 2.0),
         label_galley,
-        Color32::PLACEHOLDER,
-    );
-    ui.painter().galley(
-        egui::pos2(rect.left(), text_top + label_h + line_gap),
-        caption_galley,
         Color32::PLACEHOLDER,
     );
 
@@ -774,7 +762,7 @@ pub(super) fn paint_toggle(
     hovered: bool,
 ) {
     let how_on = ui.ctx().animate_bool_with_time(id, on, 0.15);
-    let bg = lerp_color(TOGGLE_OFF, PRIMARY, how_on);
+    let bg = lerp_color(TOGGLE_OFF, TOGGLE_ON, how_on);
     let bg = if hovered { lighten(bg, 0.05) } else { bg };
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(rect.height() / 2.0), bg);
@@ -791,7 +779,7 @@ pub(super) fn paint_toggle(
         knob_r,
         Color32::from_black_alpha(60),
     );
-    painter.circle_filled(knob_pos, knob_r, Color32::from_rgb(245, 245, 248));
+    painter.circle_filled(knob_pos, knob_r, lerp_color(KNOB_OFF, KNOB_ON, how_on));
 }
 
 pub(super) fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -809,14 +797,14 @@ pub(super) fn installed_badge(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(FG).size(13.0));
     ui.add_space(7.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, PRIMARY);
+    ui.painter().circle_filled(rect.center(), 4.0, SUCCESS);
 }
 
 /// Primary (Save) button. Disabled when there's nothing to save; otherwise
 /// lime fill that brightens on hover, darkens + scales down on press.
 pub(super) fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '_ {
     move |ui: &mut egui::Ui| {
-        let size = Vec2::new(94.0, 34.0);
+        let size = Vec2::new(84.0, BUTTON_H);
         let sense = if enabled {
             egui::Sense::click()
         } else {
@@ -860,7 +848,7 @@ pub(super) fn primary_button(text: &str, enabled: bool) -> impl egui::Widget + '
 /// primary button so the two line up in a dialog footer.
 pub(super) fn destructive_button(text: &str) -> impl egui::Widget + '_ {
     move |ui: &mut egui::Ui| {
-        let size = Vec2::new(94.0, 34.0);
+        let size = Vec2::new(84.0, BUTTON_H);
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
         announce_button(&resp, true, text);
         let id = ui.make_persistent_id(("destructive_btn", text));
@@ -917,12 +905,10 @@ pub(super) fn ghost_button(text: &str, width: f32, height: f32) -> impl egui::Wi
 }
 
 pub(super) fn divider(ui: &mut egui::Ui) {
-    ui.add_space(8.0);
     let avail = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, 1.0), egui::Sense::hover());
     ui.painter()
         .hline(rect.left()..=rect.right(), rect.center().y, border());
-    ui.add_space(8.0);
 }
 
 /// Lay `add` out in a child `Ui` that, while `inert`, takes no input — no
@@ -1215,7 +1201,7 @@ mod tests {
         ui.add(primary_button("Save", false));
         hit[4] = ui.add(primary_button("Apply", true)).clicked();
         hit[5] = ui.add(destructive_button("Clear")).clicked();
-        hit[6] = ui.add(ghost_button("Close", 84.0, 34.0)).clicked();
+        hit[6] = ui.add(ghost_button("Close", 76.0, BUTTON_H)).clicked();
         hit
     }
 
@@ -1257,7 +1243,7 @@ mod tests {
             trap.before_frame(&mut input);
             let _ = ctx.run(input, |ctx| {
                 dismissed = modal_card(ctx, "dialog", |ui| {
-                    ok = ui.add(ghost_button("OK", 84.0, 34.0)).clicked();
+                    ok = ui.add(ghost_button("OK", 76.0, BUTTON_H)).clicked();
                 });
                 trap.after_frame(ctx, Some("dialog"));
             });
@@ -1361,7 +1347,7 @@ mod tests {
                         after.push(ui.cursor().min);
                         ui.add(destructive_button("Clear"));
                         after.push(ui.cursor().min);
-                        ui.add(ghost_button("Close", 84.0, 34.0));
+                        ui.add(ghost_button("Close", 76.0, BUTTON_H));
                         after.push(ui.cursor().min);
                     });
                 },
@@ -1554,7 +1540,7 @@ mod tests {
         let nodes = a11y_nodes(|ui| {
             ui.add(primary_button("Save", false));
             ui.add(destructive_button("Clear"));
-            ui.add(ghost_button("Close", 84.0, 34.0));
+            ui.add(ghost_button("Close", 76.0, BUTTON_H));
         });
         assert!(named(&nodes, Role::Button, "Save").is_disabled());
         assert!(!named(&nodes, Role::Button, "Clear").is_disabled());
