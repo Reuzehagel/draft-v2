@@ -27,7 +27,6 @@ pub struct Fsm {
     recording: bool,
     locked: bool,
     last_press: Option<Instant>,
-    busy_until: Option<Instant>,
     dbl_window: Duration,
 }
 
@@ -38,26 +37,11 @@ impl Fsm {
             recording: false,
             locked: false,
             last_press: None,
-            busy_until: None,
             dbl_window: Duration::from_millis(300),
         }
     }
 
-    // Suppress presses until `until`. Wired into `step` (and tested), but not
-    // yet engaged by the app event loop — kept for a future debounce.
-    #[allow(dead_code)]
-    pub fn mark_busy(&mut self, until: Instant) {
-        self.busy_until = Some(until);
-    }
-
     pub fn step(&mut self, ev: InEvent) -> OutEvent {
-        let now = match ev {
-            InEvent::Pressed(t) | InEvent::Released(t) => t,
-        };
-        if matches!(self.busy_until, Some(t) if now < t) {
-            return OutEvent::Ignore;
-        }
-
         match (self.mode, ev) {
             (Mode::Toggle, InEvent::Pressed(_)) => {
                 self.recording = !self.recording;
@@ -150,13 +134,5 @@ mod tests {
         assert_eq!(f.step(InEvent::Released(t(200))), OutEvent::Ignore);
         // Next press: unlock + stop.
         assert_eq!(f.step(InEvent::Pressed(t(1000))), OutEvent::Stop);
-    }
-
-    #[test]
-    fn busy_window_ignores_presses() {
-        let mut f = Fsm::new(Mode::Toggle);
-        f.mark_busy(t(500));
-        assert_eq!(f.step(InEvent::Pressed(t(100))), OutEvent::Ignore);
-        assert_eq!(f.step(InEvent::Pressed(t(600))), OutEvent::Start);
     }
 }

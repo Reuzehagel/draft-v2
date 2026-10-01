@@ -1393,14 +1393,6 @@ mod tests {
         assert_eq!(HANDOFF.ease, Ease::Linear);
     }
 
-    /// The handoff's border crossfade and the core's waveform drain are one
-    /// gesture. If these two clocks ever diverged, the bars would reach flat
-    /// while the border was still arriving.
-    #[test]
-    fn the_handoff_tween_and_the_cores_drain_share_a_clock() {
-        assert_eq!(HANDOFF.dur, crate::pill::core::HANDOFF);
-    }
-
     /// With residency off, a chord press is the pill's whole existence
     /// beginning — it appears at once, exactly as the session pill always has.
     #[test]

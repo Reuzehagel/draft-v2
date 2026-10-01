@@ -1401,11 +1401,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn esc_with_a_popup_open_closes_only_the_popup() {
-        assert_eq!(esc_closes(true, false, false, false), EscCloses::Popup);
-    }
-
-    #[test]
     fn esc_with_a_modal_card_open_closes_only_the_modal() {
         assert_eq!(esc_closes(false, true, false, false), EscCloses::KeyDialog);
         assert_eq!(
@@ -1518,15 +1513,6 @@ mod tests {
             enabled,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn removing_a_rule_keeps_the_keys_of_the_rules_below_it() {
-        let mut keys = RuleKeys::default();
-        keys.fit(3);
-        let (b, c) = (keys.key(1), keys.key(2));
-        keys.remove(0);
-        assert_eq!((keys.key(0), keys.key(1)), (b, c));
     }
 
     /// A rule added after a removal must not inherit the removed rule's

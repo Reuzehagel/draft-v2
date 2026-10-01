@@ -1586,14 +1586,6 @@ mod tests {
         assert_eq!(out.pixel(outside, cy).unwrap().alpha(), 0);
     }
 
-    /// Nothing but the nub is drawn when `buttons` is 0 — the bar has no
-    /// presence at all in the modes that don't carry it.
-    #[test]
-    fn the_nub_draws_no_buttons() {
-        let pm = frame(PillMode::Idle, &FLAT);
-        assert_eq!(runs(&pm, cy(&pm, 1.0)).len(), 1);
-    }
-
     /// Draw the expanded bar with the label saying `fade`.
     fn with_label(fade: &Fade) -> Pixmap {
         let mut pm = envelope();

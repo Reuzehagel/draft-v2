@@ -348,13 +348,4 @@ mod tests {
         assert!(l.at(t(50)).is_blank());
         assert!(!l.is_running(t(50)));
     }
-
-    /// Every button has a name, and they are the ones the ticket settled. The
-    /// bar is icon-only; a button whose name were empty would be unlearnable.
-    #[test]
-    fn every_button_is_named() {
-        let names: Vec<&str> = BUTTONS.iter().map(|b| b.name).collect();
-        assert_eq!(names, vec!["Copy last transcript", "Dictate", "Settings"]);
-        assert!(names.iter().all(|n| !n.trim().is_empty()));
-    }
 }

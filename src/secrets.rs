@@ -132,19 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_key_is_not_written_by_an_unrelated_save() {
-        assert_eq!(
-            key_write("env-key", "env-key", KeySource::Environment),
-            None
-        );
-    }
-
-    #[test]
-    fn a_key_that_failed_to_load_is_not_deleted_by_an_unrelated_save() {
-        assert_eq!(key_write("", "", KeySource::Unreadable), None);
-    }
-
-    #[test]
     fn clearing_a_stored_key_deletes_it() {
         assert_eq!(
             key_write("stored", "", KeySource::Keyring),

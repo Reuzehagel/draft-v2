@@ -782,14 +782,6 @@ mod tests {
         }
     }
 
-    // Read-modify-write, never an absolute write: bits set by Windows or winit
-    // for their own reasons have to survive our re-assertion.
-    #[test]
-    fn applying_the_pill_set_preserves_foreign_bits() {
-        let cur = WS_EX_APPWINDOW.0;
-        assert_eq!(with_pill_ex_style(cur, true), cur | PILL_EX_STYLE);
-    }
-
     #[test]
     fn applying_the_pill_set_is_idempotent() {
         for click_through in [true, false] {

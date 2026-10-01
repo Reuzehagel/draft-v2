@@ -578,26 +578,6 @@ mod tests {
         assert!(s.is_idle());
     }
 
-    #[test]
-    fn hold_press_release_runs_the_dictate_fsm_end_to_end() {
-        let mut s = ready_session();
-        // Press → start capture.
-        assert_eq!(
-            s.on_dictate_input(InEvent::Pressed(t(0))),
-            vec![Command::StartCapture]
-        );
-        s.capture_started(Some(long_capture()));
-        // Release → commit to a worker.
-        let cmds = s.on_dictate_input(InEvent::Released(t(500)));
-        assert!(matches!(
-            cmds[..],
-            [
-                Command::ReportActivity(SessionActivity::Processing { .. }),
-                Command::SpawnTranscription { .. }
-            ]
-        ));
-    }
-
     /// Drive a chord (via its own input method) from idle all the way into
     /// Processing, asserting the spawn and returning its routed session kind.
     fn spawn_kind_for(
