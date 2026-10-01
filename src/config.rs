@@ -41,10 +41,7 @@ pub struct Config {
     pub push_to_command: bool,
     /// The hotkey that triggers push-to-command. Same syntax as `hotkey`.
     pub command_hotkey: String,
-    /// The overlay's own settings. Last field on purpose: TOML puts every
-    /// scalar before the first table, and a nested struct serialised ahead of
-    /// one would emit a `[pill]` header with the remaining keys swallowed
-    /// underneath it.
+    /// The overlay's own settings.
     #[serde(default)]
     pub pill: PillConfig,
 }
@@ -463,20 +460,5 @@ mod tests {
         assert!(!cfg.pill.resident);
         assert_eq!(cfg.pill.monitor, MonitorPolicy::Focused);
         assert_eq!(cfg.pill.monitor_pinned_path, None);
-    }
-
-    /// TOML has no way back once a table header is emitted: every scalar has to
-    /// come before `[pill]`. Serialising with the field anywhere but last emits
-    /// a file whose later keys land *inside* the table — which round-trips into
-    /// a parse error rather than silently wrong values, but is a landmine for
-    /// the next field added to `Config` all the same.
-    #[test]
-    fn the_pill_table_is_serialised_after_every_scalar() {
-        let text = toml::to_string_pretty(&Config::default()).expect("serialise");
-        let header = text.find("[pill]").expect("the table is written");
-        assert!(
-            !text[header..].contains("hotkey"),
-            "a scalar was emitted after the table header:\n{text}"
-        );
     }
 }

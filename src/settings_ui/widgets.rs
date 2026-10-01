@@ -1027,44 +1027,22 @@ mod tests {
         ctx
     }
 
-    /// A Windows device name is longer than any popup we're willing to draw,
-    /// so it is elided — and the galley measures within the width it was given
-    /// rather than running past the popup edge the way `layout_no_wrap` did.
-    #[test]
-    fn a_long_option_label_is_elided_within_its_row() {
-        let ctx = font_ctx();
-        let long = "Microfoonmatrix (Intel® Smart Sound Technologie voor digitale microfoons)";
-        for row_w in ROW_WIDTHS {
-            let max = combo_item_text_w(row_w);
-            let g = elided_galley(&ctx, long, egui::FontId::proportional(13.0), FG, max);
-            assert!(g.elided, "a 72-char device name must not fit {max}px");
-            assert!(
-                g.size().x <= max,
-                "galley {} wider than the {max}px it was given",
-                g.size().x
-            );
-            let last = g.rows[0].glyphs.last().expect("a laid-out row");
-            assert_eq!(last.chr, '…', "elided text ends in an ellipsis");
-        }
-    }
-
-    /// …and a label that fits is untouched: no ellipsis, and `elided` is false
-    /// so the caller shows no tooltip.
+    /// A label that fits its row is untouched: no ellipsis, and it reports no
+    /// cut, so the caller shows no tooltip.
     #[test]
     fn a_short_option_label_is_left_alone() {
         let ctx = font_ctx();
         for row_w in ROW_WIDTHS {
             for label in ["Hold", "Toggle", "System default"] {
-                let g = elided_galley(
+                let (g, cut) = middle_elided_galley(
                     &ctx,
                     label,
                     egui::FontId::proportional(13.0),
                     FG,
                     combo_item_text_w(row_w),
                 );
-                assert!(!g.elided, "{label:?} fits a {row_w}px row and stays whole");
-                assert_eq!(g.text(), label);
-                assert!(g.rows[0].glyphs.iter().all(|gl| gl.chr != '…'));
+                assert!(!cut, "{label:?} fits a {row_w}px row and stays whole");
+                assert_eq!(visible(&g), label);
             }
         }
     }

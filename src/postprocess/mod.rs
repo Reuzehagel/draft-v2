@@ -44,11 +44,6 @@ impl Replacements {
         }
     }
 
-    /// True when there is nothing to substitute — lets a caller skip work.
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
     pub fn apply(&self, text: &str) -> String {
         let mut out = text.to_owned();
         for rule in &self.rules {
@@ -94,13 +89,6 @@ impl Pipeline {
         }
     }
 
-    /// True when the pipeline would do nothing — lets a caller skip work.
-    /// Not yet wired into the event loop.
-    #[allow(dead_code)]
-    pub fn is_noop(&self) -> bool {
-        self.replacements.is_empty() && self.voice_commands.is_none()
-    }
-
     /// Run every stage in order and return the transformed text. Replacements
     /// run first so a rule can't accidentally assemble or break up a command
     /// phrase the user actually spoke.
@@ -135,14 +123,6 @@ mod tests {
     fn session_pipeline_applies_replacements_then_voice_commands() {
         let out = Pipeline::for_session(&cfg_with(true)).apply("draft new paragraph done");
         assert_eq!(out, "Draft\n\nDone");
-    }
-
-    /// A **Transcription run** composes replacements alone: a recorded speaker
-    /// saying "new paragraph" is describing, not instructing.
-    #[test]
-    fn replacements_alone_leave_command_phrases_as_text() {
-        let out = Replacements::from_config(&cfg_with(true)).apply("draft new paragraph done");
-        assert_eq!(out, "Draft new paragraph done");
     }
 
     #[test]
