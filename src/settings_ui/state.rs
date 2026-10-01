@@ -245,7 +245,7 @@ impl Form {
     pub fn save(&mut self, store: &mut impl Store) -> Result<(), String> {
         store
             .save_config(&self.cfg)
-            .map_err(|e| format!("Config save failed: {e}"))?;
+            .map_err(|e| format!("Couldn't save settings: {e}"))?;
         for (p, source) in self.key_sources.iter_mut() {
             let Some(write) =
                 secrets::key_write(self.baseline.keys.get(*p), self.keys.get(*p), *source)
@@ -254,7 +254,7 @@ impl Form {
             };
             store
                 .write_key(*p, &write)
-                .map_err(|e| format!("Keyring save failed ({p:?}): {e}"))?;
+                .map_err(|e| format!("Couldn't save the {} API key: {e}", p.label()))?;
             // Advance this key's baseline now, not with the rest: if a later
             // step fails, the next save must compare against what the keyring
             // holds, or a Remove made in between would read as "no edit".
@@ -263,7 +263,7 @@ impl Form {
         }
         store
             .set_autostart(self.autostart_enabled)
-            .map_err(|e| format!("Autostart toggle failed: {e}"))?;
+            .map_err(|e| format!("Couldn't change Start with Windows: {e}"))?;
         self.baseline = self.snapshot();
         Ok(())
     }
@@ -414,7 +414,7 @@ mod tests {
             ..Default::default()
         };
         let err = form.save(&mut store).unwrap_err();
-        assert!(err.starts_with("Config save failed: "), "{err}");
+        assert!(err.starts_with("Couldn't save settings: "), "{err}");
         assert_eq!(store.keys, vec![]);
         assert_eq!(store.autostart, None);
         assert!(form.is_dirty());
@@ -429,7 +429,7 @@ mod tests {
             ..Default::default()
         };
         let err = form.save(&mut store).unwrap_err();
-        assert!(err.starts_with("Keyring save failed (Groq): "), "{err}");
+        assert!(err.starts_with("Couldn't save the Groq API key: "), "{err}");
         assert!(form.is_dirty());
     }
 
@@ -445,7 +445,10 @@ mod tests {
             ..Default::default()
         };
         let err = form.save(&mut store).unwrap_err();
-        assert!(err.starts_with("Autostart toggle failed: "), "{err}");
+        assert!(
+            err.starts_with("Couldn't change Start with Windows: "),
+            "{err}"
+        );
         assert!(form.is_dirty(), "autostart is still unsaved");
 
         store.fail = None;

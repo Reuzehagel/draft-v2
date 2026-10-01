@@ -1,5 +1,7 @@
 // Theme: every colour, metric, and the egui style for the settings window,
-// in one place. shadcn "neutral + lime" DARK, oklch -> sRGB.
+// in one place. Monochrome, like the pill: shadcn's "neutral" DARK greys
+// (oklch -> sRGB), white for the primary action, and the pill's green and
+// red for status only.
 //
 // Rules baked into this theme that the rest of the UI relies on:
 // - `override_text_color` is FG, so any text that should NOT be
@@ -13,11 +15,10 @@
 //   `text_meets_aa_contrast` holds the pairs — add a row with a new one.
 
 use egui::{Color32, RichText, Rounding, Stroke, Vec2};
-// shadcn "neutral + lime" DARK theme, oklch → sRGB.
 pub(super) const BG: Color32 = Color32::from_rgb(10, 10, 10); // --background  oklch(0.145 0 0)
 pub(super) const SIDEBAR_BG: Color32 = Color32::from_rgb(23, 23, 23); // --sidebar/--card  0.205
-pub(super) const CONTROL_FILL: Color32 = Color32::from_rgb(32, 32, 35); // input surface
-pub(super) const CONTROL_HOVER: Color32 = Color32::from_rgb(44, 44, 48);
+pub(super) const CONTROL_FILL: Color32 = Color32::from_rgb(32, 32, 32); // input surface
+pub(super) const CONTROL_HOVER: Color32 = Color32::from_rgb(44, 44, 44);
 pub(super) const SELECTED_BG: Color32 = Color32::from_rgb(38, 38, 38); // --accent  0.269 (selected nav)
 pub(super) const FG: Color32 = Color32::from_rgb(250, 250, 250); // --foreground  0.985
 pub(super) const MUTED_FG: Color32 = Color32::from_rgb(161, 161, 161); // --muted-foreground  0.708
@@ -25,30 +26,47 @@ pub(super) const MUTED_FG: Color32 = Color32::from_rgb(161, 161, 161); // --mute
 /// the call sites, so examples can't be mistaken for typed content — the
 /// global `override_text_color` would otherwise paint hints full-brightness.
 /// Still at least 4.5:1 on the input fill (`text_meets_aa_contrast`).
-pub(super) const HINT_FG: Color32 = Color32::from_rgb(136, 136, 140);
+pub(super) const HINT_FG: Color32 = Color32::from_rgb(136, 136, 136);
 pub(super) const RING: Color32 = Color32::from_rgb(115, 115, 115); // --ring  0.556 (neutral focus)
 /// Keyboard focus ring around the custom controls (`widgets::focus_ring`).
 /// Opaque, like the borders, and at least 3:1 on every surface it sits on
 /// (`focus_ring_meets_non_text_contrast`).
 pub(super) const FOCUS_RING: Color32 = RING;
-pub(super) const PRIMARY: Color32 = Color32::from_rgb(132, 204, 22); // --primary (lime)
-pub(super) const PRIMARY_HOVER: Color32 = Color32::from_rgb(146, 214, 40);
-pub(super) const PRIMARY_PRESSED: Color32 = Color32::from_rgb(110, 172, 18);
-pub(super) const PRIMARY_FG: Color32 = Color32::from_rgb(26, 46, 5); // --primary-foreground (text on lime)
-pub(super) const DESTRUCTIVE: Color32 = Color32::from_rgb(235, 107, 107); // --destructive
-pub(super) const DESTRUCTIVE_HOVER: Color32 = Color32::from_rgb(237, 119, 119);
-pub(super) const DESTRUCTIVE_PRESSED: Color32 = Color32::from_rgb(212, 96, 96);
-/// Text on the red. Dark ink, as on the lime: white on this red is ~2.9:1.
+/// The primary action (Save): white with black ink. The window is
+/// monochrome, like the pill — brightness says what matters, and colour is
+/// kept for status alone.
+pub(super) const PRIMARY: Color32 = Color32::from_rgb(240, 240, 240);
+pub(super) const PRIMARY_HOVER: Color32 = Color32::from_rgb(255, 255, 255);
+pub(super) const PRIMARY_PRESSED: Color32 = Color32::from_rgb(212, 212, 212);
+pub(super) const PRIMARY_FG: Color32 = Color32::from_rgb(10, 10, 10);
+/// Something is set up and working ("Configured", "Installed"): the pill's
+/// own delivered green (`pill::geom::SUCCESS`), so a status reads the same
+/// in both places.
+pub(super) const SUCCESS: Color32 = Color32::from_rgb(74, 188, 120);
+/// Errors and the destructive action: the pill's failed red
+/// (`pill::geom::ERROR`).
+pub(super) const DESTRUCTIVE: Color32 = Color32::from_rgb(214, 96, 96);
+pub(super) const DESTRUCTIVE_HOVER: Color32 = Color32::from_rgb(226, 110, 110);
+pub(super) const DESTRUCTIVE_PRESSED: Color32 = Color32::from_rgb(208, 94, 94);
+/// Text on the red. Dark ink: white on this red is under 3:1.
 pub(super) const DESTRUCTIVE_FG: Color32 = Color32::from_rgb(50, 8, 8);
-pub(super) const TOGGLE_OFF: Color32 = Color32::from_rgb(54, 54, 58);
+/// A switch that is off: a dark track under a light knob.
+pub(super) const TOGGLE_OFF: Color32 = Color32::from_rgb(54, 54, 54);
+pub(super) const KNOB_OFF: Color32 = Color32::from_rgb(245, 245, 245);
+/// A switch that is on: the same pair inverted, a light track under a dark
+/// knob, so on and off differ by brightness rather than hue. Each pair holds
+/// 3:1 against the page and between knob and track
+/// (`switch_meets_non_text_contrast`).
+pub(super) const TOGGLE_ON: Color32 = Color32::from_rgb(225, 225, 225);
+pub(super) const KNOB_ON: Color32 = Color32::from_rgb(23, 23, 23);
 
 // Borders are SOLID greys, not semi-transparent strokes. A 1px stroke of a
 // translucent colour gets spread by egui's ~1px feathering, leaving gaps that
 // read as a broken / "pixely" line; an opaque colour feathers into a clean,
 // continuous hairline.
-pub(super) const BORDER: Color32 = Color32::from_rgb(38, 38, 42); // dividers / faint seams
-pub(super) const CONTROL_BORDER: Color32 = Color32::from_rgb(52, 52, 58); // input & button outlines
-pub(super) const CONTROL_BORDER_HOVER: Color32 = Color32::from_rgb(80, 80, 88);
+pub(super) const BORDER: Color32 = Color32::from_rgb(38, 38, 38); // dividers / faint seams
+pub(super) const CONTROL_BORDER: Color32 = Color32::from_rgb(52, 52, 52); // input & button outlines
+pub(super) const CONTROL_BORDER_HOVER: Color32 = Color32::from_rgb(80, 80, 80);
 
 /// Style a TextEdit placeholder so it reads as an example, not content.
 pub(super) fn hint(text: &str) -> RichText {
@@ -62,18 +80,27 @@ pub(super) fn input_border() -> Stroke {
     Stroke::new(1.0, CONTROL_BORDER)
 }
 
-pub(super) const RAIL_W: f32 = 184.0;
-pub(super) const CONTROL_W: f32 = 240.0;
-pub(super) const CONTROL_H: f32 = 32.0;
-pub(super) const RADIUS: f32 = 10.0; // shadcn --radius (0.625rem) — controls, buttons, popovers
-pub(super) const RADIUS_SM: f32 = 8.0; // nav items, row hover
+pub(super) const RAIL_W: f32 = 168.0;
+pub(super) const CONTROL_W: f32 = 232.0;
+pub(super) const CONTROL_H: f32 = 28.0;
+/// Footer and dialog buttons: a touch taller than a row control, so the
+/// actions that end something read as a step apart from the settings.
+pub(super) const BUTTON_H: f32 = 30.0;
+/// Every settings row — `row` and `toggle_row` alike — is this tall: one line
+/// of label, centred on a CONTROL_H control, so a pane is an even ladder of
+/// rows whatever control each one holds.
+pub(super) const ROW_H: f32 = 40.0;
+/// A row label's size; its caption is a tooltip, not a second line.
+pub(super) const LABEL_SIZE: f32 = 13.5;
+pub(super) const RADIUS: f32 = 6.0; // controls, buttons, popovers
+pub(super) const RADIUS_SM: f32 = 4.0; // nav items, row hover
 /// Gap between a control's edge and its focus ring's inner edge.
 pub(super) const FOCUS_RING_GAP: f32 = 1.25;
 /// Focus ring stroke width. Gap plus width stays inside egui's 3px clip
 /// margin, so a control flush with a scroll area's edge keeps its whole ring.
 pub(super) const FOCUS_RING_W: f32 = 1.5;
 /// Height of the Save/Close strip along the bottom of the pane.
-pub(super) const FOOTER_H: f32 = 60.0;
+pub(super) const FOOTER_H: f32 = 50.0;
 
 /// Install the theme.
 ///
@@ -102,8 +129,8 @@ fn dark_style() -> egui::Style {
     // egui makes labels selectable by default, which shows the text-select
     // I-beam over our row/label text and makes controls feel un-clickable.
     style.interaction.selectable_labels = false;
-    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-    style.spacing.button_padding = Vec2::new(12.0, 6.0);
+    style.spacing.item_spacing = Vec2::new(10.0, 6.0);
+    style.spacing.button_padding = Vec2::new(10.0, 4.0);
     style.spacing.interact_size = Vec2::new(40.0, CONTROL_H);
     style.spacing.combo_height = 320.0;
     style.spacing.scroll.floating = false;
@@ -130,7 +157,7 @@ fn dark_style() -> egui::Style {
     };
     v.override_text_color = Some(FG);
     // Neutral text selection — never the accent.
-    v.selection.bg_fill = Color32::from_rgb(51, 51, 56);
+    v.selection.bg_fill = Color32::from_rgb(51, 51, 51);
     v.selection.stroke = Stroke::new(1.0, RING);
     v.hyperlink_color = PRIMARY;
 
@@ -286,6 +313,21 @@ mod tests {
         for (name, bg) in [("page", BG), ("sidebar/dialog", SIDEBAR_BG)] {
             let ratio = contrast(FOCUS_RING, bg);
             assert!(ratio >= 3.0, "focus ring on {name}: {ratio:.2}:1");
+        }
+    }
+
+    /// A switch says on or off by brightness alone, so both states must read
+    /// as a control: the on track against the page, and each knob against
+    /// its own track.
+    #[test]
+    fn switch_meets_non_text_contrast() {
+        for (name, a, b) in [
+            ("on track on page", TOGGLE_ON, BG),
+            ("knob on on track", KNOB_ON, TOGGLE_ON),
+            ("knob on off track", KNOB_OFF, TOGGLE_OFF),
+        ] {
+            let ratio = contrast(a, b);
+            assert!(ratio >= 3.0, "{name}: {ratio:.2}:1");
         }
     }
 }
