@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
-const MODEL: &str = "openai/gpt-oss-120b";
+pub const MODEL: &str = "openai/gpt-oss-120b";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The contract that makes answers paste-safe: the model's output lands
@@ -53,6 +53,39 @@ struct ChatMessage {
     content: String,
 }
 
+/// The answer run's other seam: POST a JSON body to an endpoint with a bearer
+/// key, and hand back the status and body for [`read_response`] to judge.
+pub trait ChatTransport {
+    fn post(
+        &self,
+        endpoint: &str,
+        key: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, String)>;
+}
+
+/// The real transport: the shared blocking HTTP client.
+pub struct HttpTransport;
+
+impl ChatTransport for HttpTransport {
+    fn post(
+        &self,
+        endpoint: &str,
+        key: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let resp = client()?
+            .post(endpoint)
+            .bearer_auth(key)
+            .json(body)
+            .send()
+            .context("POST to Groq chat")?;
+        let status = resp.status();
+        let text = resp.text().context("read Groq chat response")?;
+        Ok((status, text))
+    }
+}
+
 /// One client for the process lifetime — rebuilding it per call would pay
 /// TLS/pool setup on a path whose whole point is low latency.
 fn client() -> Result<&'static reqwest::blocking::Client> {
@@ -64,16 +97,12 @@ fn client() -> Result<&'static reqwest::blocking::Client> {
     Ok(CLIENT.get_or_init(|| built))
 }
 
-pub fn run_command(api_key: &str, instruction: &str) -> Result<String> {
-    let resp = client()?
-        .post(ENDPOINT)
-        .bearer_auth(api_key)
-        .json(&request_body(instruction))
-        .send()
-        .context("POST to Groq chat")?;
-
-    let status = resp.status();
-    let text = resp.text().context("read Groq chat response")?;
+pub fn run_command(
+    transport: &impl ChatTransport,
+    api_key: &str,
+    instruction: &str,
+) -> Result<String> {
+    let (status, text) = transport.post(ENDPOINT, api_key, &request_body(instruction))?;
     read_response(status, &text)
 }
 
@@ -195,6 +224,9 @@ mod tests {
             .unwrap_or_else(|_| "Write one short sentence about coffee.".into());
         let key = draft::secrets::load_key(draft::config::Provider::Groq)
             .expect("no Groq key: set one in Settings or GROQ_API_KEY");
-        println!("{}", run_command(&key, &instruction).unwrap());
+        println!(
+            "{}",
+            run_command(&HttpTransport, &key, &instruction).unwrap()
+        );
     }
 }
