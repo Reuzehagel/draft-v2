@@ -373,9 +373,14 @@ mod tests {
         assert!(body.get("reasoning_format").is_none());
         assert_eq!(body["messages"][1]["content"], "make it shorter");
 
+        // An unlisted model gets the common fields and nothing else.
         let other = request_body(&chat(ChatBackend::Groq, "vendor/next-model"), "x");
-        assert!(other.get("reasoning_effort").is_none());
-        assert!(other.get("include_reasoning").is_none());
+        let mut fields: Vec<_> = other.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(
+            fields,
+            ["max_completion_tokens", "messages", "model", "temperature"]
+        );
     }
 
     #[test]

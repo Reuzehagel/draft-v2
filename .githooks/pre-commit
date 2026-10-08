@@ -6,3 +6,14 @@
 set -e
 cargo fmt --check
 cargo clippy --all-targets --quiet -- -D warnings
+
+# egui 0.29 lets Tab land on a widget in a disabled `Ui`, which then drops
+# focus: a settings control that's off is a `Sense::hover` stand-in instead
+# (see the layout invariants atop src/settings_ui/widgets.rs).
+disabled=$(git grep -nE '\.(add_enabled_ui|add_enabled|disable)\(' -- src/settings_ui \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+if [ -n "$disabled" ]; then
+    echo "A disabled egui Ui drops keyboard focus; draw a Sense::hover stand-in:" >&2
+    echo "$disabled" >&2
+    exit 1
+fi

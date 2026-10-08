@@ -8,9 +8,9 @@ A change described as "no behaviour change" preserves everything observable, the
 
 ## Tests
 
-- A test names the source's constant (`llm::MODEL`), never a retyped literal, so a model retirement or a rename breaks only the tests about it.
-- A test drives its module through that module's own seams — the fakes pattern of `pill::adapter`'s `PillPort` and `settings_ui::state`'s `Store`. Assertions about another module's wire format (a request body's shape) belong in that module's tests.
-- A test never touches the user's real files under `%APPDATA%\Draft` or `%LOCALAPPDATA%\Draft`.
+- A test names the source's constant (`llm::QWEN_3_8_27B`), never a retyped literal, so a model retirement or a rename breaks only the tests about it.
+- A test drives its module through that module's own seams — the fakes pattern of `pill::adapter`'s `PillPort` and `settings_ui::state`'s `Store`. It asserts what crosses its own seam: the answer run's fake Chat transport may check the endpoint, the key and the fields the run routes. The full shape of a request body belongs to the module that builds it, and is asserted there.
+- A test never writes to the user's real files under `%APPDATA%\Draft` or `%LOCALAPPDATA%\Draft`. An `#[ignore]`d tool may read them (`llm::tests::live` reads `config.toml`).
 
 ## Comments
 

@@ -27,6 +27,11 @@
 // - A focus ring is paint, never layout (`focus_ring`): it is drawn outside
 //   the control's rect, within egui's clip margin, so a focused control takes
 //   exactly the room an unfocused one does and nothing beside it moves.
+// - A control that's off is a `Sense::hover` stand-in, painted muted and
+//   announced disabled (`primary_button`, `disabled_combo`). egui 0.29 lets
+//   Tab land on a widget in a disabled `Ui` and then drops focus, so the
+//   pre-commit hook rejects `add_enabled_ui` here; `inert_if` is for the
+//   window behind a dialog only, where the focus trap keeps Tab away.
 // - Every control has a screen reader name. The custom widgets here announce
 //   themselves, and a control inside a `row` is named after the row's label.
 //   Anything else — a raw `TextEdit` outside a row, a button whose text only

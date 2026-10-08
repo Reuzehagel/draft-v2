@@ -357,13 +357,9 @@ mod tests {
                 ..ask(false)
             };
             let (_, _, body) = asked(&chosen);
-            let mut fields: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
-            fields.sort();
-            assert_eq!(
-                fields,
-                ["max_completion_tokens", "messages", "model", "temperature"],
-                "{backend:?}"
-            );
+            for field in ["reasoning_effort", "reasoning_format", "include_reasoning"] {
+                assert!(body.get(field).is_none(), "{backend:?} sent {field}");
+            }
             assert_eq!(body["model"], "vendor/next-model");
         }
     }
