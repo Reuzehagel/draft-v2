@@ -1,0 +1,3 @@
+# Text is stored and checked out as LF, so `core.autocrlf` on a Windows clone
+# has nothing to convert and no commit warns about line endings.
+* text=auto eol=lf
