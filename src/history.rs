@@ -31,8 +31,29 @@ pub struct Entry {
     pub provider: String,
 }
 
+#[cfg(not(test))]
 fn history_path() -> Result<std::path::PathBuf> {
     Ok(crate::paths::data_dir()?.join("history.jsonl"))
+}
+
+/// The library's own tests get a history file of their own per process, wiped
+/// on first use, so a test can watch what is written without reading — or
+/// writing — the user's. Only the library's unit tests see this: the `draft`
+/// binary's tests link the ordinary library, so a test there takes history as
+/// a seam instead (the answer run's `record` closure).
+#[cfg(test)]
+fn history_path() -> Result<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    Ok(PATH
+        .get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join("draft-history-tests")
+                .join(format!("process-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            dir.join("history.jsonl")
+        })
+        .clone())
 }
 
 /// Seconds since the Unix epoch. Shared so recorded timestamps and the UI's
