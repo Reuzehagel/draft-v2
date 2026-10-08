@@ -11,6 +11,7 @@
 
 mod activation;
 mod alloc_count;
+mod answer_run;
 mod autostart;
 mod hotkey;
 mod llm;
@@ -400,7 +401,8 @@ impl App {
     }
 
     /// Off-thread pipeline for a committed capture: transcribe → postprocess →
-    /// history → paste, reporting one [`session::Outcome`] back by id.
+    /// history → paste, reporting one [`session::Outcome`] back by id. A
+    /// `Command` session hands its transcript to [`answer_run`] instead.
     ///
     /// History is recorded *before* the paste attempt — if the paste is
     /// swallowed or lands in the wrong window, that record is the only surviving
@@ -458,7 +460,7 @@ impl App {
             // Attribution rides with the result so history credits whichever
             // provider actually served this call (the fallback wrapper can
             // route to local Parakeet mid-call).
-            let (text, stt_provider) = match transcriber.transcribe_attributed(&samples) {
+            let (text, provider) = match transcriber.transcribe_attributed(&samples) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "transcription failed");
@@ -474,36 +476,42 @@ impl App {
                 return;
             }
 
-            // What lands at the cursor, and who is credited in history.
-            // Dictation runs the deterministic pipeline over the transcript;
-            // push-to-command treats it as an instruction instead — no
-            // pipeline (replacements and voice commands are for spoken
-            // prose), the LLM's answer is what gets pasted.
-            let (mut out, provider): (String, &'static str) = match kind {
-                SessionKind::Command => {
-                    let Some(key) = groq_key else {
-                        tracing::error!(
-                            "push-to-command needs a Groq API key — add one under \
-                             Settings > Transcription with Groq selected"
-                        );
-                        report(session::Outcome::Failed);
-                        return;
-                    };
-                    match llm::run_command(&key, trimmed) {
-                        Ok(answer) => (answer, "command"),
-                        Err(e) => {
-                            tracing::error!(error = %e, "command transform failed");
-                            report(session::Outcome::Failed);
-                            return;
-                        }
-                    }
+            // Push-to-command treats the transcript as an instruction instead
+            // — no pipeline (replacements and voice commands are for spoken
+            // prose); the answer run asks, records and pastes the answer.
+            if let SessionKind::Command = kind {
+                let ask = answer_run::Ask {
+                    key: groq_key.as_deref(),
+                    instruction: trimmed,
+                    append_space,
+                };
+                let mut desk = answer_run::SystemDesk {
+                    mode: paste_mode,
+                    restore_clipboard,
+                };
+                let outcome = answer_run::run(
+                    &ask,
+                    &mut desk,
+                    &llm::HttpTransport,
+                    history::append,
+                    || report(session::Outcome::Delivered),
+                );
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    ?outcome,
+                    "command run finished"
+                );
+                // Delivered was reported the moment the paste was sent.
+                if outcome != session::Outcome::Delivered {
+                    report(outcome);
                 }
-                SessionKind::Dictate => (pipeline.apply(trimmed), stt_provider),
-            };
+                return;
+            }
 
-            // Either stage can legitimately empty the text (a lone "scratch
-            // that", a delete-everything replacement, a refusing model) —
-            // don't paste a bare trailing space or record an empty entry.
+            let mut out = pipeline.apply(trimmed);
+            // The pipeline can legitimately empty the text (a lone "scratch
+            // that", a delete-everything replacement) — don't paste a bare
+            // trailing space or record an empty entry.
             if out.trim().is_empty() {
                 tracing::info!(elapsed_ms, "nothing left to paste");
                 report(session::Outcome::Empty);
