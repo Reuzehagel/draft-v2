@@ -182,14 +182,12 @@ mod tests {
     /// there is nothing to recover, and the tray's "Copy last" must not offer
     /// text the user never spoke.
     ///
-    /// This reads the real history file, because `history` resolves its path
-    /// from the Windows known folders and there is no seam to point it
-    /// elsewhere. It still fails on the regression it is for — an append would
-    /// move `last()` from `None` to `Some`, or change it — but note that it
-    /// only ever reads, and never writes, the user's own history.
+    /// Under the library's tests `history` writes to a scratch file of this
+    /// process's own, which nothing else here appends to, so it must still be
+    /// empty afterward.
     #[test]
     fn does_not_touch_history() {
-        let before = crate::history::last().map(|e| (e.ts, e.text));
+        assert!(crate::history::is_empty(), "history started non-empty");
         let out = run_samples(
             &[],
             &StubTranscriber("words that must not be recorded"),
@@ -197,8 +195,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out, RunOutcome::Delivered(_)));
-        let after = crate::history::last().map(|e| (e.ts, e.text));
-        assert_eq!(before, after, "a transcription run appended to history");
+        assert!(
+            crate::history::is_empty(),
+            "a transcription run appended to history"
+        );
     }
 
     #[test]
