@@ -12,7 +12,8 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::llm::{self, ChatTransport};
+use crate::config::ChatBackend;
+use crate::llm::{self, Chat, ChatKeys, ChatTransport};
 use crate::paste;
 use crate::session::Outcome;
 
@@ -39,10 +40,14 @@ impl Desk for SystemDesk {
     }
 }
 
-/// What to ask, and how the answer is pasted.
+/// What to ask, who to ask it of, and how the answer is pasted.
 pub struct Ask<'a> {
-    /// The Chat backend's key; `None` when none is stored.
-    pub key: Option<&'a str>,
+    /// The Chat backend and model the config names; `None` leaves it to
+    /// Draft — see [`Chat::resolve`].
+    pub backend: Option<ChatBackend>,
+    pub model: Option<&'a str>,
+    /// Every Chat backend's key, as stored: the default backend follows them.
+    pub keys: &'a ChatKeys,
     pub instruction: &'a str,
     /// The cosmetic trailing space after the paste — never recorded.
     pub append_space: bool,
@@ -72,13 +77,17 @@ fn answer(
     record: impl FnOnce(&str, &str) -> Result<()>,
     on_sent: impl FnOnce(),
 ) -> Result<Outcome> {
-    let key = ask.key.ok_or_else(|| {
+    let chat = Chat::resolve(ask.backend, ask.model, |b| ask.keys.get(b).is_some());
+    // The chosen backend is asked or nothing is: a key stored for the other
+    // one is no reason to swap.
+    let key = ask.keys.get(chat.backend).ok_or_else(|| {
         anyhow!(
-            "push-to-command needs a Groq API key — add one under \
-             Settings > Transcription with Groq selected"
+            "push-to-command needs a {} API key — add one under Settings > Commands",
+            chat.backend.label()
         )
     })?;
-    let answer = llm::run_command(transport, key, ask.instruction)?;
+    tracing::info!(backend = chat.backend.label(), model = %chat.model, "asking");
+    let answer = llm::run_command(transport, &chat, key, ask.instruction)?;
 
     // A refusing or silent model is not a failure — there is just nothing to
     // paste, and an empty entry is not worth recording.
@@ -109,7 +118,11 @@ mod tests {
     /// Everything the run did to the outside world, in order.
     #[derive(Debug, PartialEq)]
     enum Event {
-        Asked(serde_json::Value),
+        Asked {
+            endpoint: String,
+            key: String,
+            body: serde_json::Value,
+        },
         Recorded(String, String),
         Pasted(String),
     }
@@ -141,11 +154,15 @@ mod tests {
     impl ChatTransport for FakeTransport<'_> {
         fn post(
             &self,
-            _endpoint: &str,
-            _key: &str,
+            endpoint: &str,
+            key: &str,
             body: &serde_json::Value,
         ) -> Result<(StatusCode, String)> {
-            self.log.borrow_mut().push(Event::Asked(body.clone()));
+            self.log.borrow_mut().push(Event::Asked {
+                endpoint: endpoint.into(),
+                key: key.into(),
+                body: body.clone(),
+            });
             Ok((self.status, self.body.clone()))
         }
     }
@@ -161,12 +178,48 @@ mod tests {
         }
     }
 
+    static GROQ_ONLY: ChatKeys = ChatKeys {
+        groq: Some(String::new()),
+        cerebras: None,
+    };
+
+    static NO_KEYS: ChatKeys = ChatKeys {
+        groq: None,
+        cerebras: None,
+    };
+
+    /// Asks Groq: with only a Groq key stored, that is Draft's default.
     fn ask(append_space: bool) -> Ask<'static> {
         Ask {
-            key: Some("gsk_test"),
+            backend: None,
+            model: None,
+            keys: &GROQ_ONLY,
             instruction: "say hi",
             append_space,
         }
+    }
+
+    fn both_keys() -> ChatKeys {
+        ChatKeys {
+            groq: Some("gsk_test".into()),
+            cerebras: Some("csk_test".into()),
+        }
+    }
+
+    /// The one request `ask` sent: endpoint, key, body.
+    fn asked(ask: &Ask) -> (String, String, serde_json::Value) {
+        let log = Log::default();
+        go(ask, &log, &answering(&log, "Hi."), false);
+        let first = log.into_inner().into_iter().next();
+        let Some(Event::Asked {
+            endpoint,
+            key,
+            body,
+        }) = first
+        else {
+            panic!("the chat backend was not asked first: {first:?}");
+        };
+        (endpoint, key, body)
     }
 
     /// Runs `ask` with history recorded into `log`; returns the outcome and
@@ -195,7 +248,7 @@ mod tests {
     fn effects(log: Log) -> Vec<Event> {
         log.into_inner()
             .into_iter()
-            .filter(|e| !matches!(e, Event::Asked(_)))
+            .filter(|e| !matches!(e, Event::Asked { .. }))
             .collect()
     }
 
@@ -216,12 +269,99 @@ mod tests {
 
     #[test]
     fn the_instruction_is_what_is_asked() {
-        let log = Log::default();
-        go(&ask(false), &log, &answering(&log, "Hi."), false);
-        let Event::Asked(body) = &log.borrow()[0] else {
-            panic!("the chat backend was not asked first: {:?}", log.borrow());
-        };
+        let (_, _, body) = asked(&ask(false));
         assert_eq!(body["messages"][1]["content"], "say hi");
+    }
+
+    #[test]
+    fn each_backend_is_asked_at_its_endpoint_with_its_own_key() {
+        let keys = both_keys();
+        for (backend, endpoint, key) in [
+            (ChatBackend::Groq, llm::GROQ_ENDPOINT, "gsk_test"),
+            (ChatBackend::Cerebras, llm::CEREBRAS_ENDPOINT, "csk_test"),
+        ] {
+            let chosen = Ask {
+                backend: Some(backend),
+                keys: &keys,
+                ..ask(false)
+            };
+            let (e, k, body) = asked(&chosen);
+            assert_eq!((e.as_str(), k.as_str()), (endpoint, key), "{backend:?}");
+            assert_eq!(body["model"], llm::default_model(backend), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn with_nothing_chosen_cerebras_is_asked_unless_only_groq_has_a_key() {
+        let keys = both_keys();
+        let (endpoint, key, body) = asked(&Ask {
+            keys: &keys,
+            ..ask(false)
+        });
+        assert_eq!(endpoint, llm::CEREBRAS_ENDPOINT);
+        assert_eq!(key, "csk_test");
+        assert_eq!(body["model"], llm::QWEN_3_8_27B);
+
+        let (endpoint, _, body) = asked(&ask(false));
+        assert_eq!(endpoint, llm::GROQ_ENDPOINT);
+        assert_eq!(body["model"], llm::GROQ_GPT_OSS_120B);
+    }
+
+    /// Each listed model carries the fields that keep its reasoning out of the
+    /// answer, and none of the others' fields.
+    #[test]
+    fn each_listed_model_carries_its_reasoning_fields() {
+        let keys = both_keys();
+        let fields = ["reasoning_effort", "reasoning_format", "include_reasoning"];
+        for (backend, model, want) in [
+            (
+                ChatBackend::Cerebras,
+                llm::QWEN_3_8_27B,
+                serde_json::json!({ "reasoning_effort": "none" }),
+            ),
+            (
+                ChatBackend::Cerebras,
+                llm::CEREBRAS_GPT_OSS_120B,
+                serde_json::json!({ "reasoning_effort": "low", "reasoning_format": "hidden" }),
+            ),
+            (
+                ChatBackend::Groq,
+                llm::GROQ_GPT_OSS_120B,
+                serde_json::json!({ "reasoning_effort": "low", "include_reasoning": false }),
+            ),
+        ] {
+            let chosen = Ask {
+                backend: Some(backend),
+                model: Some(model),
+                keys: &keys,
+                ..ask(false)
+            };
+            let (_, _, body) = asked(&chosen);
+            assert_eq!(body["model"], model);
+            let got: serde_json::Map<_, _> = fields
+                .iter()
+                .filter_map(|&f| body.get(f).map(|v| (f.to_string(), v.clone())))
+                .collect();
+            assert_eq!(serde_json::Value::Object(got), want, "{model}");
+        }
+    }
+
+    #[test]
+    fn a_model_draft_does_not_list_is_sent_as_is_with_no_extra_fields() {
+        let keys = both_keys();
+        for backend in [ChatBackend::Groq, ChatBackend::Cerebras] {
+            let chosen = Ask {
+                backend: Some(backend),
+                model: Some("vendor/next-model"),
+                keys: &keys,
+                ..ask(false)
+            };
+            let (_, _, body) = asked(&chosen);
+            for field in ["reasoning_effort", "reasoning_format", "include_reasoning"] {
+                assert!(body.get(field).is_none(), "{backend:?} sent {field}");
+            }
+            assert_eq!(body["model"], "vendor/next-model");
+        }
     }
 
     #[test]
@@ -267,7 +407,11 @@ mod tests {
         );
         let err = answer(&ask(false), &mut desk, &transport, |_, _| Ok(()), || {}).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains(llm::MODEL), "{msg}");
+        assert!(
+            msg.contains(&format!("`{}`", llm::GROQ_GPT_OSS_120B)),
+            "{msg}"
+        );
+        assert!(msg.contains("Settings > Commands"), "{msg}");
         assert_eq!(effects(log), []);
     }
 
@@ -287,11 +431,30 @@ mod tests {
     fn without_a_key_nothing_is_asked() {
         let log = Log::default();
         let no_key = Ask {
-            key: None,
+            keys: &NO_KEYS,
             ..ask(false)
         };
         let (outcome, _) = go(&no_key, &log, &answering(&log, "Hi."), false);
         assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(log.into_inner(), []);
+    }
+
+    /// A chosen backend is asked or nothing is: a key on the other one is no
+    /// reason to swap.
+    #[test]
+    fn a_chosen_backend_without_a_key_fails_naming_its_key() {
+        let log = Log::default();
+        let cerebras = Ask {
+            backend: Some(ChatBackend::Cerebras),
+            ..ask(false)
+        };
+        let mut desk = FakeDesk {
+            log: &log,
+            fail: false,
+        };
+        let transport = answering(&log, "Hi.");
+        let err = answer(&cerebras, &mut desk, &transport, |_, _| Ok(()), || {}).unwrap_err();
+        assert!(format!("{err}").contains("Cerebras API key"), "{err}");
         assert_eq!(log.into_inner(), []);
     }
 

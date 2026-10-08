@@ -6,9 +6,9 @@ Windows push-to-talk speech-to-text: hold a global hotkey, speak, release, and t
 
 There is no CI. `.githooks/pre-commit` runs `cargo fmt --check` and `cargo clippy -D warnings` on every commit (enable it per clone: `git config core.hooksPath .githooks`); run `cargo test` yourself before committing. Clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch.
 
-`#[ignore]`d tests are tools that write files instead of asserting: `cargo test -- --ignored tray::tests::preview` draws the tray icon at every scale, on both taskbars, to `target/tray-preview/`. `cargo test -- --ignored mark::tests::write` regenerates `assets/draft.ico` (the exe and MSI icon, embedded by `build.rs`) after any change to `src/mark.rs` — a test fails until you do. `cargo test --bin draft -- --ignored --nocapture llm::tests::live` sends push-to-command's real request (`DRAFT_COMMAND` sets the instruction) with the stored key and prints the answer — no microphone needed. The pill's preview and frame bench are in `src/pill/CLAUDE.md`.
+`#[ignore]`d tests are tools that write files instead of asserting: `cargo test -- --ignored tray::tests::preview` draws the tray icon at every scale, on both taskbars, to `target/tray-preview/`. `cargo test -- --ignored mark::tests::write` regenerates `assets/draft.ico` (the exe and MSI icon, embedded by `build.rs`) after any change to `src/mark.rs` — a test fails until you do. `cargo test --bin draft -- --ignored --nocapture llm::tests::live` sends push-to-command's real request (`DRAFT_COMMAND` sets the instruction) to the configured Chat backend and model, with the stored key, and prints the answer — no microphone needed. The pill's preview and frame bench are in `src/pill/CLAUDE.md`.
 
-To look at the settings window, `cargo build` then `Start-Process .\target\debug\draft.exe -ArgumentList '--settings-preview' -Wait` (from the repo root): it opens the real window over your config, shows each pane, and saves them to `target/settings-preview/` as `01-recording.png`… before closing itself. It only looks — nothing is edited or saved.
+To look at the settings window, `cargo build` then `Start-Process .\target\debug\draft.exe -ArgumentList '--settings-preview' -Wait` (from the repo root): it opens the real window over your config, shows each pane, and saves them to `target/settings-preview/` as `01-recording.png`…, plus the rows only some states show (`06-commands-no-key.png`; the list is `STATES` in `settings_ui/preview.rs`), before closing itself. Nothing is saved.
 
 `cargo test` and `cargo clippy` build the test harness, not `target/debug/draft.exe` — `cargo build` before launching. Launch the exe from PowerShell (`Start-Process .\draft.exe`); from Git Bash it exits 127 with no output. The single-instance gate means the user's running Draft must be closed first, or the new process exits at once.
 
@@ -29,7 +29,7 @@ Dictation flow: `hotkey.rs` (raw chord events) → `activation.rs` (FSM: hold/to
 
 Transcription run (`transcription_run.rs`): file → `decode.rs` (symphonia demux/decode, resampled to 16 kHz mono by the *same* `audio::resample`) → `transcribe::build` → **Replacements only**. No voice commands (a recording's speaker isn't addressing Draft) and no history (nothing is pasted, so there's nothing to recover). Both are absences by construction, not flags.
 
-Push-to-command (`llm.rs`): a second hotkey routes the transcript to a Groq chat model as an instruction and pastes the answer; it skips the postprocess pipeline.
+Push-to-command (`llm.rs`, `answer_run.rs`): a second hotkey routes the transcript to the Chat backend (Groq or Cerebras, and a model the user chooses — ADR 0004) as an instruction and pastes the answer; it skips the postprocess pipeline.
 
 ## Facts that bite
 

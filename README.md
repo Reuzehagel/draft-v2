@@ -18,7 +18,16 @@ Before pasting, the transcript runs through a deterministic pipeline:
 
 Every transcript is saved to a local history before the paste is attempted, so a paste that lands in the wrong window is recoverable. The tray menu has a "copy last transcript" entry for exactly that case.
 
-There is also an optional second hotkey, push-to-command: speech is treated as an instruction, sent to an LLM (Groq), and the *answer* is pasted instead of your words.
+There is also an optional second hotkey, push-to-command: speech is treated as an instruction, sent to a chat model, and the *answer* is pasted instead of your words.
+
+## Push-to-command
+
+Turn it on, and choose what answers, under Settings > Commands. The answer comes from a **Chat backend**, Cerebras or Groq, and a model on it:
+
+- **Cerebras** needs a Cerebras API key, set on the Commands pane (or in the `CEREBRAS_API_KEY` environment variable). Draft lists `qwen-3.8-27b` and `gpt-oss-120b`.
+- **Groq** uses the same Groq API key as the Groq transcription provider; it can be set on either pane. Draft lists `openai/gpt-oss-120b`.
+
+Until you choose, Draft asks Cerebras with `qwen-3.8-27b` — or Groq with `openai/gpt-oss-120b` if a Groq key is the only one stored. The listed models are run with their reasoning kept out of the answer, so only the answer is pasted. "Other…" sends any model id exactly as typed, with no such settings. Vendors retire chat models from time to time; when yours is, push-to-command fails with an error naming it, and you choose another under Settings > Commands — Draft never switches models on its own.
 
 ## Transcribing a file
 

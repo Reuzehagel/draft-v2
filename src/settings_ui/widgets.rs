@@ -27,6 +27,11 @@
 // - A focus ring is paint, never layout (`focus_ring`): it is drawn outside
 //   the control's rect, within egui's clip margin, so a focused control takes
 //   exactly the room an unfocused one does and nothing beside it moves.
+// - A control that's off is a `Sense::hover` stand-in, painted muted and
+//   announced disabled (`primary_button`, `disabled_combo`). egui 0.29 lets
+//   Tab land on a widget in a disabled `Ui` and then drops focus, so the
+//   pre-commit hook rejects `add_enabled_ui` here; `inert_if` is for the
+//   window behind a dialog only, where the focus trap keeps Tab away.
 // - Every control has a screen reader name. The custom widgets here announce
 //   themselves, and a control inside a `row` is named after the row's label.
 //   Anything else — a raw `TextEdit` outside a row, a button whose text only
@@ -350,6 +355,49 @@ pub(super) fn combo<T: PartialEq + Clone>(
         .map_or(selected_text, |(_, label)| label);
     name_by_row(ui, r.response.id, |node| node.set_value(value));
     r.response.on_hover_cursor(egui::CursorIcon::PointingHand);
+}
+
+/// A dropdown that can't be opened: the `combo` button's metrics, its text
+/// and chevron muted, and nothing to focus or click — as the Save button is
+/// when off. Not an `egui::ComboBox` in a disabled `Ui`: egui 0.29 still lets
+/// Tab land on a disabled widget, which then drops focus on the floor.
+pub(super) fn disabled_combo(ui: &mut egui::Ui, text: &str) {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(CONTROL_W, CONTROL_H), egui::Sense::hover());
+    // Named by its row and valued by its text, as a live dropdown is.
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, false, text));
+    name_by_row(ui, resp.id, |node| {
+        node.set_value(text);
+        node.set_disabled();
+    });
+    ui.painter()
+        .rect_filled(rect, Rounding::same(RADIUS), CONTROL_FILL);
+    ui.painter()
+        .rect_stroke(rect, Rounding::same(RADIUS), input_border());
+    let chevron_w = 36.0;
+    let galley = elided_galley(
+        ui.ctx(),
+        text,
+        egui::FontId::proportional(13.0),
+        MUTED_FG,
+        rect.width() - 12.0 - chevron_w,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::PLACEHOLDER,
+    );
+    // The live dropdown's filled triangle, where it draws it.
+    let c = egui::pos2(rect.right() - 15.0, rect.center().y);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - 6.0, c.y - 3.5),
+            egui::pos2(c.x + 6.0, c.y - 3.5),
+            egui::pos2(c.x, c.y + 3.5),
+        ],
+        MUTED_FG,
+        Stroke::NONE,
+    ));
 }
 
 /// Left inset of an option row's label.
@@ -1491,6 +1539,20 @@ mod tests {
         named(&nodes, Role::TextInput, "Hotkey");
         let opener = named(&nodes, Role::Button, "API key");
         assert_eq!(opener.value(), Some("Configured"));
+    }
+
+    /// A dropdown that can't be opened is still named by its row, says what
+    /// it holds, and says it is off.
+    #[test]
+    fn a_disabled_dropdown_is_named_by_its_row_and_announced_off() {
+        let nodes = a11y_nodes(|ui| {
+            row(ui, "Model", "The model that answers.", |ui| {
+                disabled_combo(ui, "qwen");
+            });
+        });
+        let combo = named(&nodes, Role::ComboBox, "Model");
+        assert_eq!(combo.value(), Some("qwen"));
+        assert!(combo.is_disabled());
     }
 
     /// A rejected field says why, in place of the row's caption.
