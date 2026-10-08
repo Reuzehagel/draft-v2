@@ -426,12 +426,14 @@ impl App {
             config::PasteMode::Clipboard => paste::PasteMode::Clipboard,
             config::PasteMode::Unicode => paste::PasteMode::Unicode,
         };
-        // Fetch the key on the UI thread — the keyring is process-global state,
+        // Fetch the keys on the UI thread — the keyring is process-global state,
         // no reason to touch it from every worker.
-        let groq_key = match kind {
-            SessionKind::Command => secrets::load_key(config::Provider::Groq),
-            SessionKind::Dictate => None,
+        let chat_keys = match kind {
+            SessionKind::Command => llm::ChatKeys::load(),
+            SessionKind::Dictate => llm::ChatKeys::default(),
         };
+        let chat_backend = self.cfg.chat_backend;
+        let chat_model = self.cfg.chat_model.clone();
         std::thread::spawn(move || {
             // Debug artifact: the last capture, on disk as a wav.
             let path = wav_dump_path();
@@ -481,7 +483,9 @@ impl App {
             // prose); the answer run asks, records and pastes the answer.
             if let SessionKind::Command = kind {
                 let ask = answer_run::Ask {
-                    key: groq_key.as_deref(),
+                    backend: chat_backend,
+                    model: chat_model.as_deref(),
+                    keys: &chat_keys,
                     instruction: trimmed,
                     append_space,
                 };
