@@ -4,7 +4,7 @@ Windows push-to-talk speech-to-text: hold a global hotkey, speak, release, and t
 
 ## Commands
 
-There is no CI — run `cargo test`, `cargo clippy` and `cargo fmt --check` locally before committing. Clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch.
+There is no CI. `.githooks/pre-commit` runs `cargo fmt --check` and `cargo clippy -D warnings` on every commit (enable it per clone: `git config core.hooksPath .githooks`); run `cargo test` yourself before committing. Clippy stays warning-free (dead-code warnings were cleaned up deliberately) and the tree stays rustfmt-clean, so an ordinary change never drags a reformat of files it didn't touch.
 
 `#[ignore]`d tests are tools that write files instead of asserting: `cargo test -- --ignored tray::tests::preview` draws the tray icon at every scale, on both taskbars, to `target/tray-preview/`. `cargo test -- --ignored mark::tests::write` regenerates `assets/draft.ico` (the exe and MSI icon, embedded by `build.rs`) after any change to `src/mark.rs` — a test fails until you do. `cargo test --bin draft -- --ignored --nocapture llm::tests::live` sends push-to-command's real request (`DRAFT_COMMAND` sets the instruction) with the stored key and prints the answer — no microphone needed. The pill's preview and frame bench are in `src/pill/CLAUDE.md`.
 
@@ -14,7 +14,7 @@ To look at the settings window, `cargo build` then `Start-Process .\target\debug
 
 ## Branches and PRs
 
-Work goes on an `area/topic` branch (`pill/settled-appearance`), never straight to `main`. PRs merge squash-only, and a single-commit PR lands its commit message as written — write it as the permanent record. PR titles carry the issue number in parens: `pill: one hook for the window messages winit never hands up (#40)`.
+Work goes on an `area/topic` branch (`pill/settled-appearance`), never straight to `main`. PRs merge squash-only, and a single-commit PR lands its commit message as written — write it as the permanent record. PR titles and commit subjects carry no number — the squash merge appends `(#PR)` — and the PR body links the issue with `Closes #N`. Releases: `docs/agents/release.md`.
 
 ## Architecture
 

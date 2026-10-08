@@ -1,0 +1,8 @@
+#!/bin/sh
+# The guardrail this repo has instead of CI. Enabled per clone with
+#   git config core.hooksPath .githooks
+# Tests stay a manual step: they are slower, and fmt and clippy are what an
+# ordinary commit forgets.
+set -e
+cargo fmt --check
+cargo clippy --all-targets --quiet -- -D warnings
