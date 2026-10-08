@@ -40,12 +40,12 @@ The `.msi` lands in `target\wix\`.
 - API keys. They live in Windows Credential Manager and aren't touched by
   the installer or uninstaller.
 
-## Version bumps
+## Not part of releases
 
-Edit two places:
-
-1. `Cargo.toml` → `[package] version`
-2. `wix/main.wxs` → `<Product Version="...">`
+Releases ship `draft.exe` and `draft-cli.exe` only (see
+`docs/agents/release.md`), so a release bumps `Cargo.toml` alone and
+`<Product Version="...">` in `main.wxs` is left at `0.1.0`. To build an MSI
+anyway, set that version to the release's first.
 
 The `UpgradeCode` GUID in `main.wxs` is stable across versions — that's
 what tells Windows "this MSI replaces the previous Draft install."
