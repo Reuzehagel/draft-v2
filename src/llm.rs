@@ -183,4 +183,18 @@ mod tests {
         assert!(msg.contains("Rate limit reached"), "{msg}");
         assert!(!msg.contains("no longer served"), "{msg}");
     }
+
+    /// A tool, not a test: push-to-command's real request, without a
+    /// microphone. Sends `DRAFT_COMMAND` (or a stock instruction) with the
+    /// stored Groq key and prints the answer, so a model or backend change can
+    /// be checked live from a terminal.
+    #[test]
+    #[ignore]
+    fn live() {
+        let instruction = std::env::var("DRAFT_COMMAND")
+            .unwrap_or_else(|_| "Write one short sentence about coffee.".into());
+        let key = draft::secrets::load_key(draft::config::Provider::Groq)
+            .expect("no Groq key: set one in Settings or GROQ_API_KEY");
+        println!("{}", run_command(&key, &instruction).unwrap());
+    }
 }
