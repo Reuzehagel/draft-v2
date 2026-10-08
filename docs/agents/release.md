@@ -12,4 +12,4 @@ Written for users, not from the commit log: what changed for them, grouped under
 
 ## The MSI is not shipped
 
-Releases attach only the exes. `wix/` builds an MSI (`wix/README.md`), but no release has carried one, and `wix/main.wxs` still says `Version="0.1.0"`. Its README's "edit two places" for a version bump applies only if the MSI starts shipping.
+Releases attach only the exes, by choice: the update check opens the release page and users download `draft.exe`, so an installer would add a WiX toolchain and a second version to bump for no one who asked. `wix/` still builds one (`wix/README.md`), with `main.wxs` left at `Version="0.1.0"`.
