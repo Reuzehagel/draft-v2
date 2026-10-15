@@ -30,14 +30,17 @@ mod state;
 mod theme;
 mod widgets;
 
-use crate::config::{Activation, Config, MonitorPolicy, PasteMode, PillBodyStyle, Provider};
-use crate::secrets;
+use crate::config::{
+    Activation, ChatBackend, Config, MonitorPolicy, PasteMode, PillBodyStyle, Provider,
+};
+use crate::llm;
+use crate::secrets::{self, KeySlot};
 use crate::transcribe::parakeet_download;
 use download::DownloadState;
 use egui::{Frame, Margin, RichText, Rounding, Vec2};
 use focus_trap::FocusTrap;
 use format::{progress_fraction, progress_label, relative_time};
-use state::{Form, SystemStore, ALL_PROVIDERS};
+use state::{Form, ModelPick, SystemStore, ALL_PROVIDERS};
 use std::sync::{Arc, Mutex};
 use theme::*;
 use widgets::*;
@@ -149,19 +152,22 @@ enum Tab {
     Transcription,
     Replacements,
     Output,
+    Commands,
     History,
     System,
 }
 
 impl Tab {
     /// Rail order, which is the order the panes are read in: what Draft
-    /// listens with, what it shows you while it does, then where the words go.
+    /// listens with, what it shows you while it does, then where the words go
+    /// — and then the second thing words can be, an instruction.
     const ALL: &'static [Tab] = &[
         Tab::Recording,
         Tab::Pill,
         Tab::Transcription,
         Tab::Replacements,
         Tab::Output,
+        Tab::Commands,
         Tab::History,
         Tab::System,
     ];
@@ -173,6 +179,7 @@ impl Tab {
             Tab::Transcription => "Transcription",
             Tab::Replacements => "Replacements",
             Tab::Output => "Output",
+            Tab::Commands => "Commands",
             Tab::History => "History",
             Tab::System => "System",
         }
@@ -185,14 +192,12 @@ impl Tab {
             Tab::Transcription => "The service that turns your speech into text.",
             Tab::Replacements => "Corrections made to every transcript before it's pasted.",
             Tab::Output => "How transcripts reach the app you're typing in.",
+            Tab::Commands => "Spoken instructions, and the AI that answers them.",
             Tab::History => "Every transcript, so you can recover one that didn't paste.",
             Tab::System => "How Draft starts.",
         }
     }
 }
-
-/// Why Save is off while there are edits, said wherever Save is offered.
-const HOTKEY_BLOCKS_SAVE: &str = "Fix the hotkey before saving.";
 
 /// What one Esc closes: the topmost surface only — a **popup**, else a
 /// **modal card**, else the window.
@@ -245,7 +250,7 @@ fn hold_close(ctx: &egui::Context, dirty: bool, close_confirmed: bool) -> bool {
 /// redisplay the stored secret — the buffer starts empty and only overwrites
 /// the saved key if the user actually types one.
 struct KeyDialog {
-    provider: Provider,
+    slot: KeySlot,
     buffer: String,
     reveal: bool,
 }
@@ -521,6 +526,7 @@ impl SettingsApp {
                     Tab::Transcription => self.tab_transcription(ui, ctx),
                     Tab::Replacements => self.tab_replacements(ui),
                     Tab::Output => self.tab_output(ui),
+                    Tab::Commands => self.tab_commands(ui),
                     Tab::History => self.tab_history(ui),
                     Tab::System => self.tab_system(ui),
                 }
@@ -615,17 +621,25 @@ impl SettingsApp {
                 );
             }
         });
+    }
 
-        ui.add_space(14.0);
-
+    /// The Commands pane: push-to-command, and the **Chat backend** that
+    /// answers it.
+    ///
+    /// The backend's rows show with push-to-command off too: they are a
+    /// choice to make before turning it on, not a setting it switches on.
+    /// The key row is the chosen backend's — Groq's is the Groq Provider's
+    /// key, so it is the same key under Transcription — and it sits above the
+    /// model, which is greyed out until there is a key to ask it with.
+    fn tab_commands(&mut self, ui: &mut egui::Ui) {
+        let errs = self.form.hotkey_errors();
         group(ui, |ui| {
             toggle_row(
                 ui,
                 &mut self.form.cfg.push_to_command,
                 "Push-to-command",
                 "A second hotkey for instructions instead of dictation: say \
-                 what you want, and the AI's answer is pasted at your cursor. \
-                 Uses Groq, so set a Groq API key under Transcription.",
+                 what you want, and the AI's answer is pasted at your cursor.",
             );
             if self.form.cfg.push_to_command {
                 divider(ui);
@@ -639,6 +653,139 @@ impl SettingsApp {
                 );
             }
         });
+
+        ui.add_space(14.0);
+
+        let chat = self.form.chat();
+        let missing = self.form.missing_chat_key();
+        group(ui, |ui| {
+            row(
+                ui,
+                "Chat backend",
+                "The service your instructions are sent to. Its answer is \
+                 what gets pasted.",
+                |ui| {
+                    let mut backend = chat.backend;
+                    combo(
+                        ui,
+                        "chat_backend",
+                        &mut backend,
+                        chat.backend.label(),
+                        &[
+                            (ChatBackend::Cerebras, ChatBackend::Cerebras.label()),
+                            (ChatBackend::Groq, ChatBackend::Groq.label()),
+                        ],
+                    );
+                    self.form.choose_backend(backend);
+                },
+            );
+            // Cerebras's key is always here: Cerebras is not a Provider, so
+            // this is the only place to set it. Groq's joins it while Groq is
+            // chosen, so its key needn't be set by switching the Provider.
+            if chat.backend == ChatBackend::Groq {
+                divider(ui);
+                self.key_row(ui, KeySlot::from(ChatBackend::Groq));
+            }
+            divider(ui);
+            self.key_row(ui, KeySlot::Cerebras);
+            divider(ui);
+            // Greyed out rather than hidden: the row says there is a model to
+            // choose, and the note under the group says what it is waiting on.
+            self.model_rows(ui, chat.backend, missing.is_none());
+        });
+
+        let note = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(10.0);
+            group(ui, |ui| {
+                ui.label(RichText::new(text).size(12.0).color(MUTED_FG));
+            });
+        };
+        if let Some(slot) = missing {
+            note(
+                ui,
+                &format!(
+                    "Choosing a model needs a {} API key. Set one above.",
+                    slot.label()
+                ),
+            );
+        }
+        if self.form.model_pick() == ModelPick::Other {
+            note(
+                ui,
+                "A model Draft doesn't list is sent exactly as typed, without \
+                 the settings that keep its reasoning out of the answer.",
+            );
+        }
+    }
+
+    /// One Chat backend's key: the Transcription pane's key opener and dialog.
+    fn key_row(&mut self, ui: &mut egui::Ui, slot: KeySlot) {
+        let configured = self.form.keys.has(slot);
+        row(
+            ui,
+            &format!("{} API key", slot.label()),
+            "Your key for this backend, kept in Windows Credential Manager.",
+            |ui| {
+                if key_opener(ui, configured) {
+                    self.key_dialog = Some(KeyDialog {
+                        slot,
+                        buffer: String::new(),
+                        reveal: false,
+                    });
+                }
+            },
+        );
+    }
+
+    /// The Model dropdown, and the id field when it says "Other…". Without
+    /// a key to ask with, the dropdown is greyed out and the field not shown.
+    fn model_rows(&mut self, ui: &mut egui::Ui, backend: ChatBackend, enabled: bool) {
+        row(
+            ui,
+            "Model",
+            "The model that answers. Draft lists the ones it knows how to \
+             run; Other… sends any model id.",
+            |ui| {
+                let pick = self.form.model_pick();
+                let mut options: Vec<(ModelPick, &str)> = llm::models(backend)
+                    .map(|m| (ModelPick::Listed(m.id), m.id))
+                    .collect();
+                options.push((ModelPick::Other, "Other…"));
+                let selected = match pick {
+                    ModelPick::Listed(id) => id,
+                    ModelPick::Other => "Other…",
+                };
+                if !enabled {
+                    disabled_combo(ui, selected);
+                    return;
+                }
+                let mut chosen = pick;
+                combo(ui, "chat_model", &mut chosen, selected, &options);
+                if chosen != pick {
+                    self.form.choose_model(chosen);
+                }
+            },
+        );
+        let error = self.form.model_error();
+        let Some(id) = self.form.other_model_mut().filter(|_| enabled) else {
+            return;
+        };
+        divider(ui);
+        let mut edited = false;
+        row(
+            ui,
+            "Model id",
+            "The id exactly as the backend names it.",
+            |ui| {
+                edited = text_input(ui, id, "vendor/model-name", CONTROL_W, error).changed();
+            },
+        );
+        if let Some(msg) = error {
+            field_error(ui, msg);
+        }
+        if edited {
+            self.form.other_model_edited();
+        }
     }
 
     /// The pill pane.
@@ -781,7 +928,7 @@ impl SettingsApp {
                         // never shown back here.
                         if key_opener(ui, configured) {
                             self.key_dialog = Some(KeyDialog {
-                                provider,
+                                slot: provider.into(),
                                 buffer: String::new(),
                                 reveal: false,
                             });
@@ -1119,6 +1266,7 @@ impl SettingsApp {
             .hline(ui.max_rect().x_range(), ui.max_rect().top(), border());
         let dirty = self.form.is_dirty();
         let can_save = self.form.can_save();
+        let blocker = self.form.save_blocker();
         let size = Vec2::new(ui.available_width(), ui.available_height());
         ui.allocate_ui_with_layout(
             size,
@@ -1142,7 +1290,7 @@ impl SettingsApp {
                     // pane the user has since left, so say why Save is off.
                     (_, true) if !can_save => {
                         ui.label(
-                            RichText::new(HOTKEY_BLOCKS_SAVE)
+                            RichText::new(blocker.unwrap_or_default())
                                 .size(12.0)
                                 .color(DESTRUCTIVE),
                         );
@@ -1168,8 +1316,8 @@ impl SettingsApp {
     fn key_dialog_view(&mut self, ctx: &egui::Context) {
         enum Act {
             None,
-            Commit(Provider, String),
-            Remove(Provider),
+            Commit(KeySlot, String),
+            Remove(KeySlot),
             Cancel,
         }
         let mut act = Act::None;
@@ -1177,10 +1325,10 @@ impl SettingsApp {
             let Some(dlg) = self.key_dialog.as_mut() else {
                 return;
             };
-            let configured = !self.form.keys.get(dlg.provider).trim().is_empty();
+            let configured = self.form.keys.has(dlg.slot);
             let scrim_clicked = modal_card(ctx, KEY_DIALOG, |ui| {
                 ui.label(
-                    RichText::new(format!("{} API key", dlg.provider.label()))
+                    RichText::new(format!("{} API key", dlg.slot.label()))
                         .size(15.0)
                         .strong()
                         .color(FG),
@@ -1204,7 +1352,7 @@ impl SettingsApp {
                             .hint_text(hint("Paste key"))
                             .vertical_align(egui::Align::Center),
                     );
-                    name_control(&field, &format!("{} API key", dlg.provider.label()));
+                    name_control(&field, &format!("{} API key", dlg.slot.label()));
                     ui.add_space(8.0);
                     let eye = if dlg.reveal { "Hide" } else { "Show" };
                     if ui.add(ghost_button(eye, show_w, CONTROL_H)).clicked() {
@@ -1215,12 +1363,12 @@ impl SettingsApp {
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
                     if configured && ui.add(ghost_button("Remove", 76.0, BUTTON_H)).clicked() {
-                        act = Act::Remove(dlg.provider);
+                        act = Act::Remove(dlg.slot);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_save = !dlg.buffer.trim().is_empty();
                         if ui.add(primary_button("Save", can_save)).clicked() && can_save {
-                            act = Act::Commit(dlg.provider, dlg.buffer.clone());
+                            act = Act::Commit(dlg.slot, dlg.buffer.clone());
                         }
                         ui.add_space(8.0);
                         if ui.add(ghost_button("Cancel", 76.0, BUTTON_H)).clicked() {
@@ -1325,6 +1473,7 @@ impl SettingsApp {
         }
         let mut act = Act::None;
         let can_save = self.form.can_save();
+        let blocker = self.form.save_blocker().unwrap_or_default();
         let scrim_clicked = modal_card(ctx, UNSAVED_PROMPT, |ui| {
             ui.label(
                 RichText::new("Save changes before closing?")
@@ -1336,7 +1485,7 @@ impl SettingsApp {
             let msg = if can_save {
                 "If you don't save, your changes will be lost.".to_string()
             } else {
-                format!("{HOTKEY_BLOCKS_SAVE} Discard closes without saving.")
+                format!("{blocker} Discard closes without saving.")
             };
             ui.label(RichText::new(msg).size(12.0).color(MUTED_FG));
             ui.add_space(18.0);
@@ -1727,9 +1876,9 @@ mod tests {
         frame(&ctx, &mut app, vec![]);
 
         let mut regions = Vec::new();
-        // Seven rail items, System's one toggle, then Close — Save is off,
+        // Eight rail items, System's one toggle, then Close — Save is off,
         // with nothing to save.
-        for _ in 0..9 {
+        for _ in 0..10 {
             tab(&ctx, &mut app, false);
             let r = focused_rect(&ctx).expect("tab focuses something");
             regions.push(if r.right() <= RAIL_W {
@@ -1740,7 +1889,7 @@ mod tests {
                 "pane"
             });
         }
-        let mut want = vec!["rail"; 7];
+        let mut want = vec!["rail"; 8];
         want.extend(["pane", "footer"]);
         assert_eq!(regions, want);
     }
@@ -1784,7 +1933,7 @@ mod tests {
         let ctx = styled_ctx();
         let mut app = blank_app(Tab::Transcription);
         app.key_dialog = Some(KeyDialog {
-            provider: Provider::Groq,
+            slot: Provider::Groq.into(),
             buffer: String::new(),
             reveal: false,
         });
@@ -1817,8 +1966,8 @@ mod tests {
         let ctx = styled_ctx();
         let mut app = blank_app(Tab::System);
         frame(&ctx, &mut app, vec![]);
-        // Seven rail items, then System's launch-at-login toggle.
-        for _ in 0..8 {
+        // Eight rail items, then System's launch-at-login toggle.
+        for _ in 0..9 {
             tab(&ctx, &mut app, false);
         }
         let r = focused_rect(&ctx).expect("the toggle has focus");
@@ -1832,6 +1981,63 @@ mod tests {
             "the toggle behind the dialog flipped"
         );
         assert!(app.confirm_clear_history, "the dialog is still up");
+    }
+
+    /// The rects Tab stops on in the pane, from the first rail item round to
+    /// the footer.
+    fn pane_stops(app: &mut SettingsApp) -> Vec<egui::Rect> {
+        let ctx = styled_ctx();
+        frame(&ctx, app, vec![]);
+        let mut stops = Vec::new();
+        for _ in 0..20 {
+            tab(&ctx, app, false);
+            let r = focused_rect(&ctx).expect("tab focuses something");
+            if r.top() >= SCREEN.bottom() - FOOTER_H {
+                break;
+            }
+            if r.right() > RAIL_W {
+                stops.push(r);
+            }
+        }
+        stops
+    }
+
+    /// With no key for the chosen backend, the Model dropdown is greyed out
+    /// and Tab passes it by: push-to-command, the backend, its key. A key
+    /// brings the model into the round.
+    #[test]
+    fn the_model_is_out_of_reach_until_its_backend_has_a_key() {
+        let mut app = blank_app(Tab::Commands);
+        assert_eq!(app.form.missing_chat_key(), Some(KeySlot::Cerebras));
+        assert_eq!(pane_stops(&mut app).len(), 3);
+
+        app.form.keys.set(KeySlot::Cerebras, "csk".into());
+        assert_eq!(pane_stops(&mut app).len(), 4);
+    }
+
+    /// Push-to-command's rows moved to the Commands pane: Recording no longer
+    /// reaches them, and Commands shows the hotkey once it is on.
+    #[test]
+    fn push_to_command_lives_on_the_commands_pane() {
+        let mut app = blank_app(Tab::Recording);
+        app.form.cfg.push_to_command = true;
+        // Hotkey, microphone, activation, double-press lock.
+        assert_eq!(pane_stops(&mut app).len(), 4);
+
+        let mut app = blank_app(Tab::Commands);
+        app.form.cfg.push_to_command = true;
+        // Toggle, command hotkey, backend, key.
+        assert_eq!(pane_stops(&mut app).len(), 4);
+    }
+
+    /// "Other…" shows the id field, and an empty id is what Save waits on.
+    #[test]
+    fn other_shows_the_model_id_field() {
+        let mut app = blank_app(Tab::Commands);
+        app.form.keys.set(KeySlot::Cerebras, "csk".into());
+        app.form.choose_model(ModelPick::Other);
+        assert_eq!(pane_stops(&mut app).len(), 5);
+        assert!(!app.form.can_save());
     }
 
     /// Making the window inert doesn't grey it out: behind the scrim it paints

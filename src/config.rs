@@ -37,10 +37,19 @@ pub struct Config {
     /// Only takes effect when the local model is downloaded.
     pub fallback_to_local: bool,
     /// Push-to-command: a second hotkey where speech is an instruction and
-    /// the LLM's answer is pasted instead of the words. Needs a Groq API key.
+    /// the Chat backend's answer is pasted instead of the words.
     pub push_to_command: bool,
     /// The hotkey that triggers push-to-command. Same syntax as `hotkey`.
     pub command_hotkey: String,
+    /// The **Chat backend** the user chose. `None` until they choose one:
+    /// Draft then picks by which keys are stored, every time it asks, so a key
+    /// added later can still change the answer. A name this build doesn't
+    /// know loads as `None` — see `chat_backend_or_default`.
+    #[serde(deserialize_with = "chat_backend_or_default")]
+    pub chat_backend: Option<ChatBackend>,
+    /// The model on `chat_backend`, sent as written. Read only alongside a
+    /// chosen backend; `None` there means that backend's default model.
+    pub chat_model: Option<String>,
     /// The overlay's own settings.
     #[serde(default)]
     pub pill: PillConfig,
@@ -203,6 +212,59 @@ impl Provider {
     }
 }
 
+/// The chat service push-to-command asks. Not a **Provider**: it hears no
+/// audio, and it has a model setting where a Provider does not (ADR 0004).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatBackend {
+    Groq,
+    Cerebras,
+}
+
+impl ChatBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            ChatBackend::Groq => "Groq",
+            ChatBackend::Cerebras => "Cerebras",
+        }
+    }
+
+    /// The backend Draft picks when the user hasn't: Cerebras, unless only a
+    /// Groq key is stored.
+    pub fn default_for(has_groq_key: bool, has_cerebras_key: bool) -> Self {
+        if has_groq_key && !has_cerebras_key {
+            ChatBackend::Groq
+        } else {
+            ChatBackend::Cerebras
+        }
+    }
+}
+
+/// An unrecognised Chat backend loads as no choice at all — Draft's default —
+/// for the reason an unrecognised provider loads as local Parakeet: one stale
+/// value is not worth the rest of the file. A value that isn't a string is
+/// still an error.
+fn chat_backend_or_default<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<ChatBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+
+    let name = String::deserialize(deserializer)?;
+    let known: std::result::Result<ChatBackend, serde::de::value::Error> =
+        ChatBackend::deserialize(name.as_str().into_deserializer());
+    Ok(known
+        .inspect_err(|_| {
+            tracing::warn!(
+                chat_backend = %name,
+                "unrecognised chat backend in config, using the default"
+            )
+        })
+        .ok())
+}
+
 /// An unrecognised provider name is not a corrupt config. It is either a
 /// **Provider** that has since been removed, or one a newer build wrote before
 /// a rollback; failing the parse would back the whole file up and cost the
@@ -245,6 +307,8 @@ impl Default for Config {
             fallback_to_local: true,
             push_to_command: false,
             command_hotkey: "Ctrl+Shift+Backslash".into(),
+            chat_backend: None,
+            chat_model: None,
             pill: PillConfig::default(),
         }
     }
@@ -378,6 +442,69 @@ mod tests {
             assert!(logs.contains("WARN"), "{name}: {logs}");
             assert!(logs.contains(name), "{name}: {logs}");
         }
+    }
+
+    #[test]
+    fn a_config_written_before_the_chat_backend_existed_leaves_it_to_draft() {
+        let cfg: Config = toml::from_str(
+            "push_to_command = true
+command_hotkey = \"Ctrl+Alt+C\"
+",
+        )
+        .expect("old config parses");
+        assert!(cfg.push_to_command);
+        assert_eq!(cfg.command_hotkey, "Ctrl+Alt+C");
+        assert_eq!(cfg.chat_backend, None);
+        assert_eq!(cfg.chat_model, None);
+        assert_eq!(Config::default().chat_backend, None);
+        assert_eq!(Config::default().chat_model, None);
+    }
+
+    #[test]
+    fn a_chosen_chat_backend_and_model_round_trip() {
+        let cfg = Config {
+            chat_backend: Some(ChatBackend::Groq),
+            chat_model: Some("vendor/some-model".into()),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&cfg).expect("serialise");
+        assert!(text.contains("chat_backend = \"groq\""), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).expect("parses"), cfg);
+        // No choice writes no key, rather than a value that means "none".
+        let text = toml::to_string_pretty(&Config::default()).expect("serialise");
+        assert!(!text.contains("chat_"), "{text}");
+    }
+
+    #[test]
+    fn an_unrecognised_chat_backend_loads_as_the_default_and_keeps_everything_else() {
+        let (cfg, logs) = parse_capturing_logs(
+            "hotkey = \"Ctrl+Alt+D\"
+             push_to_command = true
+             chat_backend = \"openrouter\"
+             chat_model = \"some/model\"
+",
+        );
+        assert_eq!(cfg.chat_backend, None);
+        assert_eq!(cfg.hotkey, "Ctrl+Alt+D");
+        assert!(cfg.push_to_command);
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("openrouter"), "{logs}");
+        assert!(toml::from_str::<Config>(
+            "chat_backend = 3
+"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_default_chat_backend_is_cerebras_unless_only_a_groq_key_is_stored() {
+        assert_eq!(
+            ChatBackend::default_for(false, false),
+            ChatBackend::Cerebras
+        );
+        assert_eq!(ChatBackend::default_for(false, true), ChatBackend::Cerebras);
+        assert_eq!(ChatBackend::default_for(true, true), ChatBackend::Cerebras);
+        assert_eq!(ChatBackend::default_for(true, false), ChatBackend::Groq);
     }
 
     /// Tolerating an unknown provider *name* must not make a provider that
