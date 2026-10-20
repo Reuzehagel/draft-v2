@@ -3,6 +3,8 @@
 // directly via the trait's `transcribe` entry point.
 
 pub mod elevenlabs;
+#[cfg(test)]
+mod live;
 pub mod mistral;
 pub mod openai_compat;
 pub mod parakeet;
