@@ -5,8 +5,9 @@
 // `Authorization: ApiKey <key>` header. We send a 16 kHz mono WAV; the server
 // auto-detects the container. Response JSON has a top-level "text" field with
 // the transcript. The vocabulary hint rides in the `phrases` query parameter,
-// comma-separated, so a term with a comma in it is skipped; `bias_strength` is
-// left at Reson8's default, and no `custom_model_id` is used.
+// comma-separated, so a term with a comma in it is skipped, with
+// `bias_strength` raised from Reson8's 0.45 (see `BIAS_STRENGTH`); no
+// `custom_model_id` is used.
 //
 // Reson8 also supports exchanging the API key for a short-lived bearer token,
 // but the prerecorded endpoint accepts the static ApiKey scheme directly, so
@@ -19,6 +20,13 @@ use super::Transcriber;
 use crate::audio::TARGET_SR;
 
 const ENDPOINT: &str = "https://api.reson8.dev/v1/speech-to-text/prerecorded";
+
+/// How hard the vocabulary hint pulls. At Reson8's default 0.45 a five-term
+/// hint left a clip's output byte-identical; 2.0 fixed "tiny skier" to
+/// "tiny-skia", while 3.0 and up began rewriting "parrot" as "Parakeet" in a
+/// clip that never said it. A term alone pulls harder than the same term in a
+/// list, so a longer vocabulary drifts less at this setting, not more.
+const BIAS_STRENGTH: &str = "2.0";
 
 pub struct Reson8Transcriber {
     api_key: String,
@@ -50,7 +58,10 @@ impl Reson8Transcriber {
         if self.phrases.is_empty() {
             return Vec::new();
         }
-        vec![("phrases", self.phrases.join(","))]
+        vec![
+            ("phrases", self.phrases.join(",")),
+            ("bias_strength", BIAS_STRENGTH.to_string()),
+        ]
     }
 }
 
@@ -90,18 +101,21 @@ mod tests {
     }
 
     #[test]
-    fn sends_the_vocabulary_as_comma_joined_phrases() {
+    fn sends_the_vocabulary_as_comma_joined_phrases_with_a_raised_bias() {
         assert_eq!(
             reson8(&["Draft", "Parakeet v3"]).query(),
-            [("phrases", "Draft,Parakeet v3".to_string())]
+            [
+                ("phrases", "Draft,Parakeet v3".to_string()),
+                ("bias_strength", "2.0".to_string()),
+            ]
         );
     }
 
     #[test]
     fn skips_a_phrase_with_a_comma() {
         assert_eq!(
-            reson8(&["Smith, John", "Draft"]).query(),
-            [("phrases", "Draft".to_string())]
+            reson8(&["Smith, John", "Draft"]).query()[0],
+            ("phrases", "Draft".to_string())
         );
     }
 
@@ -111,10 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn never_sends_a_language_or_bias_strength() {
+    fn never_sends_a_language_or_custom_model() {
         for (param, _) in reson8(&["Draft"]).query() {
             assert_ne!(param, "language");
-            assert_ne!(param, "bias_strength");
             assert_ne!(param, "custom_model_id");
         }
     }
