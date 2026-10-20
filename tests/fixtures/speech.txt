@@ -1,0 +1,1 @@
+Run cargo clippy before committing, then push the Parakeet model and the tiny skia renderer to the Reuzehagel repo on GitHub. The meeting moves to Thursday at three thirty.

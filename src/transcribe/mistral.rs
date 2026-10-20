@@ -12,7 +12,8 @@ use super::Transcriber;
 use crate::audio::TARGET_SR;
 
 const ENDPOINT: &str = "https://api.mistral.ai/v1/audio/transcriptions";
-const DEFAULT_MODEL: &str = "voxtral-mini-latest";
+// Pinned: Small has no `-latest` alias, so a new Voxtral is a deliberate bump.
+const DEFAULT_MODEL: &str = "voxtral-small-transcribe-3-0";
 
 pub struct MistralTranscriber {
     api_key: String,
@@ -100,7 +101,7 @@ mod tests {
         assert_eq!(
             mistral(&["Draft", "Parakeet"]).text_fields(),
             [
-                ("model", "voxtral-mini-latest".to_string()),
+                ("model", "voxtral-small-transcribe-3-0".to_string()),
                 ("context_bias", "Draft".to_string()),
                 ("context_bias", "Parakeet".to_string()),
             ]
@@ -111,7 +112,7 @@ mod tests {
     fn no_vocabulary_sends_only_the_model() {
         assert_eq!(
             mistral(&[]).text_fields(),
-            [("model", "voxtral-mini-latest".to_string())]
+            [("model", "voxtral-small-transcribe-3-0".to_string())]
         );
     }
 }
