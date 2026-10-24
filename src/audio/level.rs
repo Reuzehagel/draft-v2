@@ -99,12 +99,8 @@ impl BandMeter {
     }
 
     pub fn reset(&mut self) {
-        for v in &mut self.bars {
-            *v = 0.0;
-        }
-        for v in &mut self.out {
-            *v = 0.0;
-        }
+        self.bars.fill(0.0);
+        self.out.fill(0.0);
         self.phase = 0.0;
         self.last_tick = None;
     }

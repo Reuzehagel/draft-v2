@@ -219,7 +219,11 @@ fn ico() -> Vec<u8> {
         .iter()
         .map(|&px| {
             let mut pm = Pixmap::new(px, px).expect("non-zero icon size");
-            for (o, p) in pm.pixels_mut().iter_mut().zip(app_rgba(px).chunks_exact(4)) {
+            for (o, p) in pm
+                .pixels_mut()
+                .iter_mut()
+                .zip(app_rgba(px).as_chunks::<4>().0)
+            {
                 *o = tiny_skia::ColorU8::from_rgba(p[0], p[1], p[2], p[3]).premultiply();
             }
             pm.encode_png().expect("encode icon png")
@@ -335,7 +339,7 @@ mod tests {
             let pm = Pixmap::decode_png(&ico[offset..offset + len]).expect("decode entry");
             assert_eq!((pm.width(), pm.height()), (px, px), "{stale}");
             let drawn = app_rgba(px);
-            for (p, want) in pm.pixels().iter().zip(drawn.chunks_exact(4)) {
+            for (p, want) in pm.pixels().iter().zip(drawn.as_chunks::<4>().0) {
                 let c = p.demultiply();
                 // Premultiplying on the way in can move a translucent edge
                 // pixel's colour by a step, and a clear one has none; the
@@ -361,7 +365,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create preview dir");
         for px in sizes() {
             let mut pm = Pixmap::new(px, px).unwrap();
-            for (o, p) in pm.pixels_mut().iter_mut().zip(app_rgba(px).chunks_exact(4)) {
+            for (o, p) in pm
+                .pixels_mut()
+                .iter_mut()
+                .zip(app_rgba(px).as_chunks::<4>().0)
+            {
                 *o = tiny_skia::ColorU8::from_rgba(p[0], p[1], p[2], p[3]).premultiply();
             }
             pm.save_png(dir.join(format!("app-{px}.png"))).unwrap();

@@ -916,7 +916,12 @@ pub fn pixmap_to_premul_bgra(pm: &Pixmap, dst: &mut [u8], r: IntRect) {
         else {
             return;
         };
-        for (s, d) in s.chunks_exact(4).zip(d.chunks_exact_mut(4)) {
+        for (s, d) in s
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(d.as_chunks_mut::<4>().0.iter_mut())
+        {
             d[0] = s[2]; // B
             d[1] = s[1]; // G
             d[2] = s[0]; // R
