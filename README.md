@@ -6,7 +6,7 @@ Draft runs in the system tray. While you hold the hotkey (`Ctrl+\` by default), 
 
 ## Transcription
 
-The default engine is Parakeet, an on-device model (~700 MB, downloaded from Settings) that needs no API key and works offline. Cloud providers are also supported: Mistral, Groq, OpenAI, and Reson8, with API keys stored in the Windows Credential Manager. When a cloud provider errors out mid-dictation, Draft can fall back to the local model instead of losing what you said.
+The default engine is Parakeet, an on-device model (~700 MB, downloaded from Settings) that needs no API key and works offline. Cloud providers are also supported: Mistral, Groq, OpenAI, Reson8, and ElevenLabs, with API keys stored in the Windows Credential Manager. When a cloud provider errors out mid-dictation, Draft can fall back to the local model instead of losing what you said.
 
 ## What happens to the transcript
 
