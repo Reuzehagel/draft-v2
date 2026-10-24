@@ -470,7 +470,7 @@ pub(super) fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> bool 
                 egui::pos2(cx - 1.0, cy + 3.5),
                 egui::pos2(cx + 5.0, cy - 4.0),
             ],
-            Stroke::new(1.6, FG),
+            Stroke::new(1.6_f32, FG),
         ));
     }
     resp.clicked()

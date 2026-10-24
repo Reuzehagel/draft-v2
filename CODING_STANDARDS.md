@@ -18,4 +18,4 @@ An ordering invariant ("history before paste, do not reorder") is stated once, a
 
 ## Naming
 
-Types, tests and log messages use `CONTEXT.md`'s terms. A new concept a diff introduces either matches a glossary entry or comes with one.
+Types, tests and log messages use `GLOSSARY.md`'s terms. A new concept a diff introduces either matches a glossary entry or comes with one.

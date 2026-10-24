@@ -44,5 +44,5 @@ Push-to-command (`llm.rs`, `answer_run.rs`): a second hotkey routes the transcri
 
 ## Agent skills
 
-- **Deciding or naming** anything — a Provider's behaviour, a type, a test, an issue title: `CONTEXT.md` is the glossary and holds standing decisions (one model per Provider, the provider bar). Read `docs/adr/` before working in an area it touches. Details: `docs/agents/domain.md`.
+- **Deciding or naming** anything — a Provider's behaviour, a type, a test, an issue title: `GLOSSARY.md` is the glossary and holds standing decisions (one model per Provider, the provider bar). Read `docs/adr/` before working in an area it touches. Details: `docs/agents/domain.md`.
 - **Issues and PRDs** live as GitHub issues (`Reuzehagel/draft-v2`) via `gh`. Conventions: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`.

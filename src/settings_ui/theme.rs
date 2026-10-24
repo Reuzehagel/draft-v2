@@ -74,10 +74,10 @@ pub(super) fn hint(text: &str) -> RichText {
 }
 
 pub(super) fn border() -> Stroke {
-    Stroke::new(1.0, BORDER)
+    Stroke::new(1.0_f32, BORDER)
 }
 pub(super) fn input_border() -> Stroke {
-    Stroke::new(1.0, CONTROL_BORDER)
+    Stroke::new(1.0_f32, CONTROL_BORDER)
 }
 
 pub(super) const RAIL_W: f32 = 168.0;
@@ -158,7 +158,7 @@ fn dark_style() -> egui::Style {
     v.override_text_color = Some(FG);
     // Neutral text selection — never the accent.
     v.selection.bg_fill = Color32::from_rgb(51, 51, 51);
-    v.selection.stroke = Stroke::new(1.0, RING);
+    v.selection.stroke = Stroke::new(1.0_f32, RING);
     v.hyperlink_color = PRIMARY;
 
     let r = Rounding::same(RADIUS);
@@ -175,21 +175,21 @@ fn dark_style() -> egui::Style {
     v.widgets.inactive.bg_fill = CONTROL_FILL;
     v.widgets.inactive.weak_bg_fill = CONTROL_FILL;
     v.widgets.inactive.bg_stroke = input_border();
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, FG);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, FG);
 
     v.widgets.hovered.bg_fill = CONTROL_HOVER;
     v.widgets.hovered.weak_bg_fill = CONTROL_HOVER;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, CONTROL_BORDER_HOVER);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, FG);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, CONTROL_BORDER_HOVER);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, FG);
 
     v.widgets.active.bg_fill = CONTROL_HOVER;
     v.widgets.active.weak_bg_fill = CONTROL_HOVER;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, RING); // neutral focus ring
-    v.widgets.active.fg_stroke = Stroke::new(1.0, FG);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, RING); // neutral focus ring
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, FG);
 
     v.widgets.open.bg_fill = CONTROL_FILL;
     v.widgets.open.weak_bg_fill = CONTROL_FILL;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, RING);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, RING);
 
     style
 }

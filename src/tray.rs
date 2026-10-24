@@ -414,11 +414,11 @@ mod tests {
         for px in SIZES {
             for t in TASKBARS {
                 let rgba = icon_rgba(Look { px, taskbar: t });
-                for p in rgba.chunks_exact(4) {
+                for p in rgba.as_chunks::<4>().0 {
                     if p[3] > 0 {
                         assert_eq!(&p[..3], &ink(t), "{px}px {t:?}");
                     } else {
-                        assert_eq!(p, [0; 4], "{px}px {t:?}");
+                        assert_eq!(*p, [0; 4], "{px}px {t:?}");
                     }
                 }
             }
